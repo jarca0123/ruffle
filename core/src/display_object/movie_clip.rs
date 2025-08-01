@@ -1159,6 +1159,16 @@ impl<'gc> MovieClip<'gc> {
         if self.current_frame() < self.total_frames() {
             NextFrame::Next
         } else if self.total_frames() > 1 {
+            // Check if this is an instance that should stop looping
+            if !self.is_root() && self.instantiated_by_timeline() && !self.placed_by_script() {
+                tracing::info!(target: "run_frame::run_all_phases_avm2",
+                    "Instance {} (is_root={}, instantiated_by_timeline={}, placed_by_script={}) reached final frame {}, considering stop",
+                    self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
+                    self.is_root(),
+                    self.instantiated_by_timeline(),
+                    self.placed_by_script(),
+                    self.current_frame());
+            }
             NextFrame::First
         } else {
             NextFrame::Same
@@ -1438,6 +1448,18 @@ impl<'gc> MovieClip<'gc> {
                 frame
             );
             self.assert_expected_tag_start();
+        }
+        
+        // Check if this is a looping goto for an instance that should stop
+        if is_implicit && !self.is_root() && self.instantiated_by_timeline() && !self.placed_by_script() {
+            tracing::info!(target: "run_frame::run_all_phases_avm2",
+                "Instance {} (is_root={}, instantiated_by_timeline={}, placed_by_script={}) looping from frame {} to frame {}",
+                self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
+                self.is_root(),
+                self.instantiated_by_timeline(),
+                self.placed_by_script(),
+                self.current_frame(),
+                frame);
         }
 
         let frame_before_rewind = self.current_frame();
