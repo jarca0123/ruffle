@@ -1159,16 +1159,6 @@ impl<'gc> MovieClip<'gc> {
         if self.current_frame() < self.total_frames() {
             NextFrame::Next
         } else if self.total_frames() > 1 {
-            // Check if this is an instance that should stop looping
-            if !self.is_root() && self.instantiated_by_timeline() && !self.placed_by_script() {
-                tracing::info!(target: "run_frame::run_all_phases_avm2",
-                    "Instance {} (is_root={}, instantiated_by_timeline={}, placed_by_script={}) reached final frame {}, considering stop",
-                    self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
-                    self.is_root(),
-                    self.instantiated_by_timeline(),
-                    self.placed_by_script(),
-                    self.current_frame());
-            }
             NextFrame::First
         } else {
             NextFrame::Same
@@ -1449,9 +1439,43 @@ impl<'gc> MovieClip<'gc> {
             );
             self.assert_expected_tag_start();
         }
-        
+
         // Check if this is a looping goto for an instance that should stop
-        if is_implicit && !self.is_root() && self.instantiated_by_timeline() && !self.placed_by_script() {
+        let should_stop_after_goto = is_implicit
+            && !self.is_root()
+            && self.instantiated_by_timeline()
+            && !self.placed_by_script();
+            //&& self.movie().is_action_script_3();
+            
+        if should_stop_after_goto {
+            // Check if this instance has only graphic children (no movie clips)
+            let has_only_graphic_children = !self.raw_container().iter_render_list().any(|child| {
+                child
+                    .as_movie_clip()
+                    .map_or(false, |mc| true)
+            });
+            
+            // For AVM2, check if parent is root
+            let is_root_movie_clip = match self.parent() {
+                Some(parent) => parent.is_root(),
+                None => false,
+            };
+            
+            if is_root_movie_clip && has_only_graphic_children {
+                tracing::info!(target: "run_frame::run_all_phases_avm2",
+                    "Instance {} will be stopped after going to frame {}",
+                    self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
+                    frame);
+                // Set the flag to stop in enter_frame
+                self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, true);
+            }
+        }
+        
+        if is_implicit
+            && !self.is_root()
+            && self.instantiated_by_timeline()
+            && !self.placed_by_script()
+        {
             tracing::info!(target: "run_frame::run_all_phases_avm2",
                 "Instance {} (is_root={}, instantiated_by_timeline={}, placed_by_script={}) looping from frame {} to frame {}",
                 self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
@@ -1709,6 +1733,8 @@ impl<'gc> MovieClip<'gc> {
         }
 
         self.assert_expected_tag_end(hit_target_frame);
+        
+
     }
 
     fn construct_as_avm1_object(
@@ -2214,20 +2240,29 @@ impl<'gc> MovieClip<'gc> {
             self.is_root(),
             self.instantiated_by_timeline(),
             self.placed_by_script());
-        
+
+        // Check if we should stop after goto - allow frame script to execute but then stop
+        let should_stop_after_scripts = self.0.contains_flag(MovieClipFlags::STOP_AFTER_GOTO);
+        if should_stop_after_scripts {
+            tracing::info!(target: "run_frame::run_all_phases_avm2",
+                "Instance {} will stop after executing frame scripts due to STOP_AFTER_GOTO flag",
+                self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+            return;
+        }
+
         let avm2_object = self.0.object.get().and_then(|o| o.as_avm2_object());
 
         if let Some(avm2_object) = avm2_object {
             if self.0.has_pending_script.get() {
                 tracing::info!(target: "run_frame::run_all_phases_avm2", "AVM2 object found for {}, has_pending_script=true",
                     self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
-                
+
                 let frame_id = self.0.queued_script_frame.get();
                 tracing::info!(target: "run_frame::run_all_phases_avm2", "Queuing frame script for {}: current_frame={}, last_queued={:?}",
                     self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
                     self.current_frame(),
                     self.0.last_queued_script_frame.get());
-                
+
                 // If we are already executing frame scripts, then we shouldn't
                 // run frame scripts recursively. This is because AVM2 can run
                 // gotos, which will both queue and run frame scripts for the
@@ -2251,7 +2286,7 @@ impl<'gc> MovieClip<'gc> {
                             self.0.last_queued_script_frame.set(Some(frame_id));
                             tracing::info!(target: "run_frame::run_all_phases_avm2", "Reset last_queued_script_frame for {} (allows re-execution)",
                                 self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
-                            
+
                             self.0.has_pending_script.set(false);
                             tracing::info!(target: "run_frame::run_all_phases_avm2", "Setting pending script for {}: frame={}, has_script={:?}",
                                 self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
@@ -2288,7 +2323,7 @@ impl<'gc> MovieClip<'gc> {
                             tracing::info!(target: "run_frame::run_all_phases_avm2", "Completed frame script execution for {} frame {}",
                                 self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
                                 frame_id);
-                            
+
                             self.0
                                 .set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, false);
                         }
@@ -2302,9 +2337,17 @@ impl<'gc> MovieClip<'gc> {
                     self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
             }
         }
-        
+
         tracing::info!(target: "run_frame::run_all_phases_avm2", "Finished run_local_frame_scripts for {}",
             self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+
+        // Stop the movie clip if the flag was set (after frame scripts have executed)
+        if should_stop_after_scripts {
+            tracing::info!(target: "run_frame::run_all_phases_avm2",
+                "Instance {} stopping after frame script execution",
+                self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+            self.stop(context);
+        }
 
         let goto_frame = self.0.queued_goto_frame.take();
         if let Some(frame) = goto_frame {
@@ -2341,6 +2384,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
     fn enter_frame(self, context: &mut UpdateContext<'gc>) {
         let skip_frame = self.base().should_skip_next_enter_frame();
+        
         //Child removals from looping gotos appear to resolve in reverse order.
         for child in self.iter_render_list().rev() {
             if skip_frame {
@@ -2442,7 +2486,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
         tracing::info!(target: "run_frame::run_all_phases_avm2", "run_frame_scripts called for {}",
             self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
-        
+
         self.run_local_frame_scripts(context);
 
         if let Some(container) = self.as_container() {
@@ -2450,7 +2494,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             tracing::info!(target: "run_frame::run_all_phases_avm2", "Running frame scripts for {} children of {}",
                 child_count,
                 self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
-            
+
             for (i, child) in container.iter_render_list().enumerate() {
                 tracing::info!(target: "run_frame::run_all_phases_avm2", "Running frame scripts for child {}: {:?}",
                     i,
@@ -2461,7 +2505,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             tracing::info!(target: "run_frame::run_all_phases_avm2", "Running frame scripts for 0 children of {}",
                 self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
         }
-        
+
         tracing::info!(target: "run_frame::run_all_phases_avm2", "Finished run_frame_scripts for {}",
             self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
     }
@@ -4453,6 +4497,10 @@ impl<'gc, 'a> MovieClip<'gc> {
         self.0
             .set_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME, val);
     }
+
+    pub fn clear_stop_after_goto_flag(self) {
+        self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false);
+    }
 }
 
 #[derive(Clone)]
@@ -4838,6 +4886,9 @@ bitflags! {
 
         /// Whether this `MovieClip` has been post-instantiated yet.
         const POST_INSTANTIATED = 1 << 6;
+        
+        /// Whether this `MovieClip` should stop after the current goto completes.
+        const STOP_AFTER_GOTO = 1 << 7;
     }
 }
 

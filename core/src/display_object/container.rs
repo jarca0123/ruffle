@@ -63,6 +63,27 @@ pub fn dispatch_added_to_stage_event_only<'gc>(
     if let Avm2Value::Object(object) = child.object2() {
         let added_evt = Avm2EventObject::bare_default_event(context, "addedToStage");
         Avm2::dispatch_event(context, added_evt, object);
+        tracing::debug!(target: "run_frame::run_all_phases_avm2",
+            "Dispatched addedToStage event for child {} ({:?})",
+            child.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
+            child.object2());
+        
+        // Clear STOP_AFTER_GOTO flag for ALL movie clips when ANY display object is added to stage
+        
+    }
+    clear_all_stop_after_goto_flags(context.stage.into());
+}
+
+/// Clear STOP_AFTER_GOTO flag for all movie clips in the display tree
+fn clear_all_stop_after_goto_flags<'gc>(root: DisplayObject<'gc>) {
+    if let Some(movie_clip) = root.as_movie_clip() {
+        movie_clip.clear_stop_after_goto_flag();
+    }
+    
+    if let Some(container) = root.as_container() {
+        for child in container.iter_render_list() {
+            clear_all_stop_after_goto_flags(child);
+        }
     }
 }
 
