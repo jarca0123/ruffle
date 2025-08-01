@@ -530,7 +530,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         changed
     }
 
-    fn name(&self) -> Option<AvmString<'gc>> {
+    pub fn name(&self) -> Option<AvmString<'gc>> {
         self.name
     }
 

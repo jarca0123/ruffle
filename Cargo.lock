@@ -4686,6 +4686,7 @@ dependencies = [
  "ruffle_video_software",
  "serde",
  "toml",
+ "tracing",
  "url",
  "vfs",
 ]

@@ -30,6 +30,7 @@ async-channel = { workspace = true }
 vfs = { workspace = true }
 percent-encoding = { workspace = true }
 cfg-expr = "0.20.1"
+tracing = { workspace = true }
 
 [features]
 jpegxr = ["ruffle_core/jpegxr"]

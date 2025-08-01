@@ -70,6 +70,7 @@ pub enum FramePhase {
 /// output exactly for two complex test cases (see `avm2/orphan_movie*`)
 #[instrument(level = "debug", skip_all)]
 pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
+    tracing::debug!(target: "run_frame::run_all_phases_avm2", "run_all_phases_avm2 started");
     let stage = context.stage;
 
     if !stage.movie().is_action_script_3() {

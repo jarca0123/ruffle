@@ -1889,6 +1889,10 @@ impl<'gc> MovieClip<'gc> {
                 frame_scripts.resize(index + 1, None);
             }
             frame_scripts[index] = Some(callable);
+            tracing::info!(target: "run_frame::run_all_phases_avm2", "Registering frame script for {}: frame_id={}, callable={:?}",
+                self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
+                frame_id,
+                callable);
             if frame_id == current_frame {
                 if *context.frame_phase == FramePhase::FrameScripts {
                     context.frame_script_cleanup_queue.push_back(self);
@@ -2183,11 +2187,25 @@ impl<'gc> MovieClip<'gc> {
     }
 
     fn run_local_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        tracing::info!(target: "run_frame::run_all_phases_avm2", "run_local_frame_scripts called for {} (is_root={}, instantiated_by_timeline={}, placed_by_script={})",
+            self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
+            self.is_root(),
+            self.instantiated_by_timeline(),
+            self.placed_by_script());
+        
         let avm2_object = self.0.object.get().and_then(|o| o.as_avm2_object());
 
         if let Some(avm2_object) = avm2_object {
             if self.0.has_pending_script.get() {
+                tracing::info!(target: "run_frame::run_all_phases_avm2", "AVM2 object found for {}, has_pending_script=true",
+                    self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+                
                 let frame_id = self.0.queued_script_frame.get();
+                tracing::info!(target: "run_frame::run_all_phases_avm2", "Queuing frame script for {}: current_frame={}, last_queued={:?}",
+                    self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
+                    self.current_frame(),
+                    self.0.last_queued_script_frame.get());
+                
                 // If we are already executing frame scripts, then we shouldn't
                 // run frame scripts recursively. This is because AVM2 can run
                 // gotos, which will both queue and run frame scripts for the
@@ -2199,13 +2217,31 @@ impl<'gc> MovieClip<'gc> {
                     .contains_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT)
                 {
                     let is_fresh_frame = self.0.last_queued_script_frame.get() != Some(frame_id);
+                    tracing::info!(target: "run_frame::run_all_phases_avm2", "Frame script check for {}: frame_id={}, last_queued={:?}, is_fresh_frame={}, should_execute={}",
+                        self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
+                        frame_id,
+                        self.0.last_queued_script_frame.get(),
+                        is_fresh_frame,
+                        is_fresh_frame);
 
                     if is_fresh_frame {
                         if let Some(callable) = self.frame_script(frame_id) {
                             self.0.last_queued_script_frame.set(Some(frame_id));
+                            tracing::info!(target: "run_frame::run_all_phases_avm2", "Reset last_queued_script_frame for {} (allows re-execution)",
+                                self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+                            
                             self.0.has_pending_script.set(false);
+                            tracing::info!(target: "run_frame::run_all_phases_avm2", "Setting pending script for {}: frame={}, has_script={:?}",
+                                self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
+                                frame_id,
+                                callable);
+
                             self.0
                                 .set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, true);
+
+                            tracing::info!(target: "run_frame::run_all_phases_avm2", "Executing frame script for {} frame {}",
+                                self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
+                                frame_id);
 
                             let movie = self.movie();
                             let domain = context
@@ -2227,13 +2263,26 @@ impl<'gc> MovieClip<'gc> {
                                 );
                             }
 
+                            tracing::info!(target: "run_frame::run_all_phases_avm2", "Completed frame script execution for {} frame {}",
+                                self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
+                                frame_id);
+                            
                             self.0
                                 .set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, false);
                         }
                     }
+                } else {
+                    tracing::info!(target: "run_frame::run_all_phases_avm2", "Skipping frame script execution for {} because it's already executing",
+                        self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
                 }
+            } else {
+                tracing::info!(target: "run_frame::run_all_phases_avm2", "No pending script for {}",
+                    self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
             }
         }
+        
+        tracing::info!(target: "run_frame::run_all_phases_avm2", "Finished run_local_frame_scripts for {}",
+            self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
 
         let goto_frame = self.0.queued_goto_frame.take();
         if let Some(frame) = goto_frame {
@@ -2369,13 +2418,30 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        tracing::info!(target: "run_frame::run_all_phases_avm2", "run_frame_scripts called for {}",
+            self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+        
         self.run_local_frame_scripts(context);
 
         if let Some(container) = self.as_container() {
-            for child in container.iter_render_list() {
+            let child_count = container.iter_render_list().count();
+            tracing::info!(target: "run_frame::run_all_phases_avm2", "Running frame scripts for {} children of {}",
+                child_count,
+                self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+            
+            for (i, child) in container.iter_render_list().enumerate() {
+                tracing::info!(target: "run_frame::run_all_phases_avm2", "Running frame scripts for child {}: {:?}",
+                    i,
+                    child.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
                 child.run_frame_scripts(context);
             }
+        } else {
+            tracing::info!(target: "run_frame::run_all_phases_avm2", "Running frame scripts for 0 children of {}",
+                self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
         }
+        
+        tracing::info!(target: "run_frame::run_all_phases_avm2", "Finished run_frame_scripts for {}",
+            self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
     }
 
     fn render_self(self, context: &mut RenderContext<'_, 'gc>) {
@@ -3045,6 +3111,9 @@ impl<'gc> MovieClipData<'gc> {
     fn increment_current_frame(&self) {
         let frame = self.current_frame.get();
         self.current_frame.set(frame + 1);
+        tracing::debug!(target: "run_frame::run_all_phases_avm2", "{}: increment_current_frame: {} -> {}",
+            self.base.base().name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
+            frame, frame + 1);
     }
 
     fn decrement_current_frame(&self) {

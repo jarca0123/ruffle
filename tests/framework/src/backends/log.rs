@@ -23,6 +23,7 @@ impl TestLogBackend {
 
 impl LogBackend for TestLogBackend {
     fn avm_trace(&self, message: &str) {
+        tracing::info!("{}", message);
         self.trace_output.borrow_mut().push_str(message);
         self.trace_output.borrow_mut().push('\n');
     }
