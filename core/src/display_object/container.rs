@@ -69,7 +69,6 @@ pub fn dispatch_added_to_stage_event_only<'gc>(
             child.object2());
         
         // Clear STOP_AFTER_GOTO flag for ALL movie clips when ANY display object is added to stage
-        
     }
     clear_all_stop_after_goto_flags(context.stage.into());
 }
