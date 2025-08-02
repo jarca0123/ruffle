@@ -1409,10 +1409,11 @@ impl<'gc> MovieClip<'gc> {
 
         let new_tag_pos = reader.get_ref().as_ptr() as u64 - tag_stream_start;
         tracing::debug!(
-            "run_frame_internal: Updating tag stream position from {} to {}, clip_id={}",
+            "run_frame_internal: Updating tag stream position from {} to {}, clip_id={}, more info: current_frame={}",
             self.0.tag_stream_pos.get(),
             new_tag_pos,
-            clip_id
+            clip_id,
+            self.0.current_frame()
         );
 
         self.0.tag_stream_pos.set(new_tag_pos);
@@ -1642,7 +1643,6 @@ impl<'gc> MovieClip<'gc> {
             && self.instantiated_by_timeline()
             && !self.placed_by_script();
 
-
         if is_implicit {
             // This is an implicit goto (a timeline loop).
             // Set a flag to prevent `run_frame_internal` from advancing the frame again.
@@ -1674,14 +1674,13 @@ impl<'gc> MovieClip<'gc> {
 
                 if has_only_graphic_children {
                     tracing::debug!(
-                        "run_goto: Setting STOP_AFTER_GOTO flag (only graphic children), clip_id={}",
-                        clip_id
-                    );
+                    "run_goto: Setting STOP_AFTER_GOTO flag (only graphic children), clip_id={}",
+                    clip_id
+                );
                     self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, true);
                 }
             }
         }
-
 
         let frame_before_rewind = self.current_frame();
         self.base().set_skip_next_enter_frame(false);
@@ -1713,11 +1712,11 @@ impl<'gc> MovieClip<'gc> {
 
         let is_rewind = if frame <= self.current_frame() {
             tracing::debug!(
-                "run_goto: Rewind detected (frame {} <= current {}), resetting to frame 0, clip_id={}",
-                frame,
-                self.current_frame(),
-                clip_id
-            );
+            "run_goto: Rewind detected (frame {} <= current {}), resetting to frame 0, clip_id={}",
+            frame,
+            self.current_frame(),
+            clip_id
+        );
 
             // Because we can only step forward, we have to start at frame 1
             // when rewinding. We don't actually remove children yet because
@@ -1768,15 +1767,15 @@ impl<'gc> MovieClip<'gc> {
         let mut index = 0;
 
         // Sanity; let's make sure we don't seek way too far.
-        let clamped_frame = frame.min(max(self.0.frames_loaded(), 0) as FrameNumber);
+        let clamped_frame = frame.min(self.0.frames_loaded().max(0) as FrameNumber);
 
         tracing::debug!(
-            "run_goto: Starting frame processing, target_frame={}, clamped_frame={}, frames_loaded={}, clip_id={}",
-            frame,
-            clamped_frame,
-            self.0.frames_loaded(),
-            clip_id
-        );
+        "run_goto: Starting frame processing, target_frame={}, clamped_frame={}, frames_loaded={}, clip_id={}",
+        frame,
+        clamped_frame,
+        self.0.frames_loaded(),
+        clip_id
+    );
 
         let mut removed_frame_scripts: Vec<DisplayObject<'gc>> = vec![];
 
@@ -1856,11 +1855,11 @@ impl<'gc> MovieClip<'gc> {
                             index,
                         );
                         tracing::debug!(
-                            "run_goto: Added goto command at index {}, total commands now {}, clip_id={}",
-                            index,
-                            goto_commands.len(),
-                            clip_id
-                        );
+                        "run_goto: Added goto command at index {}, total commands now {}, clip_id={}",
+                        index,
+                        goto_commands.len(),
+                        clip_id
+                    );
                         result
                     }
                     Action::Remove(version) => {
@@ -1930,15 +1929,6 @@ impl<'gc> MovieClip<'gc> {
         if is_rewind {
             tracing::debug!("run_goto: Processing rewind cleanup, clip_id={}", clip_id);
 
-            // Remove all display objects that were created after the
-            // destination frame.
-            //
-            // We do this after reading the clip timeline so that AS3 can't
-            // observe side effects of the rewinding process.
-            //
-            // TODO: We want to do something like self.children.retain here,
-            // but BTreeMap::retain does not exist.
-            // TODO: Should AS3 children ignore GOTOs?
             let children: SmallVec<[_; 16]> = self
                 .iter_render_list()
                 .filter(|clip| clip.place_frame() > frame)
@@ -1958,13 +1948,13 @@ impl<'gc> MovieClip<'gc> {
                 let placed_by_script = child.placed_by_script();
 
                 tracing::debug!(
-                    "run_goto: Removing child id={}, name='{}', place_frame={}, placed_by_script={}, clip_id={}",
-                    child_id,
-                    child_name,
-                    place_frame,
-                    placed_by_script,
-                    clip_id
-                );
+                "run_goto: Removing child id={}, name='{}', place_frame={}, placed_by_script={}, clip_id={}",
+                child_id,
+                child_name,
+                place_frame,
+                placed_by_script,
+                clip_id
+            );
 
                 if !child.placed_by_script() {
                     self.remove_child(context, child);
@@ -1979,7 +1969,7 @@ impl<'gc> MovieClip<'gc> {
             goto_commands.len(),
             clip_id
         );
-        
+
         for (i, cmd) in goto_commands.iter().enumerate() {
             tracing::debug!(
                 "run_goto: Command {}: frame={}, depth={}, action={:?}, clip_id={}",
@@ -1991,7 +1981,6 @@ impl<'gc> MovieClip<'gc> {
             );
         }
 
-        // Run the list of goto commands to actually create and update the display objects.
         let run_goto_command = |clip: MovieClip<'gc>,
                                 context: &mut UpdateContext<'gc>,
                                 params: &GotoPlaceObject<'_>| {
@@ -2007,12 +1996,12 @@ impl<'gc> MovieClip<'gc> {
             );
 
             tracing::debug!(
-                "run_goto: Checking AVM2 looping goto condition: is_avm2={}, is_implicit={}, child_exists={}, clip_id={}",
-                self.movie().is_action_script_3(),
-                is_implicit,
-                child_entry.is_some(),
-                clip_id
-            );
+            "run_goto: Checking AVM2 looping goto condition: is_avm2={}, is_implicit={}, child_exists={}, clip_id={}",
+            self.movie().is_action_script_3(),
+            is_implicit,
+            child_entry.is_some(),
+            clip_id
+        );
             if self.movie().is_action_script_3() && is_implicit && child_entry.is_none() {
                 tracing::debug!(
                     "run_goto: Queueing PlaceObject for AVM2 looping goto at depth {}, clip_id={}",
@@ -2020,12 +2009,6 @@ impl<'gc> MovieClip<'gc> {
                     clip_id
                 );
 
-                // Looping gotos do not run their PlaceObject commands at goto
-                // time. They are instead held to frameConstructed like normal
-                // playback.
-                //
-                // TODO: We can only queue *new* object placement, existing
-                // objects still get updated too early.
                 let new_tag = QueuedTag {
                     tag_type: QueuedTagAction::Place(params.version),
                     tag_start: params.tag_start,
@@ -2041,36 +2024,29 @@ impl<'gc> MovieClip<'gc> {
             }
 
             match (params.place_object.action, child_entry, is_rewind) {
-                // Apply final delta to display parameters.
-                // For rewinds, if an object was created before the final frame,
-                // it will exist on the final frame as well. Re-use this object
-                // instead of recreating.
-                // If the ID is 0, we are modifying a previous child. Otherwise, we're replacing it.
-                // If it's a rewind, we removed any dead children above, so we always
-                // modify the previous child.
                 (_, Some(prev_child), true) | (PlaceObjectAction::Modify, Some(prev_child), _) => {
                     let child_name = prev_child.name().map(|s| s.to_string()).unwrap_or_default();
                     let child_id = prev_child.id();
                     tracing::debug!(
-                        "run_goto: Modifying existing child id={}, name='{}' at depth {}, clip_id={}",
-                        child_id,
-                        child_name,
-                        params.depth(),
-                        clip_id
-                    );
+                    "run_goto: Modifying existing child id={}, name='{}' at depth {}, clip_id={}",
+                    child_id,
+                    child_name,
+                    params.depth(),
+                    clip_id
+                );
                     prev_child.apply_place_object(context, &params.place_object);
                 }
                 (swf::PlaceObjectAction::Replace(id), Some(prev_child), _) => {
                     let child_name = prev_child.name().map(|s| s.to_string()).unwrap_or_default();
                     let child_id = prev_child.id();
                     tracing::debug!(
-                        "run_goto: Replacing child id={}, name='{}' with id {} at depth {}, clip_id={}",
-                        child_id,
-                        child_name,
-                        id,
-                        params.depth(),
-                        clip_id
-                    );
+                    "run_goto: Replacing child id={}, name='{}' with id {} at depth {}, clip_id={}",
+                    child_id,
+                    child_name,
+                    id,
+                    params.depth(),
+                    clip_id
+                );
                     prev_child.replace_with(context, id);
                     prev_child.apply_place_object(context, &params.place_object);
                     prev_child.set_place_frame(params.frame);
@@ -2089,21 +2065,20 @@ impl<'gc> MovieClip<'gc> {
                         let child_name = child.name().map(|s| s.to_string()).unwrap_or_default();
                         let child_id = child.id();
                         tracing::debug!(
-                            "run_goto: Successfully created child id={}, name='{}' at depth {}, clip_id={}",
-                            child_id,
-                            child_name,
-                            params.depth(),
-                            clip_id
-                        );
-                        // Set the place frame to the frame where the object *would* have been placed.
+                        "run_goto: Successfully created child id={}, name='{}' at depth {}, clip_id={}",
+                        child_id,
+                        child_name,
+                        params.depth(),
+                        clip_id
+                    );
                         child.set_place_frame(params.frame);
                     } else {
                         tracing::warn!(
-                            "run_goto: Failed to instantiate child with id {} at depth {}, clip_id={}",
-                            id,
-                            params.depth(),
-                            clip_id
-                        );
+                        "run_goto: Failed to instantiate child with id {} at depth {}, clip_id={}",
+                        id,
+                        params.depth(),
+                        clip_id
+                    );
                     }
                 }
                 _ => {
@@ -2116,12 +2091,6 @@ impl<'gc> MovieClip<'gc> {
             }
         };
 
-        // We have to be sure that queued actions are generated in the same order
-        // as if the playhead had reached this frame normally.
-
-        // First, sort the goto commands in the order of execution.
-        // (Maybe it'd be better to keeps this list sorted as we create it?
-        // Currently `swap_remove` calls futz with the order; but we could use `remove`).
         goto_commands.sort_by_key(|params| params.index);
 
         tracing::debug!(
@@ -2130,7 +2099,6 @@ impl<'gc> MovieClip<'gc> {
             clip_id
         );
 
-        // Then, run frames for children that were created before this frame.
         let before_frame_commands: Vec<_> = goto_commands
             .iter()
             .filter(|params| params.frame < frame)
@@ -2147,69 +2115,49 @@ impl<'gc> MovieClip<'gc> {
             .iter()
             .for_each(|goto| run_goto_command(self, context, goto));
 
-        // Next, run the final frame for the parent clip.
-        // Re-run the final frame without display tags (DoAction, etc.)
-        // Note that this only happens if the frame exists and is loaded;
-        // e.g. gotoAndStop(9999) displays the final frame, but actions don't run!
         if hit_target_frame {
             tracing::debug!(
                 "run_goto: Running final frame {} for parent clip, clip_id={}",
                 frame,
                 clip_id
             );
-
-            if !self.0.contains_flag(MovieClipFlags::FRAME_ADVANCED_BY_GOTO) {
-                tracing::debug!("run_goto: Decrementing current frame, clip_id={}", clip_id);
-                self.0.decrement_current_frame();
-            }
-
-            tracing::debug!(
-                "run_goto: Setting tag_stream_pos to {}, clip_id={}",
-                frame_pos,
-                clip_id
-            );
-            self.0.tag_stream_pos.set(frame_pos);
-
-            if is_implicit && self.movie().is_action_script_3() {
-                // For AVM2 looping gotos, we need to process the target frame correctly
-                // Instead of relying on frame boundaries, we'll process the frame normally
-                tracing::debug!(
-                    "run_goto: AVM2 looping goto, processing target frame {}, clip_id={}",
-                    frame,
-                    clip_id
-                );
-                // For AVM2 looping gotos, we need to ensure we process the target frame
-                // by setting the current frame to the target frame and processing it
-                if frame != self.current_frame() {
-                    tracing::debug!(
-                        "run_goto: Setting current frame to target frame {}, clip_id={}",
-                        frame,
-                        clip_id
-                    );
-                    self.0.current_frame.set(frame);
-                }
-            }
-            // If we changed frames, then trigger any sounds in our target frame.
-            // However, if we executed a 'no-op goto' (start and end frames are the same),
-            // then do *not* run sounds. Some SWFS (e.g. 'This is the only level too')
-            // rely on this behavior.
             let run_sounds = frame != frame_before_rewind;
-            tracing::debug!(
-                "run_goto: Running frame_internal with run_sounds={}, clip_id={}",
-                run_sounds,
-                clip_id
-            );
+
             if self.0.contains_flag(MovieClipFlags::STOP_AFTER_GOTO) {
                 tracing::debug!("run_goto: Stopping after goto, clip_id={}", clip_id);
-                // Don't run frame_internal when STOP_AFTER_GOTO is set - this prevents frame scripts from executing
+                // We still need to ensure the tag position is correct for the final frame.
                 self.0.tag_stream_pos.set(final_tag_pos);
             } else {
+                // We prepare to run the actions for the frame we just landed on.
+                // `run_frame_internal` is designed to *advance* the playhead, so it will
+                // always increment the current frame number. To counteract this and make it
+                // run the actions for the frame we're *already on*, we decrement the frame
+                // counter first and set the tag stream position to the start of the frame's tags.
+                // `run_frame_internal` will then increment the frame back to the correct number
+                // and run its tags as intended.
+                tracing::debug!(
+                "run_goto: Preparing to run actions for target frame {}. Temporarily setting frame to {} and tag pos to {}",
+                frame, frame - 1, frame_pos
+            );
+                self.0.current_frame.set(frame - 1);
+                self.0.tag_stream_pos.set(frame_pos);
                 self.run_frame_internal(
                     context,
-                    false,
+                    false, // Don't run display actions, we already did those.
                     run_sounds,
                     self.movie().is_action_script_3(),
                 );
+            }
+
+            // Post-condition: Ensure the current_frame is correct. `run_goto` is the
+            // source of truth for the frame number, so we enforce it here, correcting
+            // for any unexpected behavior in run_frame_internal (e.g. AVM2 not incrementing).
+            if self.0.current_frame.get() != frame {
+                tracing::warn!(
+                "run_goto: Correcting inconsistent frame number after helper call. Was {}, should be {}",
+                self.0.current_frame.get(), frame
+            );
+                self.0.current_frame.set(frame);
             }
         } else {
             tracing::debug!(
@@ -2220,7 +2168,6 @@ impl<'gc> MovieClip<'gc> {
             self.0.current_frame.set(clamped_frame);
         }
 
-        // Finally, run frames for children that are placed on this frame.
         let on_frame_commands: Vec<_> = goto_commands
             .iter()
             .filter(|params| params.frame >= frame)
@@ -2237,12 +2184,6 @@ impl<'gc> MovieClip<'gc> {
             .iter()
             .for_each(|goto| run_goto_command(self, context, goto));
 
-        // On AVM2, all explicit gotos act the same way as a normal new frame,
-        // save for the lack of an enterFrame event. Since this must happen
-        // before AS3 continues execution, this is effectively a "recursive
-        // frame".
-        //
-        // Our queued place tags will now run at this time, too.
         if !is_implicit {
             tracing::debug!(
                 "run_goto: Running inner_goto_frame for explicit goto, clip_id={}",
@@ -2266,7 +2207,6 @@ impl<'gc> MovieClip<'gc> {
 
         self.assert_expected_tag_end(hit_target_frame);
     }
-
     fn construct_as_avm1_object(
         self,
         context: &mut UpdateContext<'gc>,
@@ -5060,7 +5000,10 @@ impl<'gc, 'a> MovieClip<'gc> {
 
     pub fn clear_stop_after_goto_flag(self) {
         tracing::debug!("clear_stop_after_goto_flag: clip_id={}", self.0.id());
-        tracing::debug!("clear_stop_after_goto_flag: flag={}", self.0.contains_flag(MovieClipFlags::STOP_AFTER_GOTO));
+        tracing::debug!(
+            "clear_stop_after_goto_flag: flag={}",
+            self.0.contains_flag(MovieClipFlags::STOP_AFTER_GOTO)
+        );
         let backtrace = Backtrace::capture();
         tracing::debug!("clear_stop_after_goto_flag: backtrace={:?}", backtrace);
         self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false);
