@@ -1185,14 +1185,27 @@ impl<'gc> MovieClip<'gc> {
         let current_frame = self.0.current_frame();
         let clip_id = self.0.id();
 
-        // Check if STOP_AFTER_GOTO flag is set - if so, don't run frame scripts
         if self.0.contains_flag(MovieClipFlags::STOP_AFTER_GOTO) {
-            tracing::debug!(
-                "run_frame_internal: STOP_AFTER_GOTO flag set, skipping frame execution, clip_id={}",
-                clip_id
-            );
-            return;
+            // This clip was flagged for stopping on the last frame.
+            // RE-VALIDATE the condition NOW.
+            let has_only_graphic_children = self.raw_container().iter_render_list().all(|child| {
+                child.as_movie_clip().is_none() && child.as_drawing(context.gc()).is_some()
+            });
+
+            if has_only_graphic_children {
+                // The condition still holds. The clip is still simple.
+                // Now we can safely stop it.
+                self.stop(context);
+                self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false); // Clear the flag.
+                return; // Exit; do not advance this frame.
+            } else {
+                // DYNAMIC INVALIDATION: The condition is now false!
+                // A script must have added a non-graphic child.
+                // Clear the flag and proceed with normal frame execution.
+                self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false);
+            }
         }
+
 
         tracing::debug!(
             "run_frame_internal: clip_id={}, current_frame={}, run_display_actions={}, run_sounds={}, is_action_script_3={}",
@@ -1678,6 +1691,7 @@ impl<'gc> MovieClip<'gc> {
                     clip_id
                 );
                     self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, true);
+                    //self.stop(context);
                 }
             }
         }
@@ -2704,15 +2718,42 @@ impl<'gc> MovieClip<'gc> {
         }
     }
 
-    fn run_local_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+    // in core/src/display_object/movie_clip.rs
+
+    // in core/src/display_object/movie_clip.rs
+
+    pub fn run_local_frame_scripts(self, context: &mut UpdateContext<'gc>) {
         tracing::info!(target: "run_frame::run_all_phases_avm2", "run_local_frame_scripts called for {} (is_root={}, instantiated_by_timeline={}, placed_by_script={})",
         self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
         self.is_root(),
         self.instantiated_by_timeline(),
         self.placed_by_script());
 
-        // Check if we should stop after goto - allow frame script to execute but then stop
-        let should_stop_after_scripts = self.0.contains_flag(MovieClipFlags::STOP_AFTER_GOTO);
+        // If this movieclip was determined to be a simple looping graphic
+        // in `run_goto`, then it should be stopped immediately *before*
+        // any further scripts are run. This prevents the frame script of the
+        // loop destination from running an extra time.
+        if self.0.contains_flag(MovieClipFlags::STOP_AFTER_GOTO) {
+            tracing::info!(target: "run_frame::run_all_phases_avm2",
+            "Instance {} stopping due to STOP_AFTER_GOTO flag.",
+            self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+
+            self.stop(context);
+
+            // Mark the script for the destination frame as 'executed' to prevent it
+            // from running again if a parent's loop re-triggers script execution.
+            self.0
+                .last_queued_script_frame
+                .set(Some(self.current_frame()));
+
+            // The flags have served their purpose, clear them.
+            self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false);
+            self.0
+                .set_flag(MovieClipFlags::FRAME_ADVANCED_BY_GOTO, false);
+
+            // Do not execute any scripts for this clip this frame.
+            return;
+        }
 
         let avm2_object = self.0.object.get().and_then(|o| o.as_avm2_object());
 
@@ -2721,18 +2762,12 @@ impl<'gc> MovieClip<'gc> {
                 tracing::info!(target: "run_frame::run_all_phases_avm2", "AVM2 object found for {}, has_pending_script=true",
                 self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
 
-                let frame_id = self.0.queued_script_frame.get();
+                let frame_id = self.current_frame();
                 tracing::info!(target: "run_frame::run_all_phases_avm2", "Queuing frame script for {}: current_frame={}, last_queued={:?}",
                 self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
                 self.current_frame(),
                 self.0.last_queued_script_frame.get());
 
-                // If we are already executing frame scripts, then we shouldn't
-                // run frame scripts recursively. This is because AVM2 can run
-                // gotos, which will both queue and run frame scripts for the
-                // whole movie again. If a goto is attempting to queue frame
-                // scripts on us AGAIN, we should allow the current stack to
-                // wind down before handling that.
                 if !self
                     .0
                     .contains_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT)
@@ -2811,14 +2846,7 @@ impl<'gc> MovieClip<'gc> {
                 .set_flag(MovieClipFlags::FRAME_ADVANCED_BY_GOTO, false);
         }
 
-        // Stop the movie clip if the flag was set (after frame scripts have executed)
-        if should_stop_after_scripts {
-            tracing::info!(target: "run_frame::run_all_phases_avm2",
-            "Instance {} stopping after frame script execution",
-            self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
-            self.stop(context);
-            //self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false);
-        }
+        // No longer need to check `should_stop_after_scripts` here, as it's handled at the top.
 
         let goto_frame = self.0.queued_goto_frame.take();
         if let Some(frame) = goto_frame {
