@@ -233,6 +233,10 @@ pub struct UpdateContext<'gc> {
     // Movie clips whose frame scripts were registered during frame script phase
     // requires a seperate clean-up pass when running frame-scripts instead of executing them in place
     pub frame_script_cleanup_queue: VecDeque<MovieClip<'gc>>,
+    /// Whether to defer instantiation scripts until the end of the frame.
+    /// This is used to avoid running instantiation scripts
+    /// before all objects are fully constructed.
+    pub defer_instantiation_scripts: bool,
 }
 
 impl<'gc> HasStringContext<'gc> for UpdateContext<'gc> {

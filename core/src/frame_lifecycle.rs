@@ -155,6 +155,8 @@ pub fn run_inner_goto_frame<'gc>(
     stage.construct_frame(context);
     stage.frame_constructed(context);
 
+    
+
     *context.frame_phase = FramePhase::FrameScripts;
     stage.run_frame_scripts(context);
     Avm2::each_orphan_obj(context, |orphan, context| {

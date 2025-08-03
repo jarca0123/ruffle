@@ -1,5 +1,5 @@
 use ruffle_core::backend::storage::StorageBackend;
-use std::fs;
+use std::{backtrace, fs};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -43,6 +43,8 @@ impl StorageBackend for DiskStorageBackend {
             Ok(data) => Some(data),
             Err(e) => {
                 tracing::warn!("Unable to read file \"{}\": {:?}", name, e);
+                let backtrace = backtrace::Backtrace::capture();
+                tracing::warn!("Backtrace: {:?}", backtrace);
                 None
             }
         }

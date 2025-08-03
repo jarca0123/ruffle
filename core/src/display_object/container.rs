@@ -81,7 +81,7 @@ pub fn dispatch_added_to_stage_event_only<'gc>(
 
 /// Clear STOP_AFTER_GOTO flag for all movie clips in the display tree
 fn clear_all_stop_after_goto_flags<'gc>(root: DisplayObject<'gc>) {
-    /*if let Some(movie_clip) = root.as_movie_clip() {
+    if let Some(movie_clip) = root.as_movie_clip() {
         movie_clip.clear_stop_after_goto_flag();
     }
     
@@ -89,7 +89,7 @@ fn clear_all_stop_after_goto_flags<'gc>(root: DisplayObject<'gc>) {
         for child in container.iter_render_list() {
             clear_all_stop_after_goto_flags(child);
         }
-    }*/
+    }
 }
 
 /// Dispatch the `addedToStage` event on a child and all of it's grandchildren,

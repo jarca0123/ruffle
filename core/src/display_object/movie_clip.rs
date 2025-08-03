@@ -46,7 +46,7 @@ use gc_arena::{Collect, Gc, GcWeak, Mutation};
 use ruffle_macros::istr;
 use ruffle_render::perspective_projection::PerspectiveProjection;
 use smallvec::SmallVec;
-use std::backtrace::Backtrace;
+use std::backtrace::{self, Backtrace};
 use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, Ref, RefCell, RefMut};
 use std::cmp::max;
@@ -561,6 +561,14 @@ impl<'gc> MovieClip<'gc> {
             shared.import_exports_of_importer(context, importer_movie);
         }
 
+        tracing::debug!(
+            "MovieClip {}: Preloaded {} frames",
+            self.0.shared.get().id,
+            shared.preload_progress.cur_preload_frame.get()
+        );
+        let actual_frame_count = shared.preload_progress.cur_preload_frame.get();
+        self.set_real_frames(actual_frame_count);
+
         if is_finished {
             // End-of-clip should be treated as ShowFrame
             shared.show_frame(reader, 0).unwrap();
@@ -934,6 +942,21 @@ impl<'gc> MovieClip<'gc> {
         self.0.total_frames()
     }
 
+    /// Get the actual number of frames found during parsing
+    pub fn real_frames(self) -> Option<FrameNumber> {
+        self.0.shared.get().real_frames.get()
+    }
+
+    /// Set the actual number of frames found during parsing
+    pub fn set_real_frames(self, frames: FrameNumber) {
+        self.0.shared.get().real_frames.set(Some(frames));
+    }
+
+    /// Get the effective total frames (real frames if available, otherwise AVM frames count)
+    pub fn effective_total_frames(self) -> FrameNumber {
+        self.real_frames().unwrap_or_else(|| self.total_frames())
+    }
+
     pub fn has_frame_script(self, frame: FrameNumber) -> bool {
         self.frame_script(frame).is_some()
     }
@@ -1162,12 +1185,43 @@ impl<'gc> MovieClip<'gc> {
         if self.0.contains_flag(MovieClipFlags::STOP_AFTER_GOTO) {
             // Clear the flag and stop advancing frames
             //self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false);
+            tracing::debug!(
+                "determine_next_frame: Stopping clip {} after goto on frame {}",
+                self.0.id(),
+                self.0.current_frame()
+            );
             return NextFrame::Same;
         }
 
-        if self.current_frame() < self.total_frames() {
-            NextFrame::Next
-        } else if self.total_frames() > 1 {
+        let shared = Gc::as_ref(self.0.shared.get());
+        let data = shared.swf.clone();
+        let mut reader = data.read_from(self.0.tag_stream_pos.get());
+
+        // We ignore the frame count from the header, and instead continue
+        // until we reach the end of the stream or a `TagCode::End`.
+        // Flash Player ignores the frame count, and just executes the full
+        // tag stream before returning to the first frame.
+        
+        // Check if there are more tags to process by looking for a ShowFrame tag
+        let mut has_more_tags = false;
+        let tag_callback = |_reader: &mut SwfStream<'_>, tag_code, _tag_len| {
+            if tag_code == TagCode::ShowFrame {
+                has_more_tags = true;
+                Ok(ControlFlow::Exit)
+            } else {
+                Ok(ControlFlow::Continue)
+            }
+        };
+
+        // Try to decode tags to see if we have a ShowFrame tag
+        if let Ok(_) = crate::tag_utils::decode_tags(&mut reader, tag_callback) {
+            if has_more_tags {
+                return NextFrame::Next;
+            }
+        }
+
+        // If we reach here, we've either hit the end of the stream or there are no more ShowFrame tags
+        if self.total_frames() > 1 {
             NextFrame::First
         } else {
             NextFrame::Same
@@ -1195,6 +1249,11 @@ impl<'gc> MovieClip<'gc> {
             if has_only_graphic_children {
                 // The condition still holds. The clip is still simple.
                 // Now we can safely stop it.
+                tracing::debug!(
+                    "run_frame_internal: Stopping clip {} after goto on frame {}",
+                    clip_id,
+                    current_frame
+                );
                 self.stop(context);
                 self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false); // Clear the flag.
                 return; // Exit; do not advance this frame.
@@ -2086,6 +2145,7 @@ impl<'gc> MovieClip<'gc> {
                         clip_id
                     );
                         child.set_place_frame(params.frame);
+                        child.base().set_flag(crate::display_object::DisplayObjectFlags::SKIP_NEXT_FRAME_FOR_SELF, true);
                     } else {
                         tracing::warn!(
                         "run_goto: Failed to instantiate child with id {} at depth {}, clip_id={}",
@@ -2421,7 +2481,7 @@ impl<'gc> MovieClip<'gc> {
                 frame_scripts.resize(index + 1, None);
             }
             frame_scripts[index] = Some(callable);
-            tracing::info!(target: "run_frame::run_all_phases_avm2", "Registering frame script for {}: frame_id={}, callable={:?}",
+            tracing::info!("Registering frame script for {}: frame_id={}, callable={:?}",
                 self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
                 frame_id,
                 callable);
@@ -2723,18 +2783,29 @@ impl<'gc> MovieClip<'gc> {
     // in core/src/display_object/movie_clip.rs
 
     pub fn run_local_frame_scripts(self, context: &mut UpdateContext<'gc>) {
-        tracing::info!(target: "run_frame::run_all_phases_avm2", "run_local_frame_scripts called for {} (is_root={}, instantiated_by_timeline={}, placed_by_script={})",
+        tracing::info!( "run_local_frame_scripts called for {} (is_root={}, instantiated_by_timeline={}, placed_by_script={})",
         self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
         self.is_root(),
         self.instantiated_by_timeline(),
         self.placed_by_script());
 
+        if self.base().contains_flag(crate::display_object::DisplayObjectFlags::SKIP_NEXT_FRAME_FOR_SELF) {
+            let backtrace = std::backtrace::Backtrace::capture();
+            tracing::warn!("Skipping frame script execution for {} due to SKIP_NEXT_FRAME_FOR_SELF flag. Backtrace: {:?}",
+            self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
+            backtrace);
+            tracing::info!("Skipping frame script execution for {} due to SKIP_NEXT_FRAME_FOR_SELF flag",
+            self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+            self.base().set_flag(crate::display_object::DisplayObjectFlags::SKIP_NEXT_FRAME_FOR_SELF, false);
+            self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false);
+            return;
+        }
         // If this movieclip was determined to be a simple looping graphic
         // in `run_goto`, then it should be stopped immediately *before*
         // any further scripts are run. This prevents the frame script of the
         // loop destination from running an extra time.
         if self.0.contains_flag(MovieClipFlags::STOP_AFTER_GOTO) {
-            tracing::info!(target: "run_frame::run_all_phases_avm2",
+            tracing::info!(
             "Instance {} stopping due to STOP_AFTER_GOTO flag.",
             self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
 
@@ -2759,11 +2830,11 @@ impl<'gc> MovieClip<'gc> {
 
         if let Some(avm2_object) = avm2_object {
             if self.0.has_pending_script.get() {
-                tracing::info!(target: "run_frame::run_all_phases_avm2", "AVM2 object found for {}, has_pending_script=true",
+                tracing::info!("AVM2 object found for {}, has_pending_script=true",
                 self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
 
                 let frame_id = self.current_frame();
-                tracing::info!(target: "run_frame::run_all_phases_avm2", "Queuing frame script for {}: current_frame={}, last_queued={:?}",
+                tracing::info!("Queuing frame script for {}: current_frame={}, last_queued={:?}",
                 self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
                 self.current_frame(),
                 self.0.last_queued_script_frame.get());
@@ -2773,7 +2844,7 @@ impl<'gc> MovieClip<'gc> {
                     .contains_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT)
                 {
                     let is_fresh_frame = self.0.last_queued_script_frame.get() != Some(frame_id);
-                    tracing::info!(target: "run_frame::run_all_phases_avm2", "Frame script check for {}: frame_id={}, last_queued={:?}, is_fresh_frame={}, should_execute={}",
+                    tracing::info!("Frame script check for {}: frame_id={}, last_queued={:?}, is_fresh_frame={}, should_execute={}",
                     self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
                     frame_id,
                     self.0.last_queued_script_frame.get(),
@@ -2783,11 +2854,11 @@ impl<'gc> MovieClip<'gc> {
                     if is_fresh_frame {
                         if let Some(callable) = self.frame_script(frame_id) {
                             self.0.last_queued_script_frame.set(Some(frame_id));
-                            tracing::info!(target: "run_frame::run_all_phases_avm2", "Reset last_queued_script_frame for {} (allows re-execution)",
+                            tracing::info!("Reset last_queued_script_frame for {} (allows re-execution)",
                             self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
 
                             self.0.has_pending_script.set(false);
-                            tracing::info!(target: "run_frame::run_all_phases_avm2", "Setting pending script for {}: frame={}, has_script={:?}",
+                            tracing::info!("Setting pending script for {}: frame={}, has_script={:?}",
                             self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
                             frame_id,
                             callable);
@@ -2795,7 +2866,7 @@ impl<'gc> MovieClip<'gc> {
                             self.0
                                 .set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, true);
 
-                            tracing::info!(target: "run_frame::run_all_phases_avm2", "Executing frame script for {} frame {}",
+                            tracing::info!("Executing frame script for {} frame {}",
                             self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
                             frame_id);
 
@@ -2819,7 +2890,7 @@ impl<'gc> MovieClip<'gc> {
                                 );
                             }
 
-                            tracing::info!(target: "run_frame::run_all_phases_avm2", "Completed frame script execution for {} frame {}",
+                            tracing::info!("Completed frame script execution for {} frame {}",
                             self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
                             frame_id);
 
@@ -2828,16 +2899,16 @@ impl<'gc> MovieClip<'gc> {
                         }
                     }
                 } else {
-                    tracing::info!(target: "run_frame::run_all_phases_avm2", "Skipping frame script execution for {} because it's already executing",
+                    tracing::info!("Skipping frame script execution for {} because it's already executing",
                     self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
                 }
             } else {
-                tracing::info!(target: "run_frame::run_all_phases_avm2", "No pending script for {}",
+                tracing::info!("No pending script for {}",
                 self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
             }
         }
 
-        tracing::info!(target: "run_frame::run_all_phases_avm2", "Finished run_local_frame_scripts for {}",
+        tracing::info!("Finished run_local_frame_scripts for {}",
         self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
 
         // The goto flag has served its purpose, now we can clear it.
@@ -2983,29 +3054,29 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
-        tracing::info!(target: "run_frame::run_all_phases_avm2", "run_frame_scripts called for {}",
+        tracing::info!( "run_frame_scripts called for {}",
             self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
 
         self.run_local_frame_scripts(context);
 
         if let Some(container) = self.as_container() {
             let child_count = container.iter_render_list().count();
-            tracing::info!(target: "run_frame::run_all_phases_avm2", "Running frame scripts for {} children of {}",
+            tracing::info!("Running frame scripts for {} children of {}",
                 child_count,
                 self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
 
             for (i, child) in container.iter_render_list().enumerate() {
-                tracing::info!(target: "run_frame::run_all_phases_avm2", "Running frame scripts for child {}: {:?}",
+                tracing::info!("Running frame scripts for child {}: {:?}",
                     i,
                     child.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
                 child.run_frame_scripts(context);
             }
         } else {
-            tracing::info!(target: "run_frame::run_all_phases_avm2", "Running frame scripts for 0 children of {}",
+            tracing::info!("Running frame scripts for 0 children of {}",
                 self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
         }
 
-        tracing::info!(target: "run_frame::run_all_phases_avm2", "Finished run_frame_scripts for {}",
+        tracing::info!("Finished run_frame_scripts for {}",
             self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
     }
 
@@ -3705,7 +3776,7 @@ impl<'gc> MovieClipData<'gc> {
     fn increment_current_frame(&self) {
         let frame = self.current_frame.get();
         self.current_frame.set(frame + 1);
-        tracing::debug!(target: "run_frame::run_all_phases_avm2", "{}: increment_current_frame: {} -> {}",
+        tracing::debug!("{}: increment_current_frame: {} -> {}",
             self.base.base().name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
             frame, frame + 1);
     }
@@ -5035,6 +5106,7 @@ impl<'gc, 'a> MovieClip<'gc> {
         let backtrace = Backtrace::capture();
         tracing::debug!("clear_stop_after_goto_flag: backtrace={:?}", backtrace);
         self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false);
+        
     }
 }
 
@@ -5091,6 +5163,8 @@ struct MovieClipShared<'gc> {
     id: CharacterId,
     swf: SwfSlice,
     total_frames: FrameNumber,
+    /// The actual number of frames found during parsing (may differ from total_frames)
+    real_frames: Cell<Option<FrameNumber>>,
     /// Preload progress for the given clip's tag stream.
     #[collect(require_static)]
     preload_progress: PreloadProgress,
@@ -5152,6 +5226,7 @@ impl<'gc> MovieClipShared<'gc> {
             id,
             swf,
             total_frames,
+            real_frames: Cell::new(None),
             preload_progress: Default::default(),
             exported_name: Lock::new(None),
             avm2_class: Lock::new(None),

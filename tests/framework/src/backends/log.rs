@@ -30,6 +30,7 @@ impl LogBackend for TestLogBackend {
 
     fn avm_warning(&self, message: &str) {
         // Match the format used by Flash Player
+        tracing::warn!("Warning: {}", message);
         self.trace_output.borrow_mut().push_str("Warning: ");
         self.trace_output.borrow_mut().push_str(message);
         self.trace_output.borrow_mut().push('\n');
