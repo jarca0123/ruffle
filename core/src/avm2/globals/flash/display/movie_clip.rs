@@ -314,7 +314,7 @@ pub fn get_is_playing<'gc>(
         .as_display_object()
         .and_then(|dobj| dobj.as_movie_clip())
     {
-        return Ok((mc.programmatically_played() && mc.playing()).into());
+        return Ok((mc.programmatically_played() && mc.playing() && !mc.play_after_frame_script()).into());
     }
 
     Ok(Value::Undefined)
@@ -351,11 +351,15 @@ pub fn goto_and_play<'gc>(
         .and_then(|dobj| dobj.as_movie_clip())
     {
         mc.set_programmatically_played();
-
+        mc.set_play_after_frame_script();
+        mc.clear_stop_after_play();
         let frame_or_label = args.get_value(0);
         let scene = args.try_get_string(activation, 1)?;
 
         goto_frame(activation, mc, frame_or_label, scene, false)?;
+        if mc.queued_goto_frame().is_none() {
+            mc.clear_play_after_frame_script();
+        }
     }
 
     Ok(Value::Undefined)
@@ -375,8 +379,12 @@ pub fn goto_and_stop<'gc>(
     {
         let frame_or_label = args.get_value(0);
         let scene = args.try_get_string(activation, 1)?;
-
+        mc.set_stop_after_play();
+        mc.clear_play_after_frame_script();
         goto_frame(activation, mc, frame_or_label, scene, true)?;
+        if mc.queued_goto_frame().is_none() {
+            mc.clear_stop_after_play();
+        }
     }
 
     Ok(Value::Undefined)
@@ -445,6 +453,16 @@ pub fn goto_frame<'gc>(
         }
     };
 
+    tracing::debug!(
+        "goto_frame: frame_or_label={:?}, scene={:?}, frame={}",
+        frame_or_label, scene, frame
+    );
+    if frame.max(1) as u16 == mc.current_frame() {
+        // If the frame is the same, we don't need to do anything.
+        mc.set_erroneous_queued_goto_frame();
+        //return Ok(());
+    }
+
     mc.goto_frame(activation.context, frame.max(1) as u16, stop);
 
     Ok(())
@@ -462,6 +480,11 @@ pub fn stop<'gc>(
         .as_display_object()
         .and_then(|dobj| dobj.as_movie_clip())
     {
+        if let Some(Some((frame, stop))) = mc.queued_goto_frame() {
+            if stop == false {
+                return Ok(Value::Undefined);
+            }
+        }
         mc.stop(activation.context);
     }
 
@@ -480,6 +503,11 @@ pub fn play<'gc>(
         .as_display_object()
         .and_then(|dobj| dobj.as_movie_clip())
     {
+        if let Some(Some((frame, stop))) = mc.queued_goto_frame() {
+            if stop {
+                return Ok(Value::Undefined);
+            }
+        }
         mc.set_programmatically_played();
         mc.play();
     }

@@ -189,8 +189,7 @@ pub struct MovieClipData<'gc> {
 
     last_queued_script_frame: Cell<Option<FrameNumber>>,
     queued_script_frame: Cell<FrameNumber>,
-    queued_goto_frame: Cell<Option<FrameNumber>>,
-
+    queued_goto_frame: Cell<Option<Option<(FrameNumber, bool)>>>,
     current_frame: Cell<FrameNumber>,
 
     flags: Cell<MovieClipFlags>,
@@ -241,7 +240,7 @@ impl<'gc> MovieClipData<'gc> {
             last_queued_script_frame: Cell::new(None),
             queued_script_frame: Cell::new(0),
             has_pending_script: Cell::new(false),
-            queued_goto_frame: Cell::new(None),
+            queued_goto_frame: Cell::new(Some(None)),
             drop_target: Lock::new(None),
             queued_tags: Default::default(),
             hit_area: Lock::new(None),
@@ -709,6 +708,39 @@ impl<'gc> MovieClip<'gc> {
         self.0.set_programmatically_played()
     }
 
+    pub fn set_stop_after_play(self) {
+        self.0.set_stop_after_play();
+    }
+
+    pub fn clear_stop_after_play(self) {
+        self.0.clear_stop_after_play();
+    }
+    pub fn stop_after_play(self) -> bool {
+        self.0.stop_after_play()
+    }
+
+    pub fn set_play_after_frame_script(self) {
+        self.0.set_play_after_frame_script();
+    }
+
+    pub fn clear_play_after_frame_script(self) {
+        self.0.clear_play_after_frame_script();
+    }
+
+    pub fn play_after_frame_script(self) -> bool {
+        self.0.play_after_frame_script()
+    }
+
+    pub fn i_ran_out_of_names(&self) -> bool {
+        self.0.i_ran_out_of_names()
+    }
+    pub fn set_i_ran_out_of_names(&self) {
+        self.0.set_i_ran_out_of_names();
+    }
+    pub fn clear_i_ran_out_of_names(&self) {
+        self.0.clear_i_ran_out_of_names();
+    }
+
     pub fn next_frame(self, context: &mut UpdateContext<'gc>) {
         if self.current_frame() < self.total_frames() {
             self.goto_frame(context, self.current_frame() + 1, true);
@@ -747,10 +779,15 @@ impl<'gc> MovieClip<'gc> {
     /// lifecycle events will be retriggered.
     pub fn goto_frame(self, context: &mut UpdateContext<'gc>, frame: FrameNumber, stop: bool) {
         // Stop first, in case we need to kill and restart the stream sound.
-        if stop {
-            self.stop(context);
-        } else {
-            self.play();
+        if !self
+            .0
+            .contains_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT)
+        {
+            if stop {
+                self.stop(context);
+            } else {
+                self.play();
+            }
         }
 
         // When performing goto, frame scripts behave the same as when entering a new frame
@@ -769,13 +806,19 @@ impl<'gc> MovieClip<'gc> {
             {
                 // AVM2 does not allow a clip to see while it is executing a frame script.
                 // The goto is instead queued and run once the frame script is completed.
-                self.0.queued_goto_frame.set(Some(frame));
+                tracing::debug!(
+                    "MovieClip {}: Queued goto frame {} (stop={})",
+                    self.0.shared.get().id,
+                    frame,
+                    stop
+                );
+                self.0.queued_goto_frame.set(Some(Some((frame, stop))));
             } else {
                 self.run_goto(context, frame, false);
             }
         } else if self.movie().is_action_script_3() {
             // Despite not running, the goto still overwrites the currently enqueued frame.
-            self.0.queued_goto_frame.set(None);
+            self.0.queued_goto_frame.set(Some(None));
             // Pretend we actually did a goto, but don't do anything.
             run_inner_goto_frame(context, &[], self);
         }
@@ -1201,7 +1244,7 @@ impl<'gc> MovieClip<'gc> {
         // until we reach the end of the stream or a `TagCode::End`.
         // Flash Player ignores the frame count, and just executes the full
         // tag stream before returning to the first frame.
-        
+
         // Check if there are more tags to process by looking for a ShowFrame tag
         let mut has_more_tags = false;
         let tag_callback = |_reader: &mut SwfStream<'_>, tag_code, _tag_len| {
@@ -1264,7 +1307,6 @@ impl<'gc> MovieClip<'gc> {
                 self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false);
             }
         }
-
 
         tracing::debug!(
             "run_frame_internal: clip_id={}, current_frame={}, run_display_actions={}, run_sounds={}, is_action_script_3={}",
@@ -1539,7 +1581,7 @@ impl<'gc> MovieClip<'gc> {
             // to the already-ran frame. Since the frame number *has* changed
             // in the meantime, it should absolutely run again.
             self.0.last_queued_script_frame.set(None);
-            self.0.queued_script_frame.set(current_frame);
+            //self.0.queued_script_frame.set(current_frame);
         }
 
         tracing::debug!(
@@ -1720,9 +1762,6 @@ impl<'gc> MovieClip<'gc> {
             // Set a flag to prevent `run_frame_internal` from advancing the frame again.
             self.0
                 .set_flag(MovieClipFlags::FRAME_ADVANCED_BY_GOTO, true);
-
-            // Allow frame scripts to execute again on the new frame.
-            self.0.last_queued_script_frame.set(None);
         }
 
         if is_looping_instance {
@@ -2145,7 +2184,10 @@ impl<'gc> MovieClip<'gc> {
                         clip_id
                     );
                         child.set_place_frame(params.frame);
-                        child.base().set_flag(crate::display_object::DisplayObjectFlags::SKIP_NEXT_FRAME_FOR_SELF, true);
+                        child.base().set_flag(
+                            crate::display_object::DisplayObjectFlags::SKIP_NEXT_FRAME_FOR_SELF,
+                            true,
+                        );
                     } else {
                         tracing::warn!(
                         "run_goto: Failed to instantiate child with id {} at depth {}, clip_id={}",
@@ -2232,7 +2274,9 @@ impl<'gc> MovieClip<'gc> {
                 self.0.current_frame.get(), frame
             );
                 self.0.current_frame.set(frame);
+                
             }
+            self.0.queued_script_frame.set(frame);
         } else {
             tracing::debug!(
                 "run_goto: Setting current_frame to clamped_frame {}, clip_id={}",
@@ -2277,7 +2321,7 @@ impl<'gc> MovieClip<'gc> {
             self.current_frame(),
             clip_id
         );
-        self.0.queued_script_frame.set(self.current_frame());
+        //self.0.queued_script_frame.set(self.current_frame());
 
         self.assert_expected_tag_end(hit_target_frame);
     }
@@ -2481,10 +2525,14 @@ impl<'gc> MovieClip<'gc> {
                 frame_scripts.resize(index + 1, None);
             }
             frame_scripts[index] = Some(callable);
-            tracing::info!("Registering frame script for {}: frame_id={}, callable={:?}",
-                self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
+            tracing::info!(
+                "Registering frame script for {}: frame_id={}, callable={:?}",
+                self.name()
+                    .map(|s| format!("Some({:?})", s.to_string()))
+                    .unwrap_or_else(|| "None".to_string()),
                 frame_id,
-                callable);
+                callable
+            );
             if frame_id == current_frame {
                 if *context.frame_phase == FramePhase::FrameScripts {
                     context.frame_script_cleanup_queue.push_back(self);
@@ -2609,6 +2657,20 @@ impl<'gc> MovieClip<'gc> {
 
     pub fn drawing(&self) -> Option<Ref<'_, Drawing>> {
         self.0.drawing.get().map(|d| d.borrow())
+    }
+
+    pub fn queued_goto_frame(&self) -> Option<Option<(FrameNumber, bool)>> {
+        self.0.queued_goto_frame.get()
+    }
+
+    pub fn clear_queued_goto_frame(&self) {
+        self.0.queued_goto_frame.set(Some(None));
+    }
+
+    pub fn set_erroneous_queued_goto_frame(
+        &self,
+    ) {
+        self.0.queued_goto_frame.set(None);
     }
 
     pub fn is_button_mode(&self, context: &mut UpdateContext<'gc>) -> bool {
@@ -2783,20 +2845,62 @@ impl<'gc> MovieClip<'gc> {
     // in core/src/display_object/movie_clip.rs
 
     pub fn run_local_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        tracing::debug!("Running local frame scripts for {:?}", self.name());
+        tracing::debug!("is_playing: {}", self.playing());
+        tracing::debug!(
+            "current_frame: {}, total_frames: {}",
+            self.current_frame(),
+            self.total_frames()
+        );
+        tracing::debug!(
+            "play_after_frame_script: {}",
+            self.play_after_frame_script()
+        );
+        tracing::debug!("queued_goto_frame: {:?}", self.0.queued_goto_frame.get());
+        tracing::debug!(
+            "queued_script_frame: {:?}",
+            self.0.queued_script_frame.get()
+        );
+        tracing::debug!("has_pending_script: {}", self.0.has_pending_script.get());
+        tracing::debug!(
+            "last_queued_script_frame: {:?}",
+            self.0.last_queued_script_frame.get()
+        );
+        tracing::debug!(
+            "stop_after_play: {}",
+            self.0.contains_flag(MovieClipFlags::STOP_AFTER_PLAY)
+        );
+
+        tracing::debug!(
+            "programmatically_playing: {}",
+            self.0
+                .contains_flag(MovieClipFlags::PROGRAMMATICALLY_PLAYED)
+        );
+        tracing::debug!("Flags: {:?}", self.0.flags.get());
         tracing::info!( "run_local_frame_scripts called for {} (is_root={}, instantiated_by_timeline={}, placed_by_script={})",
         self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
         self.is_root(),
         self.instantiated_by_timeline(),
         self.placed_by_script());
 
-        if self.base().contains_flag(crate::display_object::DisplayObjectFlags::SKIP_NEXT_FRAME_FOR_SELF) {
+        if self
+            .base()
+            .contains_flag(crate::display_object::DisplayObjectFlags::SKIP_NEXT_FRAME_FOR_SELF)
+        {
             let backtrace = std::backtrace::Backtrace::capture();
             tracing::warn!("Skipping frame script execution for {} due to SKIP_NEXT_FRAME_FOR_SELF flag. Backtrace: {:?}",
             self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
             backtrace);
-            tracing::info!("Skipping frame script execution for {} due to SKIP_NEXT_FRAME_FOR_SELF flag",
-            self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
-            self.base().set_flag(crate::display_object::DisplayObjectFlags::SKIP_NEXT_FRAME_FOR_SELF, false);
+            tracing::info!(
+                "Skipping frame script execution for {} due to SKIP_NEXT_FRAME_FOR_SELF flag",
+                self.name()
+                    .map(|s| format!("Some({:?})", s.to_string()))
+                    .unwrap_or_else(|| "None".to_string())
+            );
+            self.base().set_flag(
+                crate::display_object::DisplayObjectFlags::SKIP_NEXT_FRAME_FOR_SELF,
+                false,
+            );
             self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false);
             return;
         }
@@ -2806,8 +2910,11 @@ impl<'gc> MovieClip<'gc> {
         // loop destination from running an extra time.
         if self.0.contains_flag(MovieClipFlags::STOP_AFTER_GOTO) {
             tracing::info!(
-            "Instance {} stopping due to STOP_AFTER_GOTO flag.",
-            self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+                "Instance {} stopping due to STOP_AFTER_GOTO flag.",
+                self.name()
+                    .map(|s| format!("Some({:?})", s.to_string()))
+                    .unwrap_or_else(|| "None".to_string())
+            );
 
             self.stop(context);
 
@@ -2830,14 +2937,23 @@ impl<'gc> MovieClip<'gc> {
 
         if let Some(avm2_object) = avm2_object {
             if self.0.has_pending_script.get() {
-                tracing::info!("AVM2 object found for {}, has_pending_script=true",
-                self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+                tracing::info!(
+                    "AVM2 object found for {}, has_pending_script=true",
+                    self.name()
+                        .map(|s| format!("Some({:?})", s.to_string()))
+                        .unwrap_or_else(|| "None".to_string())
+                );
 
-                let frame_id = self.current_frame();
-                tracing::info!("Queuing frame script for {}: current_frame={}, last_queued={:?}",
-                self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
-                self.current_frame(),
-                self.0.last_queued_script_frame.get());
+                let frame_id = self.0.queued_script_frame.get();
+                tracing::info!(
+                    "Queuing frame script for {}: current_frame={}, last_queued={:?}, frame_id={:?}",
+                    self.name()
+                        .map(|s| format!("Some({:?})", s.to_string()))
+                        .unwrap_or_else(|| "None".to_string()),
+                    self.current_frame(),
+                    self.0.last_queued_script_frame.get(),
+                    frame_id
+                );
 
                 if !self
                     .0
@@ -2854,21 +2970,33 @@ impl<'gc> MovieClip<'gc> {
                     if is_fresh_frame {
                         if let Some(callable) = self.frame_script(frame_id) {
                             self.0.last_queued_script_frame.set(Some(frame_id));
-                            tracing::info!("Reset last_queued_script_frame for {} (allows re-execution)",
-                            self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+                            tracing::info!(
+                                "Reset last_queued_script_frame for {} (allows re-execution)",
+                                self.name()
+                                    .map(|s| format!("Some({:?})", s.to_string()))
+                                    .unwrap_or_else(|| "None".to_string())
+                            );
 
                             self.0.has_pending_script.set(false);
-                            tracing::info!("Setting pending script for {}: frame={}, has_script={:?}",
-                            self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
-                            frame_id,
-                            callable);
+                            tracing::info!(
+                                "Setting pending script for {}: frame={}, has_script={:?}",
+                                self.name()
+                                    .map(|s| format!("Some({:?})", s.to_string()))
+                                    .unwrap_or_else(|| "None".to_string()),
+                                frame_id,
+                                callable
+                            );
 
                             self.0
                                 .set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, true);
 
-                            tracing::info!("Executing frame script for {} frame {}",
-                            self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
-                            frame_id);
+                            tracing::info!(
+                                "Executing frame script for {} frame {}",
+                                self.name()
+                                    .map(|s| format!("Some({:?})", s.to_string()))
+                                    .unwrap_or_else(|| "None".to_string()),
+                                frame_id
+                            );
 
                             let movie = self.movie();
                             let domain = context
@@ -2890,26 +3018,42 @@ impl<'gc> MovieClip<'gc> {
                                 );
                             }
 
-                            tracing::info!("Completed frame script execution for {} frame {}",
-                            self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
-                            frame_id);
+                            tracing::info!(
+                                "Completed frame script execution for {} frame {}",
+                                self.name()
+                                    .map(|s| format!("Some({:?})", s.to_string()))
+                                    .unwrap_or_else(|| "None".to_string()),
+                                frame_id
+                            );
 
                             self.0
                                 .set_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT, false);
                         }
                     }
                 } else {
-                    tracing::info!("Skipping frame script execution for {} because it's already executing",
-                    self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+                    tracing::info!(
+                        "Skipping frame script execution for {} because it's already executing",
+                        self.name()
+                            .map(|s| format!("Some({:?})", s.to_string()))
+                            .unwrap_or_else(|| "None".to_string())
+                    );
                 }
             } else {
-                tracing::info!("No pending script for {}",
-                self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+                tracing::info!(
+                    "No pending script for {}",
+                    self.name()
+                        .map(|s| format!("Some({:?})", s.to_string()))
+                        .unwrap_or_else(|| "None".to_string())
+                );
             }
         }
 
-        tracing::info!("Finished run_local_frame_scripts for {}",
-        self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+        tracing::info!(
+            "Finished run_local_frame_scripts for {}",
+            self.name()
+                .map(|s| format!("Some({:?})", s.to_string()))
+                .unwrap_or_else(|| "None".to_string())
+        );
 
         // The goto flag has served its purpose, now we can clear it.
         if self.0.contains_flag(MovieClipFlags::FRAME_ADVANCED_BY_GOTO) {
@@ -2920,9 +3064,59 @@ impl<'gc> MovieClip<'gc> {
         // No longer need to check `should_stop_after_scripts` here, as it's handled at the top.
 
         let goto_frame = self.0.queued_goto_frame.take();
-        if let Some(frame) = goto_frame {
+        self.0.queued_goto_frame.set(Some(None));
+        if let Some(Some((frame, stop))) = goto_frame {
+            if stop {
+                self.0.set_flag(MovieClipFlags::STOP_AFTER_PLAY, true);
+            } else {
+                self.0
+                    .set_flag(MovieClipFlags::PLAY_AFTER_FRAME_SCRIPT, false);
+            }
+
             self.run_goto(context, frame, false);
+        } else if let Some(None) = goto_frame {
+            if self.0.contains_flag(MovieClipFlags::STOP_AFTER_PLAY) {
+                self.stop(context);
+                self.0.set_flag(MovieClipFlags::STOP_AFTER_PLAY, false);
+            }
         }
+        tracing::debug!(
+            "Finished run_local_frame_scripts for {}",
+            self.name()
+                .map(|s| format!("Some({:?})", s.to_string()))
+                .unwrap_or_else(|| "None".to_string())
+        );
+        tracing::debug!("is_playing: {}", self.playing());
+        tracing::debug!(
+            "current_frame: {}, total_frames: {}",
+            self.current_frame(),
+            self.total_frames()
+        );
+        tracing::debug!(
+            "play_after_frame_script: {}",
+            self.play_after_frame_script()
+        );
+        tracing::debug!("queued_goto_frame: {:?}", self.0.queued_goto_frame.get());
+        tracing::debug!(
+            "queued_script_frame: {:?}",
+            self.0.queued_script_frame.get()
+        );
+        tracing::debug!("has_pending_script: {}", self.0.has_pending_script.get());
+        tracing::debug!(
+            "last_queued_script_frame: {:?}",
+            self.0.last_queued_script_frame.get()
+        );
+        tracing::debug!(
+            "stop_after_play: {}",
+            self.0.contains_flag(MovieClipFlags::STOP_AFTER_PLAY)
+        );
+
+        tracing::debug!(
+            "programmatically_playing: {}",
+            self.0
+                .contains_flag(MovieClipFlags::PROGRAMMATICALLY_PLAYED)
+        );
+        tracing::debug!("Flags: {:?}", self.0.flags.get());
     }
 }
 
@@ -2979,9 +3173,64 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         }
 
         if self.movie().is_action_script_3() {
+            tracing::debug!(
+                "Running enter_frame for {}",
+                self.name()
+                    .map(|s| format!("Some({:?})", s.to_string()))
+                    .unwrap_or_else(|| "None".to_string())
+            );
+            tracing::debug!("is_playing: {}", self.playing());
+            tracing::debug!(
+                "current_frame: {}, total_frames: {}",
+                self.current_frame(),
+                self.total_frames()
+            );
+            tracing::debug!(
+                "play_after_frame_script: {}",
+                self.play_after_frame_script()
+            );
+            tracing::debug!("queued_goto_frame: {:?}", self.0.queued_goto_frame.get());
+            tracing::debug!(
+                "queued_script_frame: {:?}",
+                self.0.queued_script_frame.get()
+            );
+            tracing::debug!("has_pending_script: {}", self.0.has_pending_script.get());
+            tracing::debug!(
+                "last_queued_script_frame: {:?}",
+                self.0.last_queued_script_frame.get()
+            );
+            tracing::debug!(
+                "stop_after_play: {}",
+                self.0.contains_flag(MovieClipFlags::STOP_AFTER_PLAY)
+            );
+
+            tracing::debug!(
+                "programmatically_playing: {}",
+                self.0
+                    .contains_flag(MovieClipFlags::PROGRAMMATICALLY_PLAYED)
+            );
+            tracing::debug!("Flags: {:?}", self.0.flags.get());
             let is_playing = self.playing();
 
-            if is_playing {
+            if is_playing
+                && self
+                    .0
+                    .contains_flag(MovieClipFlags::PLAY_AFTER_FRAME_SCRIPT)
+            {
+                tracing::debug!(
+                    "Clearing PLAY_AFTER_FRAME_SCRIPT flag for {}",
+                    self.name()
+                        .map(|s| format!("Some({:?})", s.to_string()))
+                        .unwrap_or_else(|| "None".to_string())
+                );
+                self.0
+                    .set_flag(MovieClipFlags::PLAY_AFTER_FRAME_SCRIPT, false);
+            }
+            let mut is_that = false;
+            if let None = self.queued_goto_frame() {
+                is_that = true;
+            }
+            if is_playing || is_that {
                 self.run_frame_internal(context, true, true, true);
             }
 
@@ -3054,30 +3303,51 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
-        tracing::info!( "run_frame_scripts called for {}",
-            self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+        tracing::info!(
+            "run_frame_scripts called for {}",
+            self.name()
+                .map(|s| format!("Some({:?})", s.to_string()))
+                .unwrap_or_else(|| "None".to_string())
+        );
 
         self.run_local_frame_scripts(context);
 
         if let Some(container) = self.as_container() {
             let child_count = container.iter_render_list().count();
-            tracing::info!("Running frame scripts for {} children of {}",
+            tracing::info!(
+                "Running frame scripts for {} children of {}",
                 child_count,
-                self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+                self.name()
+                    .map(|s| format!("Some({:?})", s.to_string()))
+                    .unwrap_or_else(|| "None".to_string())
+            );
 
             for (i, child) in container.iter_render_list().enumerate() {
-                tracing::info!("Running frame scripts for child {}: {:?}",
+                tracing::info!(
+                    "Running frame scripts for child {}: {:?}",
                     i,
-                    child.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+                    child
+                        .name()
+                        .map(|s| format!("Some({:?})", s.to_string()))
+                        .unwrap_or_else(|| "None".to_string())
+                );
                 child.run_frame_scripts(context);
             }
         } else {
-            tracing::info!("Running frame scripts for 0 children of {}",
-                self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+            tracing::info!(
+                "Running frame scripts for 0 children of {}",
+                self.name()
+                    .map(|s| format!("Some({:?})", s.to_string()))
+                    .unwrap_or_else(|| "None".to_string())
+            );
         }
 
-        tracing::info!("Finished run_frame_scripts for {}",
-            self.name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()));
+        tracing::info!(
+            "Finished run_frame_scripts for {}",
+            self.name()
+                .map(|s| format!("Some({:?})", s.to_string()))
+                .unwrap_or_else(|| "None".to_string())
+        );
     }
 
     fn render_self(self, context: &mut RenderContext<'_, 'gc>) {
@@ -3776,9 +4046,16 @@ impl<'gc> MovieClipData<'gc> {
     fn increment_current_frame(&self) {
         let frame = self.current_frame.get();
         self.current_frame.set(frame + 1);
-        tracing::debug!("{}: increment_current_frame: {} -> {}",
-            self.base.base().name().map(|s| format!("Some({:?})", s.to_string())).unwrap_or_else(|| "None".to_string()),
-            frame, frame + 1);
+        tracing::debug!(
+            "{}: increment_current_frame: {} -> {}",
+            self.base
+                .base()
+                .name()
+                .map(|s| format!("Some({:?})", s.to_string()))
+                .unwrap_or_else(|| "None".to_string()),
+            frame,
+            frame + 1
+        );
     }
 
     fn decrement_current_frame(&self) {
@@ -3808,6 +4085,41 @@ impl<'gc> MovieClipData<'gc> {
 
     fn set_programmatically_played(&self) {
         self.set_flag(MovieClipFlags::PROGRAMMATICALLY_PLAYED, true);
+    }
+
+    fn set_play_after_frame_script(&self) {
+        self.set_flag(MovieClipFlags::PLAY_AFTER_FRAME_SCRIPT, true);
+    }
+
+    fn clear_play_after_frame_script(&self) {
+        self.set_flag(MovieClipFlags::PLAY_AFTER_FRAME_SCRIPT, false);
+    }
+    fn play_after_frame_script(&self) -> bool {
+        self.contains_flag(MovieClipFlags::PLAY_AFTER_FRAME_SCRIPT)
+    }
+
+    fn set_stop_after_play(&self) {
+        self.set_flag(MovieClipFlags::STOP_AFTER_PLAY, true);
+    }
+
+    fn clear_stop_after_play(&self) {
+        self.set_flag(MovieClipFlags::STOP_AFTER_PLAY, false);
+    }
+
+    fn stop_after_play(&self) -> bool {
+        self.contains_flag(MovieClipFlags::STOP_AFTER_PLAY)
+    }
+
+    fn i_ran_out_of_names(&self) -> bool {
+        self.contains_flag(MovieClipFlags::I_RAN_OUT_OF_NAMES)
+    }
+
+    fn set_i_ran_out_of_names(&self) {
+        self.set_flag(MovieClipFlags::I_RAN_OUT_OF_NAMES, true);
+    }
+
+    fn clear_i_ran_out_of_names(&self) {
+        self.set_flag(MovieClipFlags::I_RAN_OUT_OF_NAMES, false);
     }
 
     fn loop_queued(&self) -> bool {
@@ -5106,7 +5418,6 @@ impl<'gc, 'a> MovieClip<'gc> {
         let backtrace = Backtrace::capture();
         tracing::debug!("clear_stop_after_goto_flag: backtrace={:?}", backtrace);
         self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false);
-        
     }
 }
 
@@ -5497,11 +5808,17 @@ bitflags! {
         /// Whether this `MovieClip` has been post-instantiated yet.
         const POST_INSTANTIATED = 1 << 6;
 
-        /// Whether this `MovieClip` should stop after the current goto completes.
+        /// Whether this `MovieClip` should stop after the current rewind completes.
         const STOP_AFTER_GOTO = 1 << 7;
 
         /// Whether this `MovieClip`'s frame was set by an implicit goto and should not be advanced again this cycle.
         const FRAME_ADVANCED_BY_GOTO = 1 << 8;
+
+        const STOP_AFTER_PLAY = 1 << 9;
+
+        const PLAY_AFTER_FRAME_SCRIPT = 1 << 10;
+
+        const I_RAN_OUT_OF_NAMES = 1 << 11;
     }
 }
 
