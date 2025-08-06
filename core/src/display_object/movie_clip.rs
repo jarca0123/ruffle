@@ -205,6 +205,8 @@ pub struct MovieClipData<'gc> {
 
     /// Show a hand cursor when the clip is in button mode.
     avm2_use_hand_cursor: Cell<bool>,
+
+    queued_legacy_next_frame: Cell<bool>,
 }
 
 #[derive(Clone, Collect)]
@@ -247,6 +249,8 @@ impl<'gc> MovieClipData<'gc> {
             attached_audio: Lock::new(None),
             next_avm1_clip: Lock::new(None),
             importer_movie: None,
+            queued_legacy_next_frame: Cell::new(false),
+
         }
     }
 
@@ -513,7 +517,17 @@ impl<'gc> MovieClip<'gc> {
                 TagCode::DefineSound => shared.define_sound(context, reader),
                 TagCode::DefineVideoStream => shared.define_video_stream(context, reader),
                 TagCode::DefineSprite => {
-                    return shared.define_sprite(context, reader, tag_len, chunk_limit)
+                    let overall_position = (reader.get_ref().as_ptr() as u64)
+                        .saturating_sub(swf.data().as_ptr() as u64);
+                    let frame_number = shared.preload_progress.cur_preload_frame.get();
+                    return shared.define_sprite(
+                        context,
+                        reader,
+                        tag_len,
+                        chunk_limit,
+                        overall_position,
+                        frame_number,
+                    );
                 }
                 TagCode::DefineText => shared.define_text(context, reader, 1),
                 TagCode::DefineText2 => shared.define_text(context, reader, 2),
@@ -742,12 +756,37 @@ impl<'gc> MovieClip<'gc> {
     }
 
     pub fn next_frame(self, context: &mut UpdateContext<'gc>) {
-        if self.current_frame() < self.total_frames() {
+        tracing::debug!(
+            "MovieClip {}: next_frame called",
+            self.0.shared.get().id
+        );
+        let backtrace = Backtrace::capture();
+        tracing::debug!(
+            "MovieClip {}: next_frame called at {}",
+            self.0.shared.get().id,
+            backtrace
+        );
+        let is_legacy_script_call = self.movie().version() < 10
+            && self
+                .0
+                .contains_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT);
+
+        if is_legacy_script_call && self.movie().is_action_script_3() {
+            self.0.queued_legacy_next_frame.set(true);
+        } else if self.current_frame() < self.total_frames() {
+            // All modern SWFs and non-script calls use the normal goto mechanism.
             self.goto_frame(context, self.current_frame() + 1, true);
         }
     }
 
     pub fn play(self) {
+        tracing::debug!("MovieClip {}: play called", self.0.shared.get().id);
+        let backtrace = Backtrace::capture();
+        tracing::debug!(
+            "MovieClip {}: play called at {}",
+            self.0.shared.get().id,
+            backtrace
+        );
         self.0.play()
     }
 
@@ -1463,11 +1502,11 @@ impl<'gc> MovieClip<'gc> {
 
         let decode_result = tag_utils::decode_tags(&mut reader, tag_callback);
         if let Err(e) = decode_result {
-            tracing::error!(
+            /*tracing::error!(
                 "run_frame_internal: Error decoding tags: {:?}, clip_id={}",
                 e,
                 clip_id
-            );
+            );*/
         }
         tracing::debug!(
             "run_frame_internal: Running ABC/symbol tags for frame {}, clip_id={}",
@@ -1598,7 +1637,14 @@ impl<'gc> MovieClip<'gc> {
         id: CharacterId,
         depth: Depth,
         place_object: &swf::PlaceObject,
+        overall_position: u64,
+        frame: FrameNumber,
     ) -> Option<DisplayObject<'gc>> {
+        tracing::debug!(
+            "Instantiating child at depth {}, tag_position={}",
+            depth,
+            overall_position
+        );
         if self.has_child_at_depth(depth) {
             context.avm_warning(&format!("Failed to place object at depth {depth}."));
             return None;
@@ -1606,8 +1652,24 @@ impl<'gc> MovieClip<'gc> {
 
         let movie = self.movie();
         let library = context.library.library_for_movie_mut(movie.clone());
+
+        // Log a warning if there's a frame timing issue, but still allow instantiation
+        // Use the preload frame instead of the current frame for the check
+        let check_frame = self.0.shared.get().preload_progress.cur_preload_frame.get();
+        if !library.is_character_defined_before_frame_number(id, frame) {
+            tracing::error!(
+                "Character ID {} is not defined before frame {}, which may cause timing issues.",
+                id,
+                check_frame
+            );
+            return None; // Don't return None here - allow instantiation to proceed
+                         // Don't return None here - allow instantiation to proceed
+                         // The character may have been defined during preloading
+        }
+
         match library.instantiate_by_id(id, context.gc_context) {
             Some(child) => {
+                tracing::debug!("Instantiated child with id {} at depth {}", id, depth);
                 // Remove previous child from children list,
                 // and add new child onto front of the list.
                 let prev_child = self.replace_at_depth(context, child, depth);
@@ -2008,11 +2070,11 @@ impl<'gc> MovieClip<'gc> {
 
             let decode_result = tag_utils::decode_tags(&mut reader, tag_callback);
             if let Err(e) = decode_result {
-                tracing::error!(
+                /*tracing::error!(
                     "run_goto: Error decoding tags: {:?}, clip_id={}",
                     e,
                     clip_id
-                );
+                );*/
             }
 
             tracing::debug!(
@@ -2171,8 +2233,21 @@ impl<'gc> MovieClip<'gc> {
                         params.depth(),
                         clip_id
                     );
+                    let overall_position =
+                        reader.get_ref().as_ptr() as u64 - self.movie().data().as_ptr() as u64;
+                    tracing::debug!(
+                        "run_goto: Creating new child with id {} at depth {}, clip_id={}",
+                        id,
+                        params.depth(),
+                        clip_id
+                    );
+                    let root = context
+                        .stage
+                        .root_clip()
+                        .expect("Root clip should always be present in the stage");
                     if let Some(child) =
-                        clip.instantiate_child(context, id, params.depth(), &params.place_object)
+                        clip.instantiate_child(context, id, params.depth(), &params.place_object, overall_position,
+                        root.as_movie_clip().unwrap().current_frame())
                     {
                         let child_name = child.name().map(|s| s.to_string()).unwrap_or_default();
                         let child_id = child.id();
@@ -3117,6 +3192,17 @@ impl<'gc> MovieClip<'gc> {
                 .contains_flag(MovieClipFlags::PROGRAMMATICALLY_PLAYED)
         );
         tracing::debug!("Flags: {:?}", self.0.flags.get());
+        if self.0.queued_legacy_next_frame.take() {
+            let new_frame = self.current_frame() + 1;
+            if new_frame <= self.total_frames() {
+                // Use the existing run_goto to update the movie's state to the next frame.
+                self.run_goto(context, new_frame, false);
+
+                // Immediately re-run this function to execute the new frame's scripts.
+                // This recursive call handles the immediate execution requirement simply.
+                self.run_local_frame_scripts(context);
+            }
+        }
     }
 }
 
@@ -4673,6 +4759,8 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         reader: &mut SwfStream<'a>,
         tag_len: usize,
         chunk_limit: &mut ExecutionLimit,
+        tag_position: u64,
+        frame_number: u16,
     ) -> DecodeResult {
         let start = reader.as_slice();
         let id = reader.read_character_id()?;
@@ -4688,7 +4776,12 @@ impl<'gc, 'a> MovieClipShared<'gc> {
 
         if self
             .library_mut(context)
-            .register_character(id, Character::MovieClip(movie_clip))
+            .register_character_with_position_and_frame(
+                id,
+                Character::MovieClip(movie_clip),
+                tag_position,
+                frame_number,
+            )
         {
             self.preload_progress.cur_preload_symbol.set(Some(id));
         } else {
@@ -5276,7 +5369,28 @@ impl<'gc, 'a> MovieClip<'gc> {
         use swf::PlaceObjectAction;
         match place_object.action {
             PlaceObjectAction::Place(id) => {
-                self.instantiate_child(context, id, place_object.depth.into(), &place_object);
+                 let overall_position = (reader.get_ref().as_ptr() as u64)
+                    .saturating_sub(self.movie().data().as_ptr() as u64);
+                tracing::debug!(
+                    "PlaceObject: id={}, depth={}, action={:?}, overall_position={}",
+                    id,
+                    place_object.depth,
+                    place_object.action,
+                    overall_position
+                );
+
+                let root = context
+                    .stage
+                    .root_clip()
+                    .expect("Root clip should always be present in the stage");
+                self.instantiate_child(
+                    context,
+                    id,
+                    place_object.depth.into(),
+                    &place_object,
+                    overall_position,
+                    root.as_movie_clip().unwrap().current_frame(),
+                );
             }
             PlaceObjectAction::Replace(id) => {
                 if let Some(child) = self.child_by_depth(place_object.depth.into()) {
