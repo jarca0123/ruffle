@@ -82,7 +82,7 @@ pub fn dispatch_added_to_stage_event_only<'gc>(
 /// Clear STOP_AFTER_GOTO flag for all movie clips in the display tree
 fn clear_all_stop_after_goto_flags<'gc>(root: DisplayObject<'gc>) {
     if let Some(movie_clip) = root.as_movie_clip() {
-        movie_clip.clear_stop_after_goto_flag();
+        //movie_clip.clear_stop_after_goto_flag();
     }
     
     if let Some(container) = root.as_container() {
@@ -670,7 +670,7 @@ pub struct ChildContainer<'gc> {
     /// In AVM1, the depth and render lists are identical; AS1/2 code interacts
     /// exclusively with the depth list. However, AS3 instead references clips
     /// by render list indexes and does not manipulate the depth list.
-    depth_list: BTreeMap<Depth, DisplayObject<'gc>>,
+    pub depth_list: BTreeMap<Depth, DisplayObject<'gc>>,
 
     /// Does this container have any AVM1 objects that are pending removal
     ///
@@ -864,7 +864,7 @@ impl<'gc> ChildContainer<'gc> {
     }
 
     /// Determine if the render list is empty.
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.render_list.is_empty()
     }
 
@@ -1152,7 +1152,7 @@ impl<'gc> ChildContainer<'gc> {
         }
     }
 
-    fn render_list_mut(&mut self) -> &mut Vec<DisplayObject<'gc>> {
+    pub fn render_list_mut(&mut self) -> &mut Vec<DisplayObject<'gc>> {
         Rc::make_mut(&mut self.render_list)
     }
 }

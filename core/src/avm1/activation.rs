@@ -1,6 +1,7 @@
 use crate::avm1::callable_value::CallableValue;
 use crate::avm1::error::Error;
 use crate::avm1::function::{Avm1Function, ExecutionReason, FunctionObject};
+use crate::avm1::globals::AVM_DEPTH_BIAS;
 use crate::avm1::property::Attribute;
 use crate::avm1::runtime::skip_actions;
 use crate::avm1::scope::{Scope, ScopeClass};
@@ -637,7 +638,18 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let source_clip = self.resolve_target_display_object(start_clip, source, true)?;
 
         if let Some(movie_clip) = source_clip.and_then(|o| o.as_movie_clip()) {
-            globals::movie_clip::clone_sprite(movie_clip, self.context, target, depth, None);
+            let is_volatile = match movie_clip.instantiated_by_timeline() {
+                true => depth <= AVM_DEPTH_BIAS,
+                false => depth > AVM_DEPTH_BIAS,
+            };
+            globals::movie_clip::clone_sprite(
+                movie_clip,
+                self.context,
+                target,
+                depth,
+                None,
+                is_volatile,
+            );
         } else {
             avm_warn!(self, "CloneSprite: Source is not a movie clip");
         }

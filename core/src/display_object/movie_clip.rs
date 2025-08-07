@@ -250,7 +250,6 @@ impl<'gc> MovieClipData<'gc> {
             next_avm1_clip: Lock::new(None),
             importer_movie: None,
             queued_legacy_next_frame: Cell::new(false),
-
         }
     }
 
@@ -755,6 +754,18 @@ impl<'gc> MovieClip<'gc> {
         self.0.clear_i_ran_out_of_names();
     }
 
+    pub fn was_duplicated(&self) -> bool {
+        self.0.duplicated()
+    }
+
+    pub fn set_was_duplicated(&self) {
+        self.0.set_duplicated();
+    }
+
+    pub fn clear_was_duplicated(&self) {
+        self.0.clear_duplicated();
+    }
+
     pub fn next_frame(self, context: &mut UpdateContext<'gc>) {
         tracing::debug!(
             "MovieClip {}: next_frame called",
@@ -854,6 +865,7 @@ impl<'gc> MovieClip<'gc> {
                 self.0.queued_goto_frame.set(Some(Some((frame, stop))));
             } else {
                 self.run_goto(context, frame, false);
+                 self.0.queued_goto_frame.set(Some(None));
             }
         } else if self.movie().is_action_script_3() {
             // Despite not running, the goto still overwrites the currently enqueued frame.
@@ -1814,10 +1826,7 @@ impl<'gc> MovieClip<'gc> {
             self.assert_expected_tag_start();
         }
 
-        let is_looping_instance = is_implicit
-            && !self.is_root()
-            && self.instantiated_by_timeline()
-            && !self.placed_by_script();
+        let is_looping_instance = is_implicit;
 
         if is_implicit {
             // This is an implicit goto (a timeline loop).
@@ -1827,34 +1836,34 @@ impl<'gc> MovieClip<'gc> {
         }
 
         if is_looping_instance {
-            tracing::debug!("run_goto: Processing looping instance, clip_id={}", clip_id);
+    // This is an implicit goto (a timeline loop).
+    // The Flash Player has an optimization where simple, childless, looping clips are automatically stopped.
+    // However, the rules for what is considered "simple" differ between AVM1 and AVM2.
 
-            // Some looping instances with no movieclip children should just stop and become static.
-            // This seems to only apply to clips directly under the root.
-            if self.parent().map_or(false, |p| p.is_root()) {
-                let has_only_graphic_children =
-                    self.raw_container().iter_render_list().all(|child| {
-                        // Check if the child is only a graphic (shape, morph shape, etc.)
-                        // and not a movie clip, button, text field, or other interactive element
-                        child.as_movie_clip().is_none() && child.as_drawing(context.gc()).is_some()
-                    });
+    let should_be_stopped = if !self.movie().is_action_script_3() {
+        // AVM1: A MovieClip is only considered "simple" if it has NO interactive children
+        // AND it has NO `onClipEvent` handlers. The presence of `onClipEvent` makes a
+        // clip permanently interactive and stateful, exempting it from this optimization.
+        self.clip_actions().is_empty()
+            && self
+                .raw_container()
+                .iter_render_list()
+                .all(|child| child.as_interactive().is_none())
+    } else {
+        // AVM2: The rule is more aggressive. A timeline-placed MovieClip is stopped
+        // if it has NO children on its display list at the time of looping,
+        // even if it has frame scripts.
+        self.raw_container().is_empty()
+    };
 
-                tracing::debug!(
-                    "run_goto: Direct child of root, has_only_graphic_children={}, clip_id={}",
-                    has_only_graphic_children,
-                    clip_id
-                );
-
-                if has_only_graphic_children {
-                    tracing::debug!(
-                    "run_goto: Setting STOP_AFTER_GOTO flag (only graphic children), clip_id={}",
-                    clip_id
-                );
-                    self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, true);
-                    //self.stop(context);
-                }
-            }
-        }
+    if should_be_stopped {
+        tracing::debug!(
+            "run_goto: Setting STOP_AFTER_GOTO flag for simple looping clip, clip_id={}",
+            clip_id
+        );
+        self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, true);
+    }
+}
 
         let frame_before_rewind = self.current_frame();
         self.base().set_skip_next_enter_frame(false);
@@ -2100,12 +2109,59 @@ impl<'gc> MovieClip<'gc> {
             clip_id
         );
 
+        
+
         if is_rewind {
+            let timeline_depths: std::collections::HashSet<Depth> = goto_commands.iter().map(|p| p.depth()).collect();
             tracing::debug!("run_goto: Processing rewind cleanup, clip_id={}", clip_id);
 
             let children: SmallVec<[_; 16]> = self
                 .iter_render_list()
-                .filter(|clip| clip.placed_by_avm1_script() || clip.place_frame() > frame)
+                                .filter(|child| {
+                    
+                    // A timeline-managed child is removed if it was placed on a frame
+                    // after our destination, or if it's a dynamic clone that won't
+                    // be re-placed by the timeline tag processing.
+                    let is_on_timeline_for_this_goto = timeline_depths.contains(&child.depth());
+                    if child.placed_by_avm1_script() {
+                        tracing::debug!(
+                            "run_goto: Skipping AVM1-script-placed child id={}, name='{}', place_frame={}, frame={}, placed_by_avm1_script={}, clip_id={}, is_on_timeline={}, depth={}",
+                            child.id(),
+                            child.name().map(|s| s.to_string()).unwrap_or_default(),
+                            child.place_frame(),
+                            frame,
+                            child.placed_by_avm1_script(),
+                            clip_id,
+                            is_on_timeline_for_this_goto,
+                            child.depth()
+                        );
+                        return true;
+                    } else {
+                        tracing::debug!(
+                            "run_goto: Checking child id={}, name='{}', place_frame={}, frame={}, placed_by_avm1_script={}, clip_id={}, is_on_timeline={}, depth={}",
+                            child.id(),
+                            child.name().map(|s| s.to_string()).unwrap_or_default(),
+                            child.place_frame(),
+                            frame,
+                            child.placed_by_avm1_script(),
+                            clip_id,
+                            is_on_timeline_for_this_goto,
+                            child.depth()
+                        );
+                        return child.place_frame() > frame;
+                    }
+
+                    tracing::debug!(
+                        "run_goto: Checking if child id={}, name='{}', place_frame={}, frame={}, is_on_timeline={}",
+                        child.id(),
+                        child.name().map(|s| s.to_string()).unwrap_or_default(),
+                        child.place_frame(),
+                        frame,
+                        is_on_timeline_for_this_goto
+                    );
+                    child.place_frame() > frame || is_on_timeline_for_this_goto
+                })
+
                 .collect();
 
             tracing::debug!(
@@ -2115,27 +2171,35 @@ impl<'gc> MovieClip<'gc> {
                 clip_id
             );
 
-            for child in children {
-                let child_name = child.name().map(|s| s.to_string()).unwrap_or_default();
-                let child_id = child.id();
-                let place_frame = child.place_frame();
-                let placed_by_script = child.placed_by_script();
-
-                tracing::debug!(
-                "run_goto: Removing child id={}, name='{}', place_frame={}, placed_by_script={}, clip_id={}",
-                child_id,
-                child_name,
-                place_frame,
-                placed_by_script,
-                clip_id
+            if !children.is_empty() {
+        // 2. Perform a "silent" unload on the removed children.
+        // This avoids the cascading side effects of the full `remove_child` method.
+        for child in &children {
+            tracing::debug!(
+                "run_goto: Unloading child id={}, name='{}', place_frame={}, frame={}, placed_by_avm1_script={}, clip_id={}, depth={}",
+                child.id(),
+                child.name().map(|s| s.to_string()).unwrap_or_default(),
+                child.place_frame(),
+                frame,
+                child.placed_by_avm1_script(),
+                clip_id,
+                child.depth()
             );
+            child.avm1_unload(context);
+            child.set_parent(context, None);
+        }
 
-                if !child.placed_by_script() {
-                    self.remove_child(context, child);
-                } else {
-                    self.remove_child_from_depth_list(context, child);
-                }
-            }
+        // 3. Directly and efficiently modify the container's lists.
+        let mut container = self.raw_container_mut(context.gc());
+        
+        let removed_ptrs: std::collections::HashSet<_> = children
+            .iter()
+            .map(|c| c.as_ptr())
+            .collect();
+        
+        container.render_list_mut().retain(|child| !removed_ptrs.contains(&child.as_ptr()));
+        container.depth_list.retain(|_depth, child| !removed_ptrs.contains(&child.as_ptr()));
+    }
         }
 
         tracing::debug!(
@@ -2245,10 +2309,14 @@ impl<'gc> MovieClip<'gc> {
                         .stage
                         .root_clip()
                         .expect("Root clip should always be present in the stage");
-                    if let Some(child) =
-                        clip.instantiate_child(context, id, params.depth(), &params.place_object, overall_position,
-                        root.as_movie_clip().unwrap().current_frame())
-                    {
+                    if let Some(child) = clip.instantiate_child(
+                        context,
+                        id,
+                        params.depth(),
+                        &params.place_object,
+                        overall_position,
+                        root.as_movie_clip().unwrap().current_frame(),
+                    ) {
                         let child_name = child.name().map(|s| s.to_string()).unwrap_or_default();
                         let child_id = child.id();
                         tracing::debug!(
@@ -2349,7 +2417,6 @@ impl<'gc> MovieClip<'gc> {
                 self.0.current_frame.get(), frame
             );
                 self.0.current_frame.set(frame);
-                
             }
             self.0.queued_script_frame.set(frame);
         } else {
@@ -2742,9 +2809,7 @@ impl<'gc> MovieClip<'gc> {
         self.0.queued_goto_frame.set(Some(None));
     }
 
-    pub fn set_erroneous_queued_goto_frame(
-        &self,
-    ) {
+    pub fn set_erroneous_queued_goto_frame(&self) {
         self.0.queued_goto_frame.set(None);
     }
 
@@ -3606,6 +3671,19 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn avm1_unload(self, context: &mut UpdateContext<'gc>) {
+
+        if self.was_duplicated() {
+        // For duplicates, we only recursively unload children, stop any sound,
+        // and flag them as removed. We skip event dispatch and other logic.
+        for child in self.iter_render_list() {
+            child.avm1_unload(context);
+        }
+        self.0.stop_audio_stream(context);
+        self.set_avm1_removed(true);
+        return;
+    }
+
+
         for child in self.iter_render_list() {
             child.avm1_unload(context);
         }
@@ -4206,6 +4284,18 @@ impl<'gc> MovieClipData<'gc> {
 
     fn clear_i_ran_out_of_names(&self) {
         self.set_flag(MovieClipFlags::I_RAN_OUT_OF_NAMES, false);
+    }
+
+    fn duplicated(&self) -> bool {
+        self.contains_flag(MovieClipFlags::DUPLICATED)
+    }
+
+    fn set_duplicated(&self) {
+        self.set_flag(MovieClipFlags::DUPLICATED, true);
+    }
+
+    fn clear_duplicated(&self) {
+        self.set_flag(MovieClipFlags::DUPLICATED, false);
     }
 
     fn loop_queued(&self) -> bool {
@@ -5369,7 +5459,7 @@ impl<'gc, 'a> MovieClip<'gc> {
         use swf::PlaceObjectAction;
         match place_object.action {
             PlaceObjectAction::Place(id) => {
-                 let overall_position = (reader.get_ref().as_ptr() as u64)
+                let overall_position = (reader.get_ref().as_ptr() as u64)
                     .saturating_sub(self.movie().data().as_ptr() as u64);
                 tracing::debug!(
                     "PlaceObject: id={}, depth={}, action={:?}, overall_position={}",
@@ -5933,6 +6023,8 @@ bitflags! {
         const PLAY_AFTER_FRAME_SCRIPT = 1 << 10;
 
         const I_RAN_OUT_OF_NAMES = 1 << 11;
+
+        const DUPLICATED = 1 << 12;
     }
 }
 

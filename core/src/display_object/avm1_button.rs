@@ -382,7 +382,7 @@ impl<'gc> TDisplayObject<'gc> for Avm1Button<'gc> {
     }
 
     fn avm1_unload(self, context: &mut UpdateContext<'gc>) {
-        for child in self.iter_render_list() {
+                for child in self.iter_render_list() {
             child.avm1_unload(context);
         }
 

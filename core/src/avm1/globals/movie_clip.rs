@@ -780,13 +780,11 @@ fn attach_movie<'gc>(
     activation: &mut Activation<'_, 'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    let (export_name, new_instance_name, depth) = match &args.get(0..3) {
+    let (export_name, new_instance_name, depth_val) = match &args.get(0..3) {
         Some([export_name, new_instance_name, depth]) => (
             export_name.coerce_to_string(activation)?,
             new_instance_name.coerce_to_string(activation)?,
-            depth
-                .coerce_to_i32(activation)?
-                .wrapping_add(AVM_DEPTH_BIAS),
+            depth.clone(),
         ),
         _ => {
             avm_error!(activation, "MovieClip.attachMovie: Too few parameters");
@@ -794,6 +792,13 @@ fn attach_movie<'gc>(
         }
     };
     let init_object = args.get(3);
+
+    let depth_num = depth_val.coerce_to_f64(activation).unwrap_or(0.0);
+    let is_volatile = match movie_clip.instantiated_by_timeline() {
+        true => depth_num <= AVM_DEPTH_BIAS as f64,
+        false => depth_num > AVM_DEPTH_BIAS as f64,
+    };
+    let depth = f64_to_wrapping_i32(depth_num).wrapping_add(AVM_DEPTH_BIAS);
 
     // TODO: What is the derivation of this max value? It shows up a few times in the AVM...
     // 2^31 - 16777220
@@ -807,7 +812,7 @@ fn attach_movie<'gc>(
         .library_for_movie(movie_clip.movie())
         .and_then(|l| l.instantiate_by_export_name(export_name, activation.gc()))
     {
-        new_clip.set_placed_by_avm1_script(true);
+        new_clip.set_placed_by_avm1_script(is_volatile);
         // Set name and attach to parent.
         new_clip.set_name(activation.gc(), new_instance_name);
         movie_clip.replace_at_depth(activation.context, new_clip, depth);
@@ -830,12 +835,10 @@ fn create_empty_movie_clip<'gc>(
     activation: &mut Activation<'_, 'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    let (new_instance_name, depth) = match &args.get(0..2) {
+    let (new_instance_name, depth_val) = match &args.get(0..2) {
         Some([new_instance_name, depth]) => (
             new_instance_name.coerce_to_string(activation)?,
-            depth
-                .coerce_to_i32(activation)?
-                .wrapping_add(AVM_DEPTH_BIAS),
+            depth.clone(),
         ),
         _ => {
             avm_error!(
@@ -845,6 +848,13 @@ fn create_empty_movie_clip<'gc>(
             return Ok(Value::Undefined);
         }
     };
+
+    let depth_num = depth_val.coerce_to_f64(activation).unwrap_or(0.0);
+    let is_volatile = match movie_clip.instantiated_by_timeline() {
+        true => depth_num <= AVM_DEPTH_BIAS as f64,
+        false => depth_num > AVM_DEPTH_BIAS as f64,
+    };
+    let depth = f64_to_wrapping_i32(depth_num).wrapping_add(AVM_DEPTH_BIAS);
 
     // Create empty movie clip.
     let swf_movie = movie_clip.movie();
@@ -928,24 +938,32 @@ fn duplicate_movie_clip<'gc>(
         }
     };
     let depth = match args.get(1) {
-        Some(depth) => depth.coerce_to_i32(activation)?,
-        None => 0,
+        Some(depth) => depth.clone(),
+        None => Value::Number(0.0),
     };
+    let depth_num = depth.coerce_to_f64(activation)?;
+    let depth_i32 = f64_to_wrapping_i32(depth_num);
+    let is_volatile = match movie_clip.instantiated_by_timeline() {
+        true => depth_num <= AVM_DEPTH_BIAS as f64,
+        false => depth_num > AVM_DEPTH_BIAS as f64,
+    };
+
     // Despite the docs say the `initObject` parameter is supported in Flash Player 6 and later,
     // it's not version-gated.
     let init_object = args.get(2).map(|v| v.coerce_to_object(activation));
 
     // `duplicateMovieClip` method uses biased depth compared to `CloneSprite`.
-    let depth = depth.wrapping_add(AVM_DEPTH_BIAS);
+    let depth = depth_i32.wrapping_add(AVM_DEPTH_BIAS);
 
-    let new_clip = clone_sprite(movie_clip, activation.context, name, depth, init_object);
-
-    // On SWF<6 undefined is returned.
-    if activation.swf_version() < 6 {
-        return Ok(Value::Undefined);
+    if let Some(new_clip) = clone_sprite(movie_clip, activation.context, name, depth, init_object, is_volatile) {
+        new_clip.set_placed_by_avm1_script(is_volatile);
+        // On SWF<6 undefined is returned.
+        if activation.swf_version() < 6 {
+            return Ok(Value::Undefined);
+        }
+        return Ok(new_clip.object());
     }
-
-    Ok(new_clip.map_or(Value::Undefined, |clip| clip.object()))
+    Ok(Value::Undefined)
 }
 
 pub fn clone_sprite<'gc>(
@@ -954,16 +972,43 @@ pub fn clone_sprite<'gc>(
     target: AvmString<'gc>,
     depth: Depth,
     init_object: Option<Object<'gc>>,
+    is_volatile: bool,
 ) -> Option<MovieClip<'gc>> {
-    let Some(parent) = movie_clip.avm1_parent().and_then(|o| o.as_movie_clip()) else {
+    tracing::debug!(
+        "DuplicateMovieClip: duplicating {} at depth {}, is_volatile: {}",
+        target,
+        depth,
+        is_volatile
+    );
+    let Some(mut parent) = movie_clip.avm1_parent().and_then(|o| o.as_movie_clip()) else {
         // Can't duplicate the root!
+        tracing::debug!("Tried to duplicate the root movie clip");
         return None;
     };
 
-    // TODO: What is the derivation of this max value? It shows up a few times in the AVM...
-    // 2^31 - 16777220
-    if depth < 0 || depth > AVM_MAX_DEPTH {
-        return None;
+    if let Some(existing_with_name) = parent.child_by_name(&target, false) {
+        // Flash Player has a strange behavior here.
+        // If a clip with the same name already exists, and that clip is in a "timeline" depth range,
+        // that clip is removed. Then, the duplication fails.
+        // If the existing clip is in a "script" depth range, the duplication is a no-op and the existing
+        // clip is returned.
+        if (0..AVM_DEPTH_BIAS).contains(&existing_with_name.depth()) {
+            tracing::debug!(
+                "DuplicateMovieClip: removing existing clip '{}' at timeline-range depth {}",
+                target,
+                existing_with_name.depth()
+            );
+           /*  existing_with_name.avm1_unload(context);
+            parent.remove_child(context, existing_with_name);*/
+            return None;
+        } else {
+            tracing::debug!(
+                "DuplicateMovieClip: clip with name '{}' already exists at script-range depth {}, not removing",
+                target,
+                existing_with_name.depth()
+            );
+            return None;
+        }
     }
 
     let movie = parent.movie();
@@ -980,15 +1025,25 @@ pub fn clone_sprite<'gc>(
         MovieClip::new(movie, context.gc())
     };
 
-    // Set name and attach to parent.
-    new_clip.set_placed_by_avm1_script(true);
+    if depth < 0 || depth > AVM_MAX_DEPTH {
+        tracing::warn!("duplicateMovieClip: Invalid depth {}", depth);
+        return None;
+    }
+
+    // Set properties BEFORE adding to parent.
+    // This is crucial for goto logic to correctly handle the new clip's lifecycle.
+    new_clip.set_place_frame(parent.current_frame());
     new_clip.set_name(context.gc(), target);
+    new_clip.set_placed_by_avm1_script(is_volatile);
     parent.replace_at_depth(context, new_clip.into(), depth);
 
     // Copy display properties from previous clip to new clip.
     new_clip.set_matrix(context.gc(), *movie_clip.base().matrix());
     new_clip.set_color_transform(context.gc(), *movie_clip.base().color_transform());
-
+    new_clip.set_clip_depth(movie_clip.clip_depth());
+    new_clip.set_blend_mode(context.gc(),movie_clip.blend_mode());
+    new_clip.set_visible(context, true);
+    new_clip.set_was_duplicated();
     new_clip.init_clip_event_handlers(movie_clip.clip_actions().into());
 
     if let Some(drawing) = movie_clip.drawing().as_deref().cloned() {
@@ -1001,7 +1056,6 @@ pub fn clone_sprite<'gc>(
 
     Some(new_clip)
 }
-
 fn get_bytes_loaded<'gc>(
     movie_clip: MovieClip<'gc>,
     _activation: &mut Activation<'_, 'gc>,
