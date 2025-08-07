@@ -705,6 +705,14 @@ impl<'gc> DisplayObjectBase<'gc> {
         self.set_flag(DisplayObjectFlags::PLACED_BY_SCRIPT, value);
     }
 
+    fn set_placed_by_avm1_script(&self, value: bool) {
+        self.set_flag(DisplayObjectFlags::PLACED_BY_AVM1_SCRIPT, value);
+    }
+
+    fn placed_by_avm1_script(&self) -> bool {
+        self.contains_flag(DisplayObjectFlags::PLACED_BY_AVM1_SCRIPT)
+    }
+
     fn is_bitmap_cached_preference(&self) -> bool {
         self.contains_flag(DisplayObjectFlags::CACHE_AS_BITMAP)
     }
@@ -1940,6 +1948,14 @@ pub trait TDisplayObject<'gc>:
         self.base().set_placed_by_script(value)
     }
 
+    fn placed_by_avm1_script(self) -> bool {
+        self.base().placed_by_avm1_script()
+    }
+
+    fn set_placed_by_avm1_script(self, value: bool) {
+        self.base().set_placed_by_avm1_script(value);
+    }
+
     /// Whether this display object has been instantiated by the timeline.
     /// When this flag is set, attempts to change the object's name from AVM2
     /// throw an exception.
@@ -2602,7 +2618,7 @@ impl<'gc> DisplayObject<'gc> {
 bitflags! {
     /// Bit flags used by `DisplayObject`.
     #[derive(Clone, Copy)]
-    pub struct DisplayObjectFlags: u16 {
+    pub struct DisplayObjectFlags: u32 {
         /// Whether this object has been removed from the display list.
         /// Necessary in AVM1 to throw away queued actions from removed movie clips.
         const AVM1_REMOVED             = 1 << 0;
@@ -2659,6 +2675,8 @@ bitflags! {
         const HAS_MATRIX3D_STUB        = 1 << 14;
 
         const SKIP_NEXT_FRAME_FOR_SELF = 1 << 15;
+
+        const PLACED_BY_AVM1_SCRIPT    = 1 << 16;
     }
 }
 

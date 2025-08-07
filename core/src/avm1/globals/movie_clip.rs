@@ -807,6 +807,7 @@ fn attach_movie<'gc>(
         .library_for_movie(movie_clip.movie())
         .and_then(|l| l.instantiate_by_export_name(export_name, activation.gc()))
     {
+        new_clip.set_placed_by_avm1_script(true);
         // Set name and attach to parent.
         new_clip.set_name(activation.gc(), new_instance_name);
         movie_clip.replace_at_depth(activation.context, new_clip, depth);
@@ -851,6 +852,7 @@ fn create_empty_movie_clip<'gc>(
 
     // Set name and attach to parent.
     new_clip.set_name(activation.gc(), new_instance_name);
+    new_clip.set_placed_by_avm1_script(true);
     movie_clip.replace_at_depth(activation.context, new_clip.into(), depth);
     new_clip.post_instantiation(activation.context, None, Instantiator::Avm1, true);
 
@@ -979,6 +981,7 @@ pub fn clone_sprite<'gc>(
     };
 
     // Set name and attach to parent.
+    new_clip.set_placed_by_avm1_script(true);
     new_clip.set_name(context.gc(), target);
     parent.replace_at_depth(context, new_clip.into(), depth);
 

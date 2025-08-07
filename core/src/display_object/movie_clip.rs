@@ -2105,7 +2105,7 @@ impl<'gc> MovieClip<'gc> {
 
             let children: SmallVec<[_; 16]> = self
                 .iter_render_list()
-                .filter(|clip| clip.place_frame() > frame)
+                .filter(|clip| clip.placed_by_avm1_script() || clip.place_frame() > frame)
                 .collect();
 
             tracing::debug!(
