@@ -238,7 +238,7 @@ pub struct DisplayObjectBase<'gc> {
     opaque_background: Cell<Option<Color>>,
 
     /// Bit flags for various display object properties.
-    flags: Cell<DisplayObjectFlags>,
+    pub flags: Cell<DisplayObjectFlags>,
 
     /// The 'internal' scroll rect used for rendering and methods like 'localToGlobal'.
     /// This is updated from 'pre_render'
@@ -718,6 +718,14 @@ impl<'gc> DisplayObjectBase<'gc> {
 
     fn set_placed_by_script(&self, value: bool) {
         self.set_flag(DisplayObjectFlags::PLACED_BY_SCRIPT, value);
+    }
+
+    fn set_placed_by_avm1_script(&self, value: bool) {
+        self.set_flag(DisplayObjectFlags::PLACED_BY_AVM1_SCRIPT, value);
+    }
+
+    fn placed_by_avm1_script(&self) -> bool {
+        self.contains_flag(DisplayObjectFlags::PLACED_BY_AVM1_SCRIPT)
     }
 
     fn is_bitmap_cached_preference(&self) -> bool {
@@ -1944,6 +1952,14 @@ pub trait TDisplayObject<'gc>:
         self.base().set_placed_by_script(value)
     }
 
+    fn placed_by_avm1_script(self) -> bool {
+        self.base().placed_by_avm1_script()
+    }
+
+    fn set_placed_by_avm1_script(self, value: bool) {
+        self.base().set_placed_by_avm1_script(value);
+    }
+
     /// Whether this display object has been instantiated by the timeline.
     /// When this flag is set, attempts to change the object's name from AVM2
     /// throw an exception.
@@ -2087,10 +2103,27 @@ pub trait TDisplayObject<'gc>:
     /// Emit a `frameConstructed` event on this DisplayObject and any children it
     /// may have.
     fn frame_constructed(self, context: &mut UpdateContext<'gc>) {
+        self.clear_all_skip_next_frame_for_self(context.stage.as_container().unwrap());
         let frame_constructed_evt =
             Avm2EventObject::bare_default_event(context, "frameConstructed");
         let dobject_constr = context.avm2.classes().display_object;
         Avm2::broadcast_event(context, frame_constructed_evt, dobject_constr);
+    }
+
+    fn clear_all_skip_next_frame_for_self(self, container: DisplayObjectContainer<'gc>) {
+        tracing::debug!("Clearing skipNextFrame for all children of {}", self.path());
+        for child in container.iter_render_list() {
+            if let Some(ctr) = child.as_container() {
+                child.clear_all_skip_next_frame_for_self(ctr);
+            }
+        }
+
+        self.clear_skip_next_frame();
+    }
+
+    fn clear_skip_next_frame(self) {
+        self.base()
+            .set_flag(DisplayObjectFlags::SKIP_NEXT_FRAME_FOR_SELF, false);
     }
 
     /// Run any frame scripts (if they exist and this object needs to run them).
@@ -2583,8 +2616,8 @@ impl<'gc> DisplayObject<'gc> {
 
 bitflags! {
     /// Bit flags used by `DisplayObject`.
-    #[derive(Clone, Copy)]
-    struct DisplayObjectFlags: u16 {
+    #[derive(Clone, Copy, Debug)]
+    pub struct DisplayObjectFlags: u32 {
         /// Whether this object has been removed from the display list.
         /// Necessary in AVM1 to throw away queued actions from removed movie clips.
         const AVM1_REMOVED             = 1 << 0;
@@ -2639,6 +2672,10 @@ bitflags! {
 
         /// Whether this object has matrix3D (used for stubbing).
         const HAS_MATRIX3D_STUB        = 1 << 14;
+
+        const SKIP_NEXT_FRAME_FOR_SELF = 1 << 15;
+
+        const PLACED_BY_AVM1_SCRIPT    = 1 << 16;
     }
 }
 

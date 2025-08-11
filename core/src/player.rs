@@ -1,5 +1,6 @@
 use crate::avm1::Attribute;
 use crate::avm1::Avm1;
+use crate::avm1::ExecutionReason;
 use crate::avm1::Object;
 use crate::avm1::Value;
 use crate::avm1::VariableDumper;
@@ -2125,7 +2126,7 @@ impl Player {
 
                             let _ = constructor.construct_on_existing(&mut activation, object, &[]);
                         }
-                    }
+                    }            
                 }
                 // Run constructor events without changing the prototype.
                 ActionType::Construct {
@@ -2143,6 +2144,14 @@ impl Player {
                 }
                 // Event handler method call (e.g. onEnterFrame).
                 ActionType::Method { object, name, args } => {
+                    Avm1::run_stack_frame_for_method(action.clip, object, name, &args, context);
+                }
+
+                ActionType::LoaderCallback { object, name, args } => {
+                    Avm1::run_stack_frame_for_method(action.clip, object, name, &args, context);
+                }
+
+                ActionType::OnLoadInit { object, name, args } => {
                     Avm1::run_stack_frame_for_method(action.clip, object, name, &args, context);
                 }
 

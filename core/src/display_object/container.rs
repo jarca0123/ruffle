@@ -40,6 +40,7 @@ pub fn dispatch_removed_from_stage_event<'gc>(
             dispatch_removed_from_stage_event(grandchild, context)
         }
     }
+    clear_all_stop_after_goto_flags(context.stage.into());
 }
 
 /// Dispatch the `removed` event on a child and log any errors encountered
@@ -53,6 +54,7 @@ pub fn dispatch_removed_event<'gc>(child: DisplayObject<'gc>, context: &mut Upda
             dispatch_removed_from_stage_event(child, context)
         }
     }
+    clear_all_stop_after_goto_flags(context.stage.into());
 }
 
 /// Dispatch the `addedToStage` event on a child, ignoring it's grandchildren.
@@ -63,6 +65,19 @@ pub fn dispatch_added_to_stage_event_only<'gc>(
     if let Avm2Value::Object(object) = child.object2() {
         let added_evt = Avm2EventObject::bare_default_event(context, "addedToStage");
         Avm2::dispatch_event(context, added_evt, object);
+    }
+    clear_all_stop_after_goto_flags(context.stage.into());
+}
+
+fn clear_all_stop_after_goto_flags<'gc>(root: DisplayObject<'gc>) {
+    if let Some(movie_clip) = root.as_movie_clip() {
+        movie_clip.clear_stop_after_goto_flag();
+    }
+
+    if let Some(container) = root.as_container() {
+        for child in container.iter_render_list() {
+            clear_all_stop_after_goto_flags(child);
+        }
     }
 }
 
@@ -93,6 +108,9 @@ pub fn dispatch_added_event_only<'gc>(child: DisplayObject<'gc>, context: &mut U
         let added_evt = Avm2EventObject::bare_event(context, "added", true, false);
         Avm2::dispatch_event(context, added_evt, object);
     }
+
+    // Clear STOP_AFTER_GOTO flag for ALL movie clips when ANY display object is added
+    clear_all_stop_after_goto_flags(context.stage.into());
 }
 
 /// Dispatch the `added` event on a child and log any errors encountered
@@ -112,6 +130,9 @@ pub fn dispatch_added_event<'gc>(
     if parent.is_on_stage(context) && !child_was_on_stage {
         dispatch_added_to_stage_event(child, context);
     }
+
+    // Clear STOP_AFTER_GOTO flag for ALL movie clips when ANY display object is added
+    clear_all_stop_after_goto_flags(context.stage.into());
 }
 
 #[enum_trait_object(
@@ -638,7 +659,7 @@ pub struct ChildContainer<'gc> {
     /// In AVM1, the depth and render lists are identical; AS1/2 code interacts
     /// exclusively with the depth list. However, AS3 instead references clips
     /// by render list indexes and does not manipulate the depth list.
-    depth_list: BTreeMap<Depth, DisplayObject<'gc>>,
+    pub depth_list: BTreeMap<Depth, DisplayObject<'gc>>,
 
     /// Does this container have any AVM1 objects that are pending removal
     ///
@@ -832,7 +853,7 @@ impl<'gc> ChildContainer<'gc> {
     }
 
     /// Determine if the render list is empty.
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.render_list.is_empty()
     }
 
@@ -1124,7 +1145,7 @@ impl<'gc> ChildContainer<'gc> {
         }
     }
 
-    fn render_list_mut(&mut self) -> &mut Vec<DisplayObject<'gc>> {
+    pub fn render_list_mut(&mut self) -> &mut Vec<DisplayObject<'gc>> {
         Rc::make_mut(&mut self.render_list)
     }
 }

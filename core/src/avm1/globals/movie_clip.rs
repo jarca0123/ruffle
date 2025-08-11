@@ -799,6 +799,7 @@ fn attach_movie<'gc>(
         .library_for_movie(movie_clip.movie())
         .and_then(|l| l.instantiate_by_export_name(export_name, activation.gc()))
     {
+        new_clip.set_placed_by_avm1_script(true);
         // Set name and attach to parent.
         new_clip.set_name(activation.gc(), new_instance_name);
         movie_clip.replace_at_depth(activation.context, new_clip, depth);
@@ -843,6 +844,7 @@ fn create_empty_movie_clip<'gc>(
 
     // Set name and attach to parent.
     new_clip.set_name(activation.gc(), new_instance_name);
+    new_clip.set_placed_by_avm1_script(true);
     movie_clip.replace_at_depth(activation.context, new_clip.into(), depth);
     new_clip.post_instantiation(activation.context, None, Instantiator::Avm1, true);
 
@@ -928,14 +930,21 @@ fn duplicate_movie_clip<'gc>(
     // `duplicateMovieClip` method uses biased depth compared to `CloneSprite`.
     let depth = depth.wrapping_add(AVM_DEPTH_BIAS);
 
-    let new_clip = clone_sprite(movie_clip, activation.context, name, depth, init_object);
-
-    // On SWF<6 undefined is returned.
-    if activation.swf_version() < 6 {
-        return Ok(Value::Undefined);
+    if let Some(new_clip) = clone_sprite(
+        movie_clip,
+        activation.context,
+        name,
+        depth,
+        init_object,
+    ) {
+        new_clip.set_placed_by_avm1_script(true);
+        // On SWF<6 undefined is returned.
+        if activation.swf_version() < 6 {
+            return Ok(Value::Undefined);
+        }
+        return Ok(new_clip.object());
     }
-
-    Ok(new_clip.map_or(Value::Undefined, |clip| clip.object()))
+    Ok(Value::Undefined)
 }
 
 pub fn clone_sprite<'gc>(
@@ -972,12 +981,13 @@ pub fn clone_sprite<'gc>(
 
     // Set name and attach to parent.
     new_clip.set_name(context.gc(), target);
+    new_clip.set_placed_by_avm1_script(!new_clip.instantiated_by_timeline());
     parent.replace_at_depth(context, new_clip.into(), depth);
 
     // Copy display properties from previous clip to new clip.
     new_clip.set_matrix(movie_clip.base().matrix());
     new_clip.set_color_transform(movie_clip.base().color_transform());
-
+     new_clip.set_was_duplicated();
     new_clip.init_clip_event_handlers(movie_clip.clip_actions().into());
 
     if let Some(drawing) = movie_clip.drawing().as_deref().cloned() {
@@ -1597,6 +1607,7 @@ fn load_movie<'gc>(
     let method = NavigationMethod::from_method_str(&method.coerce_to_string(activation)?);
     let target_obj = target.object().coerce_to_object(activation);
     let request = activation.object_into_request(target_obj, url, method);
+    target.set_suppress_next_load_event(true);
     let future = activation.context.load_manager.load_movie_into_clip(
         activation.context.player.clone(),
         DisplayObject::MovieClip(target),
@@ -1604,8 +1615,7 @@ fn load_movie<'gc>(
         None,
         crate::loader::MovieLoaderVMData::Avm1 { broadcaster: None },
     );
-    activation.context.navigator.spawn_future(future);
-
+    activation.context.avm1.deferred_loads.push(future);
     Ok(Value::Undefined)
 }
 
@@ -1618,6 +1628,7 @@ fn load_variables<'gc>(
     let url = url_val.coerce_to_string(activation)?;
     let method = args.get(1).cloned().unwrap_or(Value::Undefined);
     let method = NavigationMethod::from_method_str(&method.coerce_to_string(activation)?);
+    target.set_suppress_next_load_event(true);
     let target = target.object().coerce_to_object(activation);
     let request = activation.object_into_request(target, url, method);
     let future = activation.context.load_manager.load_form_into_object(
@@ -1625,7 +1636,7 @@ fn load_variables<'gc>(
         target,
         request,
     );
-    activation.context.navigator.spawn_future(future);
+    activation.context.avm1.deferred_loads.push(future);
 
     Ok(Value::Undefined)
 }

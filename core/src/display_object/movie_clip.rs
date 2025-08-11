@@ -1,4 +1,5 @@
 //! `MovieClip` display object and support code.
+use crate::avm1::globals::AVM_DEPTH_BIAS;
 use crate::avm1::Avm1;
 use crate::avm1::{Activation as Avm1Activation, ActivationIdentifier};
 use crate::avm1::{NativeObject as Avm1NativeObject, Object as Avm1Object, Value as Avm1Value};
@@ -32,12 +33,12 @@ use crate::library::MovieLibrary;
 use crate::limits::ExecutionLimit;
 use crate::loader::{self, ContentType};
 use crate::loader::{LoadManager, Loader};
-use crate::prelude::*;
 use crate::streams::NetStream;
 use crate::string::{AvmString, SwfStrExt as _, WStr, WString};
 use crate::tag_utils::{self, ControlFlow, DecodeResult, Error, SwfMovie, SwfSlice, SwfStream};
 use crate::utils::HasPrefixField;
 use crate::vminterface::{AvmObject, Instantiator};
+use crate::{prelude::*, Player};
 use bitflags::bitflags;
 use core::fmt;
 use gc_arena::barrier::unlock;
@@ -188,8 +189,7 @@ pub struct MovieClipData<'gc> {
 
     last_queued_script_frame: Cell<Option<FrameNumber>>,
     queued_script_frame: Cell<FrameNumber>,
-    queued_goto_frame: Cell<Option<FrameNumber>>,
-
+    queued_goto_frame: Cell<Option<Option<(FrameNumber, bool)>>>,
     current_frame: Cell<FrameNumber>,
 
     flags: Cell<MovieClipFlags>,
@@ -205,6 +205,10 @@ pub struct MovieClipData<'gc> {
 
     /// Show a hand cursor when the clip is in button mode.
     avm2_use_hand_cursor: Cell<bool>,
+
+    queued_legacy_next_frame: Cell<bool>,
+
+    has_run_frame: Cell<bool>,
 }
 
 #[derive(Clone, Collect)]
@@ -240,13 +244,15 @@ impl<'gc> MovieClipData<'gc> {
             last_queued_script_frame: Cell::new(None),
             queued_script_frame: Cell::new(0),
             has_pending_script: Cell::new(false),
-            queued_goto_frame: Cell::new(None),
+            queued_goto_frame: Cell::new(Some(None)),
             drop_target: Lock::new(None),
             queued_tags: Default::default(),
             hit_area: Lock::new(None),
             attached_audio: Lock::new(None),
             next_avm1_clip: Lock::new(None),
             importer_movie: None,
+            queued_legacy_next_frame: Cell::new(false),
+            has_run_frame: Cell::new(false),
         }
     }
 
@@ -257,6 +263,10 @@ impl<'gc> MovieClipData<'gc> {
 }
 
 impl<'gc> MovieClip<'gc> {
+    pub fn flags(&self) -> MovieClipFlags {
+        self.0.flags.get()
+    }
+
     pub fn downgrade(self) -> MovieClipWeak<'gc> {
         MovieClipWeak(Gc::downgrade(self.0))
     }
@@ -359,6 +369,7 @@ impl<'gc> MovieClip<'gc> {
         is_root: bool,
         loader_info: Option<LoaderInfoObject<'gc>>,
     ) {
+        let suppress_event = self.suppress_next_load_event();
         let write = Gc::write(context.gc(), self.0);
         let movie =
             movie.unwrap_or_else(|| Arc::new(SwfMovie::empty(write.movie().version(), None)));
@@ -384,7 +395,12 @@ impl<'gc> MovieClip<'gc> {
             ),
         ));
         write.tag_stream_pos.set(0);
-        write.flags.set(MovieClipFlags::PLAYING);
+        let mut new_flags = MovieClipFlags::PLAYING | MovieClipFlags::LOAD_EVENT_IS_LOW_PRIORITY;
+        if suppress_event {
+            new_flags.insert(MovieClipFlags::SUPPRESS_NEXT_LOAD_EVENT);
+        }
+
+        write.flags.set(new_flags);
         write.current_frame.set(0);
         write.audio_stream.take();
     }
@@ -421,10 +437,11 @@ impl<'gc> MovieClip<'gc> {
         if !self.movie().is_action_script_3() {
             // Run my load/enterFrame clip event.
             let is_load_frame = !self.0.contains_flag(MovieClipFlags::INITIALIZED);
-            if is_load_frame {
+            let is_level_root = self.parent().and_then(|p| p.as_stage()).is_some();
+            if is_load_frame && !is_level_root {
                 self.event_dispatch(context, ClipEvent::Load);
                 self.0.set_initialized(true);
-            } else {
+            } else if !is_load_frame {
                 self.event_dispatch(context, ClipEvent::EnterFrame);
             }
 
@@ -433,9 +450,14 @@ impl<'gc> MovieClip<'gc> {
             if self.playing() {
                 self.run_frame_internal(context, true, true, false);
             }
+
+            if is_load_frame && is_level_root {
+                self.event_dispatch(context, ClipEvent::Load);
+                self.0.set_initialized(true);
+            }
+
         }
     }
-
     /// Preload a chunk of the movie.
     ///
     /// A "chunk" is an implementor-chosen number of tags that are parsed
@@ -513,7 +535,17 @@ impl<'gc> MovieClip<'gc> {
                 TagCode::DefineSound => shared.define_sound(context, reader),
                 TagCode::DefineVideoStream => shared.define_video_stream(context, reader),
                 TagCode::DefineSprite => {
-                    return shared.define_sprite(context, reader, tag_len, chunk_limit)
+                    let overall_position = (reader.get_ref().as_ptr() as u64)
+                        .saturating_sub(swf.data().as_ptr() as u64);
+                    let frame_number = shared.preload_progress.cur_preload_frame.get();
+                    return shared.define_sprite(
+                        context,
+                        reader,
+                        tag_len,
+                        chunk_limit,
+                        overall_position,
+                        frame_number,
+                    );
                 }
                 TagCode::DefineText => shared.define_text(context, reader, 1),
                 TagCode::DefineText2 => shared.define_text(context, reader, 2),
@@ -700,8 +732,71 @@ impl<'gc> MovieClip<'gc> {
         self.0.set_programmatically_played()
     }
 
+    pub fn set_stop_after_play(self) {
+        self.0.set_stop_after_play();
+    }
+
+    pub fn clear_stop_after_play(self) {
+        self.0.clear_stop_after_play();
+    }
+    pub fn stop_after_play(self) -> bool {
+        self.0.stop_after_play()
+    }
+
+    pub fn set_play_after_frame_script(self) {
+        self.0.set_play_after_frame_script();
+    }
+
+    pub fn clear_play_after_frame_script(self) {
+        self.0.clear_play_after_frame_script();
+    }
+
+    pub fn play_after_frame_script(self) -> bool {
+        self.0.play_after_frame_script()
+    }
+
+    pub fn i_ran_out_of_names(&self) -> bool {
+        self.0.i_ran_out_of_names()
+    }
+    pub fn set_i_ran_out_of_names(&self) {
+        self.0.set_i_ran_out_of_names();
+    }
+    pub fn clear_i_ran_out_of_names(&self) {
+        self.0.clear_i_ran_out_of_names();
+    }
+
+    pub fn was_duplicated(&self) -> bool {
+        self.0.duplicated()
+    }
+
+    pub fn set_was_duplicated(&self) {
+        self.0.set_duplicated();
+    }
+
+    pub fn clear_was_duplicated(&self) {
+        self.0.clear_duplicated();
+    }
+
+    pub fn suppress_next_load_event(&self) -> bool {
+        self.0
+            .contains_flag(MovieClipFlags::SUPPRESS_NEXT_LOAD_EVENT)
+    }
+
+    pub fn set_suppress_next_load_event(&self, value: bool) {
+        self.0
+            .set_flag(MovieClipFlags::SUPPRESS_NEXT_LOAD_EVENT, value);
+    }
+
     pub fn next_frame(self, context: &mut UpdateContext<'gc>) {
-        if self.current_frame() < self.total_frames() {
+        let is_legacy_script_call = self.movie().version() < 10
+            && self
+                .0
+                .contains_flag(MovieClipFlags::EXECUTING_AVM2_FRAME_SCRIPT);
+
+        if is_legacy_script_call && self.movie().is_action_script_3() {
+            self.0.queued_legacy_next_frame.set(true);
+        } else if self.current_frame() < self.total_frames() {
+            // All modern SWFs and non-script calls use the normal goto mechanism.
             self.goto_frame(context, self.current_frame() + 1, true);
         }
     }
@@ -760,13 +855,14 @@ impl<'gc> MovieClip<'gc> {
             {
                 // AVM2 does not allow a clip to see while it is executing a frame script.
                 // The goto is instead queued and run once the frame script is completed.
-                self.0.queued_goto_frame.set(Some(frame));
+                self.0.queued_goto_frame.set(Some(Some((frame, stop))));
             } else {
                 self.run_goto(context, frame, false);
+                self.0.queued_goto_frame.set(Some(None));
             }
         } else if self.movie().is_action_script_3() {
             // Despite not running, the goto still overwrites the currently enqueued frame.
-            self.0.queued_goto_frame.set(None);
+            self.0.queued_goto_frame.set(Some(None));
             // Pretend we actually did a goto, but don't do anything.
             run_inner_goto_frame(context, &[], self);
         }
@@ -933,6 +1029,21 @@ impl<'gc> MovieClip<'gc> {
         self.0.total_frames()
     }
 
+    /// Get the actual number of frames found during parsing
+    pub fn real_frames(self) -> Option<FrameNumber> {
+        self.0.shared.get().real_frames.get()
+    }
+
+    /// Set the actual number of frames found during parsing
+    pub fn set_real_frames(self, frames: FrameNumber) {
+        self.0.shared.get().real_frames.set(Some(frames));
+    }
+
+    /// Get the effective total frames (real frames if available, otherwise AVM frames count)
+    pub fn effective_total_frames(self) -> FrameNumber {
+        self.real_frames().unwrap_or_else(|| self.total_frames())
+    }
+
     pub fn has_frame_script(self, frame: FrameNumber) -> bool {
         self.frame_script(frame).is_some()
     }
@@ -944,6 +1055,10 @@ impl<'gc> MovieClip<'gc> {
             .frame_scripts
             .get(frame as usize)
             .and_then(|&v| v)
+    }
+
+    fn has_frame_scripts(self) -> bool {
+        !self.0.cell.borrow().frame_scripts.is_empty()
     }
 
     /// This sets the current preload frame of this MovieClipto a given number (resulting
@@ -1156,9 +1271,32 @@ impl<'gc> MovieClip<'gc> {
 
     /// Determine what the clip's next frame should be.
     fn determine_next_frame(self) -> NextFrame {
-        if self.current_frame() < self.total_frames() {
-            NextFrame::Next
-        } else if self.total_frames() > 1 {
+        // Check if this instance should stop after goto
+        if self.0.contains_flag(MovieClipFlags::STOP_AFTER_GOTO) {
+            return NextFrame::Same;
+        }
+
+        let shared = Gc::as_ref(self.0.shared.get());
+        let data = shared.swf.clone();
+        let mut reader = data.read_from(self.0.tag_stream_pos.get());
+
+        let mut has_more_tags = false;
+        let tag_callback = |_reader: &mut SwfStream<'_>, tag_code, _tag_len| {
+            if tag_code == TagCode::ShowFrame {
+                has_more_tags = true;
+                Ok(ControlFlow::Exit)
+            } else {
+                Ok(ControlFlow::Continue)
+            }
+        };
+
+        if let Ok(_) = crate::tag_utils::decode_tags(&mut reader, tag_callback) {
+            if has_more_tags {
+                return NextFrame::Next;
+            }
+        }
+
+        if self.total_frames() > 1 {
             NextFrame::First
         } else {
             NextFrame::Same
@@ -1173,11 +1311,42 @@ impl<'gc> MovieClip<'gc> {
         is_action_script_3: bool,
     ) {
         let shared = Gc::as_ref(self.0.shared.get());
-
+        let current_frame = self.0.current_frame();
+        let clip_id = self.0.id();
         let next_frame = self.determine_next_frame();
+        if self.0.contains_flag(MovieClipFlags::STOP_AFTER_GOTO) {
+            let all_frames_have_actions =
+                (1..=self.total_frames()).all(|frame| self.actions_on_frame(frame).any(|_| true));
+            let should_be_stopped = if !self.movie().is_action_script_3() {
+                self.clip_actions().is_empty()
+                    && self
+                        .raw_container()
+                        .iter_render_list()
+                        .all(|child| child.as_interactive().is_none())
+                    && !all_frames_have_actions
+            } else {
+                if self.parent().map_or(false, |p| p.is_root()) {
+                    self.raw_container().iter_render_list().all(|child| {
+                        child.as_movie_clip().is_none() && child.as_drawing().is_some()
+                    }) && self.instantiated_by_timeline()
+                } else {
+                    false
+                }
+            };
+            if should_be_stopped {
+                self.stop(context);
+                self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false); // Clear the flag.
+                return;
+            } else {
+                self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false);
+            }
+        }
         match next_frame {
             NextFrame::Next => {
-                if (self.0.current_frame() + 1) >= shared.preload_progress.cur_preload_frame.get() {
+                let next_frame_num = current_frame + 1;
+                let cur_preload_frame = shared.preload_progress.cur_preload_frame.get();
+
+                if next_frame_num >= cur_preload_frame {
                     return;
                 }
 
@@ -1278,8 +1447,9 @@ impl<'gc> MovieClip<'gc> {
                 self.0.audio_stream.take();
             }
         }
+        let frame_advanced_by_goto = self.0.contains_flag(MovieClipFlags::FRAME_ADVANCED_BY_GOTO);
 
-        if matches!(next_frame, NextFrame::Next) && is_action_script_3 {
+        if matches!(next_frame, NextFrame::Next) && is_action_script_3 && !frame_advanced_by_goto {
             self.0.increment_current_frame();
         }
 
@@ -1292,6 +1462,17 @@ impl<'gc> MovieClip<'gc> {
         }
     }
 
+    fn has_avm1_actions_on_any_frame(&self) -> bool {
+        let total_frames = self.total_frames();
+
+        // Check each frame for actions, return early if found
+        (1..=total_frames).any(|frame| {
+            self.actions_on_frame(frame).any(|_x| {
+                true
+            })
+        })
+    }
+
     /// Instantiate a given child object on the timeline at a given depth.
     fn instantiate_child(
         self,
@@ -1299,6 +1480,8 @@ impl<'gc> MovieClip<'gc> {
         id: CharacterId,
         depth: Depth,
         place_object: &swf::PlaceObject,
+        overall_position: u64,
+        frame: FrameNumber,
     ) -> Option<DisplayObject<'gc>> {
         if self.has_child_at_depth(depth) {
             context.avm_warning(&format!("Failed to place object at depth {depth}."));
@@ -1307,6 +1490,16 @@ impl<'gc> MovieClip<'gc> {
 
         let movie = self.movie();
         let library = context.library.library_for_movie_mut(movie.clone());
+        let check_frame = self.0.shared.get().preload_progress.cur_preload_frame.get();
+        if !library.is_character_defined_before_frame_number(id, frame) {
+            tracing::error!(
+                "Character ID {} is not defined before frame {}",
+                id,
+                check_frame
+            );
+            return None; 
+        }
+
         match library.instantiate_by_id(id, context.gc_context) {
             Some(child) => {
                 // Remove previous child from children list,
@@ -1440,6 +1633,37 @@ impl<'gc> MovieClip<'gc> {
             self.assert_expected_tag_start();
         }
 
+        let is_looping_instance = is_implicit;
+
+        if is_implicit {
+            self.0
+                .set_flag(MovieClipFlags::FRAME_ADVANCED_BY_GOTO, true);
+        }
+        let has_actions_on_all_frames =
+            (1..=self.total_frames()).all(|frame| self.actions_on_frame(frame).any(|_| true));
+        if is_looping_instance {
+            let should_be_stopped = if !self.movie().is_action_script_3() {
+                self.clip_actions().is_empty()
+                    && self
+                        .raw_container()
+                        .iter_render_list()
+                        .all(|child| child.as_interactive().is_none())
+                    && !has_actions_on_all_frames
+            } else {
+                if self.parent().map_or(false, |p| p.is_root()) {
+                    self.raw_container().iter_render_list().all(|child| {
+                        child.as_movie_clip().is_none() && child.as_drawing().is_some()
+                    }) && self.instantiated_by_timeline()
+                } else {
+                    false
+                }
+            };
+
+            if should_be_stopped {
+                self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, true);
+            }
+        }
+
         let frame_before_rewind = self.current_frame();
         self.base().set_skip_next_enter_frame(false);
 
@@ -1550,8 +1774,10 @@ impl<'gc> MovieClip<'gc> {
             }
         }
         let hit_target_frame = self.0.current_frame() == frame;
-
+        let final_tag_pos = reader.get_ref().as_ptr() as u64 - tag_stream_start;
         if is_rewind {
+            let timeline_depths: std::collections::HashSet<Depth> =
+                goto_commands.iter().map(|p| p.depth()).collect();
             // Remove all display objects that were created after the
             // destination frame.
             //
@@ -1563,10 +1789,25 @@ impl<'gc> MovieClip<'gc> {
             // TODO: Should AS3 children ignore GOTOs?
             let children: SmallVec<[_; 16]> = self
                 .iter_render_list()
-                .filter(|clip| clip.place_frame() > frame)
+                .filter(|child| {
+                    // Flash Player also removes any object at timeline depth (< AVM_DEPTH_BIAS)
+                    // during rewinds, which includes objects moved there via swapDepths
+                    if !self.movie().is_action_script_3() {
+                        let is_in_timeline = timeline_depths.contains(&child.depth());
+                        let movie_clip_not_suppressed = match child.as_movie_clip() {
+                            Some(clip) if clip.0.contains_flag(MovieClipFlags::SUPPRESS_NEXT_LOAD_EVENT) => false,
+                            _ => true,
+                        };
+                        let condition = ( child.instantiated_by_timeline() && child.depth() < AVM_DEPTH_BIAS) && ( !is_in_timeline || child.place_frame() > frame) && (movie_clip_not_suppressed);                        return condition;
+                    } else {
+                        return child.place_frame() > frame;
+                    }
+                })
                 .collect();
             for child in children {
-                if !child.placed_by_script() {
+                if (!child.placed_by_avm1_script() && !child.movie().is_action_script_3())
+                    || (!child.placed_by_script() && child.movie().is_action_script_3())
+                {
                     self.remove_child(context, child);
                 } else {
                     self.remove_child_from_depth_list(context, child);
@@ -1619,11 +1860,26 @@ impl<'gc> MovieClip<'gc> {
                 }
                 (PlaceObjectAction::Place(id), _, _)
                 | (swf::PlaceObjectAction::Replace(id), _, _) => {
-                    if let Some(child) =
-                        clip.instantiate_child(context, id, params.depth(), &params.place_object)
-                    {
+                    let overall_position =
+                        reader.get_ref().as_ptr() as u64 - self.movie().data().as_ptr() as u64;
+                    let root = context
+                        .stage
+                        .root_clip()
+                        .expect("Root clip should always be present in the stage");
+                    if let Some(child) = clip.instantiate_child(
+                        context,
+                        id,
+                        params.depth(),
+                        &params.place_object,
+                        overall_position,
+                        root.as_movie_clip().unwrap().current_frame(),
+                    ) {
                         // Set the place frame to the frame where the object *would* have been placed.
                         child.set_place_frame(params.frame);
+                        child.base().set_flag(
+                            crate::display_object::DisplayObjectFlags::SKIP_NEXT_FRAME_FOR_SELF,
+                            true,
+                        );
                     }
                 }
                 _ => {
@@ -1654,22 +1910,26 @@ impl<'gc> MovieClip<'gc> {
         // Note that this only happens if the frame exists and is loaded;
         // e.g. gotoAndStop(9999) displays the final frame, but actions don't run!
         if hit_target_frame {
-            self.0.decrement_current_frame();
-            self.0.tag_stream_pos.set(frame_pos);
-            // If we changed frames, then trigger any sounds in our target frame.
-            // However, if we executed a 'no-op goto' (start and end frames are the same),
-            // then do *not* run sounds. Some SWFS (e.g. 'This is the only level too')
-            // rely on this behavior.
-            self.run_frame_internal(
-                context,
-                false,
-                frame != frame_before_rewind,
-                self.movie().is_action_script_3(),
-            );
+            if self.0.contains_flag(MovieClipFlags::STOP_AFTER_GOTO) {                
+                self.0.tag_stream_pos.set(final_tag_pos);
+            } else {
+                self.0.current_frame.set(frame - 1);
+                self.0.tag_stream_pos.set(frame_pos);
+                self.run_frame_internal(
+                    context,
+                    false,
+                    frame != frame_before_rewind,
+                    self.movie().is_action_script_3(),
+                );
+            }
+
+            if self.0.current_frame.get() != frame {
+                self.0.current_frame.set(frame);
+            }
+            self.0.queued_script_frame.set(frame);
         } else {
             self.0.current_frame.set(clamped_frame);
         }
-
         // Finally, run frames for children that are placed on this frame.
         goto_commands
             .iter()
@@ -2015,6 +2275,30 @@ impl<'gc> MovieClip<'gc> {
         self.0.drawing.get().map(|d| d.borrow())
     }
 
+    pub fn queued_goto_frame(&self) -> Option<Option<(FrameNumber, bool)>> {
+        self.0.queued_goto_frame.get()
+    }
+
+    pub fn clear_queued_goto_frame(&self) {
+        self.0.queued_goto_frame.set(Some(None));
+    }
+
+    pub fn set_erroneous_queued_goto_frame(&self) {
+        self.0.queued_goto_frame.set(None);
+    }
+
+    pub fn set_has_run_frame(&self) {
+        self.0.has_run_frame.set(true);
+    }
+
+    pub fn has_run_frame(&self) -> bool {
+        self.0.has_run_frame.get()
+    }
+
+    pub fn clear_has_run_frame(&self) {
+        self.0.has_run_frame.set(false);
+    }
+
     pub fn is_button_mode(&self, context: &mut UpdateContext<'gc>) -> bool {
         if self.forced_button_mode()
             || self
@@ -2183,6 +2467,35 @@ impl<'gc> MovieClip<'gc> {
     }
 
     fn run_local_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        if self
+            .base()
+            .contains_flag(crate::display_object::DisplayObjectFlags::SKIP_NEXT_FRAME_FOR_SELF)
+        {
+            self.base().set_flag(
+                crate::display_object::DisplayObjectFlags::SKIP_NEXT_FRAME_FOR_SELF,
+                false,
+            );
+            self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false);
+            return;
+        }
+        // If this movieclip was determined to be a simple looping graphic
+        // in `run_goto`, then it should be stopped immediately *before*
+        // any further scripts are run. This prevents the frame script of the
+        // loop destination from running an extra time.
+        if self.0.contains_flag(MovieClipFlags::STOP_AFTER_GOTO) {
+
+            self.stop(context);
+
+            self.0
+                .last_queued_script_frame
+                .set(Some(self.current_frame()));
+
+            self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false);
+            self.0
+                .set_flag(MovieClipFlags::FRAME_ADVANCED_BY_GOTO, false);
+
+            return;
+        }
         let avm2_object = self.0.object.get().and_then(|o| o.as_avm2_object());
 
         if let Some(avm2_object) = avm2_object {
@@ -2235,9 +2548,33 @@ impl<'gc> MovieClip<'gc> {
             }
         }
 
+        if self.0.contains_flag(MovieClipFlags::FRAME_ADVANCED_BY_GOTO) {
+            self.0
+                .set_flag(MovieClipFlags::FRAME_ADVANCED_BY_GOTO, false);
+        }
         let goto_frame = self.0.queued_goto_frame.take();
-        if let Some(frame) = goto_frame {
+        self.0.queued_goto_frame.set(Some(None));
+        if let Some(Some((frame, stop))) = goto_frame {
+            if stop {
+                self.0.set_flag(MovieClipFlags::STOP_AFTER_PLAY, true);
+            } else {
+                self.0
+                    .set_flag(MovieClipFlags::PLAY_AFTER_FRAME_SCRIPT, false);
+            }
+
             self.run_goto(context, frame, false);
+        } else if let Some(None) = goto_frame {
+            if self.0.contains_flag(MovieClipFlags::STOP_AFTER_PLAY) {
+                self.stop(context);
+                self.0.set_flag(MovieClipFlags::STOP_AFTER_PLAY, false);
+            }
+        }
+        if self.0.queued_legacy_next_frame.take() {
+            let new_frame = self.current_frame() + 1;
+            if new_frame <= self.total_frames() {
+                self.run_goto(context, new_frame, false);
+                self.run_local_frame_scripts(context);
+            }
         }
     }
 }
@@ -2291,7 +2628,19 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         if self.movie().is_action_script_3() {
             let is_playing = self.playing();
 
-            if is_playing {
+            if is_playing
+                && self
+                    .0
+                    .contains_flag(MovieClipFlags::PLAY_AFTER_FRAME_SCRIPT)
+            {
+                self.0
+                    .set_flag(MovieClipFlags::PLAY_AFTER_FRAME_SCRIPT, false);
+            }
+            let mut is_erroneous_goto_frame = false;
+            if let None = self.queued_goto_frame() {
+                is_erroneous_goto_frame = true;
+            }
+            if is_playing || is_erroneous_goto_frame {
                 self.run_frame_internal(context, true, true, true);
             }
 
@@ -2698,15 +3047,27 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
                 // (e.g., clip.onEnterFrame = foo).
                 if self.should_fire_event_handlers(context, event) {
                     if let Some(name) = event.method_name(&context.strings) {
-                        context.action_queue.queue_action(
-                            self.into(),
-                            ActionType::Method {
-                                object,
-                                name,
-                                args: vec![],
-                            },
-                            event == ClipEvent::Unload,
-                        );
+                        if let ClipEvent::Load = event {
+                            context.action_queue.queue_action(
+                                self.into(),
+                                ActionType::LoaderCallback {
+                                    object,
+                                    name,
+                                    args: vec![],
+                                },
+                                event == ClipEvent::Unload,
+                            );
+                        } else {
+                            context.action_queue.queue_action(
+                                self.into(),
+                                ActionType::Method {
+                                    object,
+                                    name,
+                                    args: vec![],
+                                },
+                                event == ClipEvent::Unload,
+                            );
+                        }
                     }
                 }
             }
@@ -3065,6 +3426,53 @@ impl<'gc> MovieClipData<'gc> {
 
     fn set_programmatically_played(&self) {
         self.set_flag(MovieClipFlags::PROGRAMMATICALLY_PLAYED, true);
+    }
+
+    fn set_play_after_frame_script(&self) {
+        self.set_flag(MovieClipFlags::PLAY_AFTER_FRAME_SCRIPT, true);
+    }
+
+    fn clear_play_after_frame_script(&self) {
+        self.set_flag(MovieClipFlags::PLAY_AFTER_FRAME_SCRIPT, false);
+    }
+    fn play_after_frame_script(&self) -> bool {
+        self.contains_flag(MovieClipFlags::PLAY_AFTER_FRAME_SCRIPT)
+    }
+
+    fn set_stop_after_play(&self) {
+        self.set_flag(MovieClipFlags::STOP_AFTER_PLAY, true);
+    }
+
+    fn clear_stop_after_play(&self) {
+        self.set_flag(MovieClipFlags::STOP_AFTER_PLAY, false);
+    }
+
+    fn stop_after_play(&self) -> bool {
+        self.contains_flag(MovieClipFlags::STOP_AFTER_PLAY)
+    }
+
+    fn i_ran_out_of_names(&self) -> bool {
+        self.contains_flag(MovieClipFlags::I_RAN_OUT_OF_NAMES)
+    }
+
+    fn set_i_ran_out_of_names(&self) {
+        self.set_flag(MovieClipFlags::I_RAN_OUT_OF_NAMES, true);
+    }
+
+    fn clear_i_ran_out_of_names(&self) {
+        self.set_flag(MovieClipFlags::I_RAN_OUT_OF_NAMES, false);
+    }
+
+    fn duplicated(&self) -> bool {
+        self.contains_flag(MovieClipFlags::DUPLICATED)
+    }
+
+    fn set_duplicated(&self) {
+        self.set_flag(MovieClipFlags::DUPLICATED, true);
+    }
+
+    fn clear_duplicated(&self) {
+        self.set_flag(MovieClipFlags::DUPLICATED, false);
     }
 
     fn loop_queued(&self) -> bool {
@@ -3618,6 +4026,8 @@ impl<'gc, 'a> MovieClipShared<'gc> {
         reader: &mut SwfStream<'a>,
         tag_len: usize,
         chunk_limit: &mut ExecutionLimit,
+        tag_position: u64,
+        frame_number: u16,
     ) -> DecodeResult {
         let start = reader.as_slice();
         let id = reader.read_character_id()?;
@@ -3633,7 +4043,12 @@ impl<'gc, 'a> MovieClipShared<'gc> {
 
         if self
             .library_mut(context)
-            .register_character(id, Character::MovieClip(movie_clip))
+            .register_character_with_position_and_frame(
+                id,
+                Character::MovieClip(movie_clip),
+                tag_position,
+                frame_number,
+            )
         {
             self.preload_progress.cur_preload_symbol.set(Some(id));
         } else {
@@ -4221,7 +4636,21 @@ impl<'gc, 'a> MovieClip<'gc> {
         use swf::PlaceObjectAction;
         match place_object.action {
             PlaceObjectAction::Place(id) => {
-                self.instantiate_child(context, id, place_object.depth.into(), &place_object);
+                let overall_position = (reader.get_ref().as_ptr() as u64)
+                    .saturating_sub(self.movie().data().as_ptr() as u64);
+
+                let root = context
+                    .stage
+                    .root_clip()
+                    .expect("Root clip should always be present in the stage");
+                self.instantiate_child(
+                    context,
+                    id,
+                    place_object.depth.into(),
+                    &place_object,
+                    overall_position,
+                    root.as_movie_clip().unwrap().current_frame(),
+                );
             }
             PlaceObjectAction::Replace(id) => {
                 if let Some(child) = self.child_by_depth(place_object.depth.into()) {
@@ -4353,6 +4782,10 @@ impl<'gc, 'a> MovieClip<'gc> {
         self.0
             .set_flag(MovieClipFlags::RUNNING_CONSTRUCT_FRAME, val);
     }
+
+    pub fn clear_stop_after_goto_flag(self) {
+        self.0.set_flag(MovieClipFlags::STOP_AFTER_GOTO, false);
+    }
 }
 
 #[derive(Clone)]
@@ -4408,6 +4841,8 @@ struct MovieClipShared<'gc> {
     id: CharacterId,
     swf: SwfSlice,
     total_frames: FrameNumber,
+    /// The actual number of frames found during parsing (may differ from total_frames)
+    real_frames: Cell<Option<FrameNumber>>,
     /// Preload progress for the given clip's tag stream.
     #[collect(require_static)]
     preload_progress: PreloadProgress,
@@ -4469,6 +4904,7 @@ impl<'gc> MovieClipShared<'gc> {
             id,
             swf,
             total_frames,
+            real_frames: Cell::new(None),
             preload_progress: Default::default(),
             exported_name: Lock::new(None),
             avm2_class: Lock::new(None),
@@ -4709,8 +5145,8 @@ pub enum QueuedTagAction {
 
 bitflags! {
     /// Boolean state flags used by `MovieClip`.
-    #[derive(Clone, Copy)]
-    struct MovieClipFlags: u8 {
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct MovieClipFlags: u16 {
         /// Whether this `MovieClip` has run its initial frame.
         const INITIALIZED             = 1 << 0;
 
@@ -4738,6 +5174,24 @@ bitflags! {
 
         /// Whether this `MovieClip` has been post-instantiated yet.
         const POST_INSTANTIATED = 1 << 6;
+
+        /// Whether this `MovieClip` should stop after the current rewind completes.
+        const STOP_AFTER_GOTO = 1 << 7;
+
+        /// Whether this `MovieClip`'s frame was set by an implicit goto and should not be advanced again this cycle.
+        const FRAME_ADVANCED_BY_GOTO = 1 << 8;
+
+        const STOP_AFTER_PLAY = 1 << 9;
+
+        const PLAY_AFTER_FRAME_SCRIPT = 1 << 10;
+
+        const I_RAN_OUT_OF_NAMES = 1 << 11;
+
+        const DUPLICATED = 1 << 12;
+
+        const SUPPRESS_NEXT_LOAD_EVENT = 1 << 13;
+
+        const LOAD_EVENT_IS_LOW_PRIORITY = 1 << 14;
     }
 }
 

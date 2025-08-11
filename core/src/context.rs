@@ -498,12 +498,12 @@ pub struct QueuedAction<'gc> {
 #[collect(no_drop)]
 pub struct ActionQueue<'gc> {
     /// Each priority is kept in a separate bucket.
-    action_queue: [VecDeque<QueuedAction<'gc>>; ActionQueue::NUM_PRIORITIES],
+    pub action_queue: [VecDeque<QueuedAction<'gc>>; ActionQueue::NUM_PRIORITIES],
 }
 
 impl<'gc> ActionQueue<'gc> {
     const DEFAULT_CAPACITY: usize = 32;
-    const NUM_PRIORITIES: usize = 3;
+    const NUM_PRIORITIES: usize = 4;
 
     /// Crates a new `ActionQueue` with an empty queue.
     pub fn new() -> Self {
@@ -645,6 +645,18 @@ pub enum ActionType<'gc> {
         events: Vec<SwfSlice>,
     },
 
+    OnLoadInit {
+        object: Avm1Object<'gc>,
+        name: AvmString<'gc>,
+        args: Vec<Avm1Value<'gc>>,
+    },
+
+    LoaderCallback {
+        object: Avm1Object<'gc>,
+        name: AvmString<'gc>,
+        args: Vec<Avm1Value<'gc>>,
+    },
+
     /// An event handler method, e.g. `onEnterFrame`.
     Method {
         object: Avm1Object<'gc>,
@@ -663,9 +675,11 @@ pub enum ActionType<'gc> {
 impl ActionType<'_> {
     fn priority(&self) -> usize {
         match self {
-            ActionType::Initialize { .. } => 2,
-            ActionType::Construct { .. } => 1,
-            _ => 0,
+            ActionType::Initialize { .. } => 4,
+            ActionType::Construct { .. } => 3,
+            ActionType::LoaderCallback { .. } => 0,
+            ActionType::OnLoadInit { .. } => 1,
+            _ => 2,
         }
     }
 }
@@ -703,6 +717,18 @@ impl fmt::Debug for ActionType<'_> {
                 .debug_struct("ActionType::NotifyListeners")
                 .field("listener", listener)
                 .field("method", method)
+                .field("args", args)
+                .finish(),
+            ActionType::LoaderCallback { object, name, args } => f
+                .debug_struct("ActionType::LoaderCallback")
+                .field("object", object)
+                .field("name", name)
+                .field("args", args)
+                .finish(),
+            ActionType::OnLoadInit { object, name, args } => f
+                .debug_struct("ActionType::OnLoadInit")
+                .field("object", object)
+                .field("name", name)
                 .field("args", args)
                 .finish(),
         }
