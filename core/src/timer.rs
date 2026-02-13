@@ -148,13 +148,13 @@ impl<'gc> Timers<'gc> {
                         let Some(closure) = closure else {
                             return Err(make_null_or_undefined_error(
                                 &mut avm2_activation,
-                                Avm2Value::Null,
+                                Avm2Value::NULL,
                                 None,
                             ));
                         };
 
                         let params = FunctionArgs::from_slice(&params);
-                        closure.call(&mut avm2_activation, Avm2Value::Null, params)
+                        closure.call(&mut avm2_activation, Avm2Value::NULL, params)
                     };
 
                     match run_closure() {

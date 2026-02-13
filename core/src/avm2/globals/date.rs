@@ -202,7 +202,7 @@ pub fn init_custom_prototype<'gc>(
 
     this.link_prototype(activation.context, prototype_date_object);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Date`'s instance constructor.
@@ -216,8 +216,8 @@ pub fn init<'gc>(
     let this = this.as_date_object().unwrap();
     let arguments = get_arguments_array(args);
 
-    let timestamp = arguments.get(0).unwrap_or(&Value::Undefined);
-    if timestamp != &Value::Undefined {
+    let timestamp = arguments.get(0).copied().unwrap_or(Value::UNDEFINED);
+    if !timestamp.is_undefined() {
         if arguments.len() > 1 {
             let timezone = get_timezone();
 
@@ -241,8 +241,8 @@ pub fn init<'gc>(
                 .map_year(|year| if year < 100.0 { year + 1900.0 } else { year })
                 .apply(this);
         } else {
-            let timestamp = if let Value::String(date_str) = timestamp {
-                parse_full_date(activation, *date_str).unwrap_or(f64::NAN)
+            let timestamp = if let Some(date_str) = timestamp.as_string() {
+                parse_full_date(activation, date_str).unwrap_or(f64::NAN)
             } else {
                 timestamp.coerce_to_number(activation)?
             };
@@ -256,7 +256,7 @@ pub fn init<'gc>(
         this.set_date_time(Some(get_current_date_time()))
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn call_handler<'gc>(

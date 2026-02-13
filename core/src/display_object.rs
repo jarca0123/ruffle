@@ -2571,7 +2571,7 @@ pub trait TDisplayObject<'gc>:
 
     #[no_dynamic]
     fn object2_or_null(self) -> Avm2Value<'gc> {
-        self.object2().map(|o| o.into()).unwrap_or(Avm2Value::Null)
+        self.object2().map(|o| o.into()).unwrap_or(Avm2Value::NULL)
     }
 
     /// Tests if a given stage position point intersects with the world bounds of this object.

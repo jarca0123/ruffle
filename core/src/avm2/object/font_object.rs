@@ -1,4 +1,4 @@
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{Object, TObject};
 use crate::avm2::{Activation, ClassObject, Error};
 use crate::character::Character;
@@ -12,7 +12,7 @@ pub fn font_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::FontObject);
 
     let font = if let Some((movie, id)) = activation
         .context
@@ -46,7 +46,7 @@ pub struct FontObjectWeak<'gc>(pub GcWeak<'gc, FontObjectData<'gc>>);
 
 impl<'gc> FontObject<'gc> {
     pub fn for_font(mc: &Mutation<'gc>, class: ClassObject<'gc>, font: Font<'gc>) -> Object<'gc> {
-        let base = ScriptObjectData::new(class);
+        let base = ScriptObjectData::new(class, ObjectType::FontObject);
         FontObject(Gc::new(
             mc,
             FontObjectData {

@@ -1,7 +1,7 @@
 use crate::avm2::activation::Activation;
 use crate::avm2::amf::deserialize_value;
 use crate::avm2::function::FunctionArgs;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, EventObject, Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::{Avm2, Domain, Error};
@@ -21,7 +21,7 @@ pub fn local_connection_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::LocalConnectionObject);
 
     let object = LocalConnectionObject(Gc::new(
         activation.gc(),
@@ -113,7 +113,7 @@ impl<'gc> LocalConnectionObject<'gc> {
                 event_name.into(),
                 false.into(),
                 false.into(),
-                Value::Null,
+                Value::NULL,
                 status.into(),
             ],
         );
@@ -133,7 +133,7 @@ impl<'gc> LocalConnectionObject<'gc> {
 
         for argument in amf_arguments {
             arguments
-                .push(deserialize_value(&mut activation, &argument).unwrap_or(Value::Undefined));
+                .push(deserialize_value(&mut activation, &argument).unwrap_or(Value::UNDEFINED));
         }
         let arguments = FunctionArgs::from_slice(&arguments);
 

@@ -2,7 +2,7 @@
 
 use crate::avm2::Error;
 use crate::avm2::activation::Activation;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, TObject};
 use core::fmt;
 use gc_arena::{Collect, Gc, GcWeak};
@@ -18,7 +18,7 @@ pub fn shader_data_allocator<'gc>(
     Ok(ShaderDataObject(Gc::new(
         activation.gc(),
         ShaderDataObjectData {
-            base: ScriptObjectData::new(class),
+            base: ScriptObjectData::new(class, ObjectType::ShaderDataObject),
             shader: Cell::new(None),
         },
     ))

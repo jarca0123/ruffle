@@ -58,7 +58,7 @@ pub fn _init_function_class<'gc>(
     let function_proto = create_dummy_function(activation);
     function_class_object.link_prototype(activation.context, function_proto.into());
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Function.prototype.call`
@@ -90,7 +90,7 @@ pub fn apply<'gc>(
     let this = args.get_value(0);
 
     let arg_array = args.get_value(1);
-    let resolved_args = if !matches!(arg_array, Value::Undefined | Value::Null) {
+    let resolved_args = if !arg_array.is_null_or_undefined() {
         if let Some(array_object) = arg_array.as_object().and_then(|o| o.as_array_object()) {
             let arg_storage = array_object.storage();
 
@@ -122,7 +122,7 @@ pub fn get_length<'gc>(
         return Ok(this.executable().signature().len().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_prototype<'gc>(
@@ -136,11 +136,11 @@ pub fn get_prototype<'gc>(
         if let Some(proto) = function.prototype() {
             return Ok(proto.into());
         } else {
-            return Ok(Value::Undefined);
+            return Ok(Value::UNDEFINED);
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_prototype<'gc>(
@@ -155,5 +155,5 @@ pub fn set_prototype<'gc>(
         function.set_prototype(new_proto, activation.gc());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

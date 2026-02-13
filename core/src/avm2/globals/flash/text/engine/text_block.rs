@@ -31,8 +31,8 @@ pub fn create_text_line<'gc>(
 
     let content = this.get_slot(block_slots::_CONTENT);
 
-    let content = if matches!(content, Value::Null) {
-        return Ok(Value::Null);
+    let content = if content.is_null() {
+        return Ok(Value::NULL);
     } else {
         content
     };
@@ -46,7 +46,7 @@ pub fn create_text_line<'gc>(
                 istr!("complete").into(),
                 activation,
             )?;
-            return Ok(Value::Null);
+            return Ok(Value::NULL);
         }
         // Get the content element's text property (it's a getter).
         // TODO: GraphicElement?
@@ -55,10 +55,10 @@ pub fn create_text_line<'gc>(
                 .call_method(element_methods::GET_TEXT, &[], activation)
                 .unwrap_or_else(|_| istr!("").into());
 
-            if matches!(txt, Value::Null) {
+            if txt.is_null() {
                 // FP returns a null TextLine when `o` is null- note that
                 // `o` is already coerced to a String because of the AS bindings.
-                return Ok(Value::Null);
+                return Ok(Value::NULL);
             } else {
                 txt.coerce_to_string(activation)
                     .expect("Guaranteed by AS bindings")
@@ -118,8 +118,8 @@ fn apply_format<'gc>(
             .get_slot(format_slots::_FONT_SIZE)
             .coerce_to_number(activation)?;
 
-        let (font, bold, italic, is_device_font) = if let Value::Object(font_description) =
-            element_format.get_slot(format_slots::_FONT_DESCRIPTION)
+        let (font, bold, italic, is_device_font) = if let Some(font_description) =
+            element_format.get_slot(format_slots::_FONT_DESCRIPTION).as_object()
         {
             (
                 Some(

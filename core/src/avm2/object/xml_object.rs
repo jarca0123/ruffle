@@ -7,7 +7,7 @@ use crate::avm2::e4x::{
 };
 use crate::avm2::error::make_error_1087;
 use crate::avm2::function::FunctionArgs;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, NamespaceObject, Object, TObject, XmlListObject};
 use crate::avm2::string::AvmString;
 use crate::avm2::value::Value;
@@ -25,7 +25,7 @@ pub fn xml_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::XmlObject);
 
     Ok(XmlObject(Gc::new(
         activation.gc(),
@@ -68,7 +68,7 @@ impl<'gc> XmlObject<'gc> {
         XmlObject(Gc::new(
             activation.gc(),
             XmlObjectData {
-                base: ScriptObjectData::new(activation.context.avm2.classes().xml),
+                base: ScriptObjectData::new(activation.context.avm2.classes().xml, ObjectType::XmlObject),
                 node: Lock::new(node),
             },
         ))
@@ -256,7 +256,7 @@ impl<'gc> XmlObject<'gc> {
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<bool, Error<'gc>> {
         // 3.a. If both x and y are the same type (XML)
-        if let Value::Object(obj) = other {
+        if let Some(obj) = other.as_object() {
             if let Some(xml_obj) = obj.as_xml_object() {
                 // 3.a.i. If ((x.[[Class]] ∈ {"text", "attribute"}) and (y.hasSimpleContent())
                 // or ((y.[[Class]] ∈ {"text", "attribute"}) and (x.hasSimpleContent())
@@ -325,7 +325,7 @@ impl<'gc> TObject<'gc> for XmlObject<'gc> {
                     if index == 0 {
                         return Ok(self.into());
                     } else {
-                        return Ok(Value::Undefined);
+                        return Ok(Value::UNDEFINED);
                     }
                 }
             }
@@ -348,7 +348,7 @@ impl<'gc> TObject<'gc> for XmlObject<'gc> {
         // If the method doesn't exist on the prototype, and we have simple content,
         // then coerce this XML to a string and call the method on that.
         // This lets things like `new XML("<p>Hello world</p>").split(" ")` work.
-        if matches!(method, Value::Undefined) {
+        if method.is_undefined() {
             // Checking if we have a child with the same name as the method is probably
             // unnecessary - if we had such a child, then we wouldn't have simple content,
             // so we already would bail out before calling the method. Nevertheless,
@@ -357,7 +357,7 @@ impl<'gc> TObject<'gc> for XmlObject<'gc> {
             let prop = self.get_property_local(multiname, activation)?;
             if let Some(list) = prop.as_object().and_then(|obj| obj.as_xml_list_object()) {
                 if list.length() == 0 && self.node().has_simple_content() {
-                    let receiver = Value::String(self.node().xml_to_string(activation));
+                    let receiver = Value::from_string(self.node().xml_to_string(activation));
 
                     return receiver.call_property(multiname, arguments, activation);
                 }
@@ -424,7 +424,7 @@ impl<'gc> TObject<'gc> for XmlObject<'gc> {
                 *xml.node().kind(),
                 E4XNodeKind::Attribute(_) | E4XNodeKind::Text(_)
             ) {
-                Value::String(value.coerce_to_string(activation)?)
+                Value::from_string(value.coerce_to_string(activation)?)
             } else {
                 xml.deep_copy(activation).into()
             }
@@ -597,7 +597,7 @@ impl<'gc> TObject<'gc> for XmlObject<'gc> {
         if index == 1 {
             Ok(self.into())
         } else {
-            Ok(Value::Undefined)
+            Ok(Value::UNDEFINED)
         }
     }
 
@@ -609,7 +609,7 @@ impl<'gc> TObject<'gc> for XmlObject<'gc> {
         if index == 1 {
             Ok(0.into())
         } else {
-            Ok(Value::Null)
+            Ok(Value::NULL)
         }
     }
 

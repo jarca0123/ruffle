@@ -40,7 +40,7 @@ pub fn stub_method<'gc>(
         _ => tracing::warn!("(__ruffle__.stub_method called with wrong args)"),
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn stub_getter<'gc>(
@@ -63,7 +63,7 @@ pub fn stub_getter<'gc>(
         _ => tracing::warn!("(__ruffle__.stub_getter called with wrong args)"),
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn stub_setter<'gc>(
@@ -86,7 +86,7 @@ pub fn stub_setter<'gc>(
         _ => tracing::warn!("(__ruffle__.stub_setter called with wrong args)"),
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn stub_constructor<'gc>(
@@ -119,7 +119,7 @@ pub fn stub_constructor<'gc>(
         _ => tracing::warn!("(__ruffle__.stub_constructor called with wrong args)"),
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn log_warn<'gc>(
@@ -145,7 +145,7 @@ pub fn log_warn<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn is_dependent<'gc>(

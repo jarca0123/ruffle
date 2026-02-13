@@ -1,7 +1,7 @@
 //! Object representation for SharedObjects
 
 use crate::avm2::activation::Activation;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{Object, ScriptObject, TObject};
 use crate::context::UpdateContext;
 use gc_arena::barrier::unlock;
@@ -38,7 +38,7 @@ impl<'gc> SharedObjectObject<'gc> {
         name: String,
     ) -> Self {
         let class = activation.avm2().classes().sharedobject;
-        let base = ScriptObjectData::new(class);
+        let base = ScriptObjectData::new(class, ObjectType::SharedObjectObject);
 
         SharedObjectObject(Gc::new(
             activation.gc(),

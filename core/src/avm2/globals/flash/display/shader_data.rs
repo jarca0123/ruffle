@@ -86,5 +86,5 @@ pub fn _set_byte_code<'gc>(
     this.as_shader_data()
         .unwrap()
         .set_pixel_bender_shader(shader_handle);
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

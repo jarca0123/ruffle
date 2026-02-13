@@ -55,7 +55,7 @@ pub fn init<'gc>(
         this.call_method(sound_methods::LOAD, args, activation)?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Sound.bytesTotal`
@@ -75,7 +75,7 @@ pub fn get_bytes_total<'gc>(
         return Ok(0.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_bytes_loaded<'gc>(
@@ -118,7 +118,7 @@ pub fn get_url<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm2_stub_getter!(activation, "flash.media.Sound", "url");
     //STUB: We do not yet support network-loaded sounds.
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 /// Implements `Sound.length`
@@ -138,7 +138,7 @@ pub fn get_length<'gc>(
         return Ok(0.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Sound.play`
@@ -187,10 +187,10 @@ pub fn play<'gc>(
         }
         // If we start playing a loaded sound with an invalid position,
         // this method returns `null`
-        return Ok(Value::Null);
+        return Ok(Value::NULL);
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 /// `Sound.extract`
@@ -212,7 +212,7 @@ pub fn extract<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `Sound.close`
@@ -222,7 +222,7 @@ pub fn close<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm2_stub_method!(activation, "flash.media.Sound", "close");
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `Sound.load`
@@ -241,7 +241,7 @@ pub fn load<'gc>(
     let url_request = match args.try_get_object(0) {
         Some(request) => request,
         // FP ignores calls of `load(null)`
-        None => return Ok(Value::Undefined),
+        None => return Ok(Value::UNDEFINED),
     };
 
     let url = url_request
@@ -263,7 +263,7 @@ pub fn load<'gc>(
     activation.context.navigator.spawn_future(future);
     this.set_loading_state(SoundLoadingState::Loading);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `Sound.loadCompressedDataFromByteArray`
@@ -276,7 +276,7 @@ pub fn load_compressed_data_from_byte_array<'gc>(
 
     let this = this_object.as_sound_object().unwrap();
     if this.loading_state() == SoundLoadingState::Loaded {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     }
 
     let bytearray = args.get_object(activation, 0, "bytes")?;
@@ -303,7 +303,7 @@ pub fn load_compressed_data_from_byte_array<'gc>(
     this.read_and_call_id3_event(activation, bytes);
     this.set_sound(activation.context, handle);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `Sound.loadPCMFromByteArray`
@@ -316,7 +316,7 @@ pub fn load_pcm_from_byte_array<'gc>(
 
     let this = this_object.as_sound_object().unwrap();
     if this.loading_state() == SoundLoadingState::Loaded {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     }
 
     // TODO Add proper implementation.
@@ -325,7 +325,7 @@ pub fn load_pcm_from_byte_array<'gc>(
     this.set_loading_state(SoundLoadingState::Loaded);
     avm2_stub_method!(activation, "flash.media.Sound", "loadPCMFromByteArray");
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Sound.id3`
@@ -339,6 +339,6 @@ pub fn get_id3<'gc>(
     if let Some(id3) = this.as_sound_object().unwrap().id3() {
         Ok(id3.into())
     } else {
-        Ok(Value::Null)
+        Ok(Value::NULL)
     }
 }

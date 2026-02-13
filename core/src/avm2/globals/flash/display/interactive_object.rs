@@ -4,7 +4,7 @@ use crate::avm2::Error;
 use crate::avm2::activation::Activation;
 use crate::avm2::error::make_error_2027;
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueKind};
 use crate::display_object::TInteractiveObject;
 
 /// Implements `InteractiveObject.mouseEnabled`'s getter.
@@ -22,7 +22,7 @@ pub fn get_mouse_enabled<'gc>(
         return Ok(int.mouse_enabled().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `InteractiveObject.mouseEnabled`'s setter.
@@ -41,7 +41,7 @@ pub fn set_mouse_enabled<'gc>(
         int.set_mouse_enabled(value);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `InteractiveObject.doubleClickEnabled`'s getter.
@@ -59,7 +59,7 @@ pub fn get_double_click_enabled<'gc>(
         return Ok(int.double_click_enabled().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `InteractiveObject.doubleClickEnabled`'s setter.
@@ -78,7 +78,7 @@ pub fn set_double_click_enabled<'gc>(
         int.set_double_click_enabled(value);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `InteractiveObject.contextMenu`'s getter.
@@ -96,7 +96,7 @@ pub fn get_context_menu<'gc>(
         return Ok(int.context_menu());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `InteractiveObject.contextMenu`'s setter.
@@ -115,7 +115,7 @@ pub fn set_context_menu<'gc>(
         int.set_context_menu(activation.gc(), value);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_tab_enabled<'gc>(
@@ -126,9 +126,9 @@ pub fn get_tab_enabled<'gc>(
     let this = this.as_object().unwrap();
 
     if let Some(obj) = this.as_display_object().and_then(|o| o.as_interactive()) {
-        Ok(Value::Bool(obj.tab_enabled(activation.context)))
+        Ok(Value::from_bool(obj.tab_enabled(activation.context)))
     } else {
-        Ok(Value::Undefined)
+        Ok(Value::UNDEFINED)
     }
 }
 
@@ -147,7 +147,7 @@ pub fn set_tab_enabled<'gc>(
         obj.set_tab_enabled(activation.context, value);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_tab_index<'gc>(
@@ -161,9 +161,9 @@ pub fn get_tab_index<'gc>(
         .as_display_object()
         .and_then(|this| this.as_interactive())
     {
-        Ok(Value::Number(obj.tab_index().unwrap_or(-1) as f64))
+        Ok(Value::from_f64(obj.tab_index().unwrap_or(-1) as f64))
     } else {
-        Ok(Value::Undefined)
+        Ok(Value::UNDEFINED)
     }
 }
 
@@ -184,7 +184,7 @@ pub fn set_tab_index<'gc>(
         obj.set_tab_index(Some(value));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_focus_rect<'gc>(
@@ -195,9 +195,9 @@ pub fn get_focus_rect<'gc>(
     let this = this.as_object().unwrap();
 
     if let Some(obj) = this.as_display_object().and_then(|o| o.as_interactive()) {
-        Ok(obj.focus_rect().map(Value::Bool).unwrap_or(Value::Null))
+        Ok(obj.focus_rect().map(Value::from_bool).unwrap_or(Value::NULL))
     } else {
-        Ok(Value::Null)
+        Ok(Value::NULL)
     }
 }
 
@@ -212,14 +212,14 @@ pub fn set_focus_rect<'gc>(
         .as_display_object()
         .and_then(|this| this.as_interactive())
     {
-        let value = match args.get_value(0) {
-            Value::Bool(true) => Some(true),
-            Value::Null => None,
+        let value = match args.get_value(0).kind() {
+            ValueKind::Bool(true) => Some(true),
+            ValueKind::Null => None,
             // everything else sets focusRect to false
             _ => Some(false),
         };
         obj.set_focus_rect(value);
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }

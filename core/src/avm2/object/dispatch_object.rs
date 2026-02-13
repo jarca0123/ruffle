@@ -2,7 +2,7 @@
 
 use crate::avm2::activation::Activation;
 use crate::avm2::events::DispatchList;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{Object, TObject};
 use core::fmt;
 use gc_arena::barrier::unlock;
@@ -65,7 +65,7 @@ pub struct DispatchObjectData<'gc> {
 impl<'gc> DispatchObject<'gc> {
     /// Construct an empty dispatch list.
     pub fn empty_list(activation: &mut Activation<'_, 'gc>) -> Object<'gc> {
-        let base = ScriptObjectData::new(activation.avm2().classes().object);
+        let base = ScriptObjectData::new(activation.avm2().classes().object, ObjectType::DispatchObject);
 
         DispatchObject(Gc::new(
             activation.gc(),

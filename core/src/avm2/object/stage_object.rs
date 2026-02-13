@@ -3,7 +3,7 @@
 use crate::avm2::Error;
 use crate::avm2::activation::Activation;
 use crate::avm2::function::FunctionArgs;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, TObject};
 use crate::display_object::DisplayObject;
 use gc_arena::{Collect, Gc, GcWeak, Mutation};
@@ -48,7 +48,7 @@ impl<'gc> StageObject<'gc> {
         Self(Gc::new(
             mc,
             StageObjectData {
-                base: ScriptObjectData::new(class),
+                base: ScriptObjectData::new(class, ObjectType::StageObject),
                 display_object,
             },
         ))
@@ -82,7 +82,7 @@ impl<'gc> StageObject<'gc> {
         Self(Gc::new(
             activation.gc(),
             StageObjectData {
-                base: ScriptObjectData::new(class),
+                base: ScriptObjectData::new(class, ObjectType::StageObject),
                 display_object,
             },
         ))

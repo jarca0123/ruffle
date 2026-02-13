@@ -21,11 +21,11 @@ pub fn get_left_peak<'gc>(
         .and_then(|channel| channel.instance())
     {
         if let Some(peak) = activation.context.audio.get_sound_peak(instance) {
-            return Ok(Value::Number(peak[0].into()));
+            return Ok(Value::from_f64(peak[0].into()));
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `SoundChannel.rightPeak`
@@ -41,11 +41,11 @@ pub fn get_right_peak<'gc>(
         .and_then(|channel| channel.instance())
     {
         if let Some(peak) = activation.context.audio.get_sound_peak(instance) {
-            return Ok(Value::Number(peak[1].into()));
+            return Ok(Value::from_f64(peak[1].into()));
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Impl `SoundChannel.position`
@@ -59,7 +59,7 @@ pub fn get_position<'gc>(
     if let Some(instance) = this.as_sound_channel() {
         return Ok(instance.position(activation.context).into());
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `soundTransform`'s getter
@@ -76,7 +76,7 @@ pub fn get_sound_transform<'gc>(
         return Ok(dobj_st.into_avm2_object(activation)?.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `soundTransform`'s setter
@@ -94,7 +94,7 @@ pub fn set_sound_transform<'gc>(
         sound_channel.set_sound_transform(activation, dobj_st);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Impl `SoundChannel.stop`
@@ -109,5 +109,5 @@ pub fn stop<'gc>(
         sound_channel.stop(activation);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

@@ -59,7 +59,7 @@ pub fn init<'gc>(
         video.set_size(width, height);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn attach_net_stream<'gc>(
@@ -85,5 +85,5 @@ pub fn attach_net_stream<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

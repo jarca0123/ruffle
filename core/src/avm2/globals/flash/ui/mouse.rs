@@ -10,7 +10,7 @@ pub fn hide<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     activation.context.ui.set_mouse_visible(false);
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn show<'gc>(
@@ -19,5 +19,5 @@ pub fn show<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     activation.context.ui.set_mouse_visible(true);
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

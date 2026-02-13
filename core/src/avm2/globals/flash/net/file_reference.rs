@@ -24,7 +24,7 @@ pub fn get_creation_date<'gc>(
             if let Some(time) = dialog_result.creation_time() {
                 DateObject::from_date_time(activation.context, time).into()
             } else {
-                Value::Null
+                Value::NULL
             }
         }
     };
@@ -48,7 +48,7 @@ pub fn get_data<'gc>(
             ByteArrayObject::from_storage(activation.context, storage)
         }
         // Contrary to other getters `data` will return null instead of throwing.
-        _ => return Ok(Value::Null),
+        _ => return Ok(Value::NULL),
     };
 
     Ok(bytearray.into())
@@ -69,7 +69,7 @@ pub fn get_modification_date<'gc>(
             if let Some(time) = dialog_result.modification_time() {
                 DateObject::from_date_time(activation.context, time).into()
             } else {
-                Value::Null
+                Value::NULL
             }
         }
     };
@@ -111,7 +111,7 @@ pub fn get_size<'gc>(
         FileReference::FileDialogResult(ref dialog_result) => dialog_result.size().unwrap_or(0),
     };
 
-    Ok(Value::Number(size as f64))
+    Ok(Value::from_f64(size as f64))
 }
 
 pub fn get_type<'gc>(
@@ -147,7 +147,7 @@ pub fn browse<'gc>(
     if let Some(obj) = args.try_get_object(0) {
         if let Some(array_storage) = obj.as_array_storage() {
             for filter in array_storage.iter() {
-                if let Some(Value::Object(obj)) = filter {
+                if let Some(obj) = filter.and_then(|v| v.as_object()) {
                     let filefilter = activation
                         .avm2()
                         .classes()
@@ -162,16 +162,17 @@ pub fn browse<'gc>(
                     let mac_type = obj.get_slot(file_filter_slots::_MAC_TYPE);
 
                     // The description and extension must be non-empty strings.
-                    match (description, extension) {
-                        (Value::String(description), Value::String(extension))
+                    match (description.as_string(), extension.as_string()) {
+                        (Some(description), Some(extension))
                             if !description.is_empty() && !extension.is_empty() =>
                         {
-                            let mac_type = match mac_type {
-                                Value::String(mac_type) if !mac_type.is_empty() => {
+                            let mac_type = mac_type.as_string().and_then(|mac_type| {
+                                if !mac_type.is_empty() {
                                     Some(mac_type.to_string())
+                                } else {
+                                    None
                                 }
-                                _ => None,
-                            };
+                            });
 
                             filters.push(FileFilter {
                                 description: description.to_string(),
@@ -238,7 +239,7 @@ pub fn load<'gc>(
     let complete_evt = EventObject::bare_default_event(activation.context, "complete");
     Avm2::dispatch_event(activation.context, complete_evt, this.into());
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn save_internal<'gc>(
@@ -279,5 +280,5 @@ pub fn save_internal<'gc>(
         None => return Err(make_error_2174(activation)),
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

@@ -756,7 +756,7 @@ impl<'gc> ChildContainer<'gc> {
                         Avm2Multiname::new(activation.avm2().find_public_namespace(), name);
                     let current_val = parent_obj.get_property(&multiname, &mut activation);
                     match current_val {
-                        Ok(Avm2Value::Null) | Ok(Avm2Value::Undefined) => {
+                        Ok(val) if val.is_null_or_undefined() => {
                             // When the `get_property` returns null
                             // or undefined, FP doesn't attempt to
                             // set it to `null`. This is observable:
@@ -765,7 +765,7 @@ impl<'gc> ChildContainer<'gc> {
                         Ok(_other) => {
                             let res = parent_obj.set_property(
                                 &multiname,
-                                Avm2Value::Null,
+                                Avm2Value::NULL,
                                 &mut activation,
                             );
                             if let Err(err) = res {

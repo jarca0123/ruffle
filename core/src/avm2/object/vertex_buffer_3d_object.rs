@@ -1,7 +1,7 @@
 //! Object representation for VertexBuffer3D objects
 
 use crate::avm2::activation::Activation;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{Object, TObject};
 use gc_arena::{Collect, Gc, GcWeak};
 use ruffle_common::utils::HasPrefixField;
@@ -30,7 +30,7 @@ impl<'gc> VertexBuffer3DObject<'gc> {
         VertexBuffer3DObject(Gc::new(
             activation.gc(),
             VertexBuffer3DObjectData {
-                base: ScriptObjectData::new(class),
+                base: ScriptObjectData::new(class, ObjectType::VertexBuffer3DObject),
                 context3d,
                 handle,
                 data32_per_vertex,

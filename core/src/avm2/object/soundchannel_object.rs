@@ -2,7 +2,7 @@
 
 use crate::avm2::Error;
 use crate::avm2::activation::Activation;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, TObject};
 use crate::backend::audio::SoundInstanceHandle;
 use crate::context::UpdateContext;
@@ -17,7 +17,7 @@ pub fn sound_channel_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::SoundChannelObject);
 
     Ok(SoundChannelObject(Gc::new(
         activation.gc(),
@@ -77,7 +77,7 @@ impl<'gc> SoundChannelObject<'gc> {
     /// Create an empty SoundChannel instance.
     pub fn empty(activation: &mut Activation<'_, 'gc>) -> Self {
         let class = activation.avm2().classes().soundchannel;
-        let base = ScriptObjectData::new(class);
+        let base = ScriptObjectData::new(class, ObjectType::SoundChannelObject);
 
         SoundChannelObject(Gc::new(
             activation.gc(),

@@ -7,7 +7,7 @@ use crate::avm2::Namespace;
 use crate::avm2::activation::Activation;
 use crate::avm2::e4x::is_xml_name;
 use crate::avm2::error::make_error_1098;
-use crate::avm2::object::{NamespaceObject, Object};
+use crate::avm2::object::NamespaceObject;
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
 
@@ -23,8 +23,9 @@ pub fn namespace_constructor<'gc>(
         0 => (Some(istr!("")), namespaces.public_all()),
         1 => {
             // These cases only activate with exactly one argument passed
-            match args.get_value(0) {
-                Value::Object(Object::QNameObject(qname)) => {
+            {
+                let arg = args.get_value(0);
+                if let Some(qname) = arg.as_object().and_then(|o| o.as_qname_object()) {
                     let uri = qname.uri(activation.strings());
                     let ns = uri.map_or_else(Namespace::any, |uri| {
                         Namespace::package(uri, api_version, activation.strings())
@@ -34,10 +35,10 @@ pub fn namespace_constructor<'gc>(
                         _ => Some(istr!("")),
                     };
                     (prefix, ns)
-                }
-                Value::Object(Object::NamespaceObject(ns)) => (ns.prefix(), ns.namespace()),
-                val => {
-                    let name = val.coerce_to_string(activation)?;
+                } else if let Some(ns) = arg.as_object().and_then(|o| o.as_namespace_object()) {
+                    (ns.prefix(), ns.namespace())
+                } else {
+                    let name = arg.coerce_to_string(activation)?;
                     let ns = Namespace::package(name, api_version, activation.strings());
                     let prefix = name.is_empty().then(|| istr!(""));
                     (prefix, ns)
@@ -48,7 +49,7 @@ pub fn namespace_constructor<'gc>(
             let prefix = args.get_value(0);
             let uri = args.get_value(1);
 
-            let namespace_uri = if let Value::Object(Object::QNameObject(qname)) = uri {
+            let namespace_uri = if let Some(qname) = uri.as_object().and_then(|o| o.as_qname_object()) {
                 qname.uri(activation.strings()).unwrap_or_else(|| istr!(""))
             } else {
                 uri.coerce_to_string(activation)?
@@ -57,7 +58,7 @@ pub fn namespace_constructor<'gc>(
             let prefix_str = prefix.coerce_to_string(activation)?;
 
             // The order is important here to match Flash
-            let mut resulting_prefix = if matches!(prefix, Value::Undefined | Value::Null) {
+            let mut resulting_prefix = if prefix.is_null_or_undefined() {
                 None
             } else {
                 Some(prefix_str)
@@ -89,7 +90,7 @@ pub fn get_prefix<'gc>(
     if let Some(prefix) = this.prefix() {
         Ok(prefix.into())
     } else {
-        Ok(Value::Undefined)
+        Ok(Value::UNDEFINED)
     }
 }
 

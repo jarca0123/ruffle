@@ -111,7 +111,7 @@ pub fn make_null_or_undefined_error<'gc>(
     value: Value<'gc>,
     name: Option<&Multiname<'gc>>,
 ) -> Error<'gc> {
-    if matches!(value, Value::Undefined) {
+    if value.is_undefined() {
         make_error_1010(activation, name)
     } else {
         let mut msg = "Error #1009: Cannot access a property or method of a null object reference."

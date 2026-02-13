@@ -1,7 +1,7 @@
 //! Object representation for VertexBuffer3D objects
 
 use crate::avm2::activation::Activation;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{Object, TObject};
 use gc_arena::{Collect, Gc, GcWeak};
 use ruffle_common::utils::HasPrefixField;
@@ -25,7 +25,7 @@ impl<'gc> Program3DObject<'gc> {
         context3d: Context3DObject<'gc>,
     ) -> Object<'gc> {
         let class = activation.avm2().classes().program3d;
-        let base = ScriptObjectData::new(class);
+        let base = ScriptObjectData::new(class, ObjectType::Program3DObject);
 
         Program3DObject(Gc::new(
             activation.gc(),

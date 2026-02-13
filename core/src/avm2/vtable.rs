@@ -554,7 +554,7 @@ fn trait_to_default_value<'gc>(trait_data: &Trait<'gc>) -> Value<'gc> {
     match trait_data.kind() {
         TraitKind::Slot { default_value, .. } => *default_value,
         TraitKind::Const { default_value, .. } => *default_value,
-        TraitKind::Class { .. } => Value::Null,
+        TraitKind::Class { .. } => Value::NULL,
         _ => unreachable!(),
     }
 }

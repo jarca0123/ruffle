@@ -130,7 +130,7 @@ pub fn get_child_at<'gc>(
         };
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 /// Implements `DisplayObjectContainer.getChildByName`
@@ -149,11 +149,11 @@ pub fn get_child_by_name<'gc>(
         if let Some(child) = dobj.child_by_name(&name, true) {
             return Ok(child.object2_or_null());
         } else {
-            return Ok(Value::Null);
+            return Ok(Value::NULL);
         }
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 /// Implements `DisplayObjectContainer.addChild`
@@ -180,7 +180,7 @@ pub fn add_child<'gc>(
         }
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 /// Implements `DisplayObjectContainer.addChildAt`
@@ -204,7 +204,7 @@ pub fn add_child_at<'gc>(
         return Ok(child.object2_or_null());
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 /// Implements `DisplayObjectContainer.removeChild`
@@ -227,7 +227,7 @@ pub fn remove_child<'gc>(
         return Ok(child.object2_or_null());
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 /// Implements `DisplayObjectContainer.numChildren`
@@ -324,7 +324,7 @@ pub fn remove_child_at<'gc>(
         }
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 /// Implements `DisplayObjectContainer.removeChildren`
@@ -363,7 +363,7 @@ pub fn remove_children<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `DisplayObjectContainer.setChildIndex`
@@ -390,7 +390,7 @@ pub fn set_child_index<'gc>(
         add_child_to_displaylist(activation.context, parent, child, target_index);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `DisplayObjectContainer.swapChildrenAt`
@@ -425,7 +425,7 @@ pub fn swap_children_at<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `DisplayObjectContainer.swapChildren`
@@ -465,7 +465,7 @@ pub fn swap_children<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `DisplayObjectContainer.stopAllMovieClips`
@@ -492,7 +492,7 @@ pub fn stop_all_movie_clips<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_objects_under_point<'gc>(
@@ -531,7 +531,7 @@ pub fn get_objects_under_point<'gc>(
     while let Some(child) = children.pop() {
         let obj = child.object2();
         if let Some(obj) = obj {
-            let obj = Object::StageObject(obj);
+            let obj: Object<'gc> = obj.into();
 
             if obj != thisobj && child.hit_test_shape(activation.context, point, options) {
                 under_point.push(Some(obj.into()));
@@ -595,7 +595,7 @@ pub fn set_mouse_children<'gc>(
         dobj.raw_container_mut(activation.gc())
             .set_mouse_children(mouse_children);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_tab_children<'gc>(
@@ -609,7 +609,7 @@ pub fn get_tab_children<'gc>(
         .as_display_object()
         .and_then(|this| this.as_container())
     {
-        Ok(Value::Bool(obj.is_tab_children(activation.context)))
+        Ok(Value::from_bool(obj.is_tab_children(activation.context)))
     } else {
         Ok(false.into())
     }
@@ -630,5 +630,5 @@ pub fn set_tab_children<'gc>(
         obj.set_tab_children(activation.context, value);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

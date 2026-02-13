@@ -38,7 +38,7 @@ pub fn get_stack_trace<'gc>(
     };
 
     if !stack_trace_enabled {
-        return Ok(Value::Null);
+        return Ok(Value::NULL);
     }
 
     if let Some(error) = this.as_error_object() {
@@ -47,5 +47,5 @@ pub fn get_stack_trace<'gc>(
             return Ok(AvmString::new(activation.gc(), error.display_full()).into());
         }
     }
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }

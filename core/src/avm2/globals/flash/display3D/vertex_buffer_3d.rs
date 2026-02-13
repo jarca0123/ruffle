@@ -35,7 +35,7 @@ pub fn upload_from_byte_array<'gc>(
             vertex_buffer.data32_per_vertex(),
         );
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn upload_from_vector<'gc>(
@@ -70,5 +70,5 @@ pub fn upload_from_vector<'gc>(
             vertex_buffer.data32_per_vertex(),
         );
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

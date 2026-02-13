@@ -23,7 +23,7 @@ pub fn get_align<'gc>(
         return Ok(text_format
             .align
             .as_ref()
-            .map_or(Value::Null, |align| match align {
+            .map_or(Value::NULL, |align| match align {
                 swf::TextAlign::Left => istr!("left").into(),
                 swf::TextAlign::Center => istr!("center").into(),
                 swf::TextAlign::Right => istr!("right").into(),
@@ -31,7 +31,7 @@ pub fn get_align<'gc>(
             }));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_align<'gc>(
@@ -47,7 +47,7 @@ pub fn set_align<'gc>(
             Some(value) => value,
             None => {
                 text_format.align = None;
-                return Ok(Value::Undefined);
+                return Ok(Value::UNDEFINED);
             }
         };
 
@@ -64,7 +64,7 @@ pub fn set_align<'gc>(
         };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_block_indent<'gc>(
@@ -78,10 +78,10 @@ pub fn get_block_indent<'gc>(
         return Ok(text_format
             .block_indent
             .as_ref()
-            .map_or(Value::Null, |&block_indent| block_indent.into()));
+            .map_or(Value::NULL, |&block_indent| block_indent.into()));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_block_indent<'gc>(
@@ -93,14 +93,14 @@ pub fn set_block_indent<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.block_indent = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(round_to_even(value.coerce_to_number(activation)?).into()),
-        };
+        text_format.block_indent = if value.is_null() {
+                None
+            } else {
+                Some(round_to_even(value.coerce_to_number(activation)?).into())
+            };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_bold<'gc>(
@@ -114,10 +114,10 @@ pub fn get_bold<'gc>(
         return Ok(text_format
             .bold
             .as_ref()
-            .map_or(Value::Null, |&bold| bold.into()));
+            .map_or(Value::NULL, |&bold| bold.into()));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_bold<'gc>(
@@ -129,14 +129,14 @@ pub fn set_bold<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.bold = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(value.coerce_to_boolean()),
-        };
+        text_format.bold = if value.is_null() {
+                None
+            } else {
+                Some(value.coerce_to_boolean())
+            };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_bullet<'gc>(
@@ -150,10 +150,10 @@ pub fn get_bullet<'gc>(
         return Ok(text_format
             .bullet
             .as_ref()
-            .map_or(Value::Null, |&bullet| bullet.into()));
+            .map_or(Value::NULL, |&bullet| bullet.into()));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_bullet<'gc>(
@@ -165,14 +165,14 @@ pub fn set_bullet<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.bullet = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(value.coerce_to_boolean()),
-        };
+        text_format.bullet = if value.is_null() {
+                None
+            } else {
+                Some(value.coerce_to_boolean())
+            };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_color<'gc>(
@@ -186,10 +186,10 @@ pub fn get_color<'gc>(
         return Ok(text_format
             .color
             .as_ref()
-            .map_or(Value::Null, |color| (color.to_rgba() as i32).into()));
+            .map_or(Value::NULL, |color| (color.to_rgba() as i32).into()));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_color<'gc>(
@@ -201,14 +201,14 @@ pub fn set_color<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.color = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(swf::Color::from_rgba(value.coerce_to_u32(activation)?)),
-        };
+        text_format.color = if value.is_null() {
+                None
+            } else {
+                Some(swf::Color::from_rgba(value.coerce_to_u32(activation)?))
+            };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_display<'gc>(
@@ -222,14 +222,14 @@ pub fn get_display<'gc>(
         return Ok(text_format
             .display
             .as_ref()
-            .map_or(Value::Null, |display| match display {
+            .map_or(Value::NULL, |display| match display {
                 TextDisplay::Block => istr!("block").into(),
                 TextDisplay::Inline => istr!("inline").into(),
                 TextDisplay::None => istr!("none").into(),
             }));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_display<'gc>(
@@ -241,11 +241,10 @@ pub fn set_display<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        let value = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => return Err(make_error_2007(activation, "display")),
-            value => value.coerce_to_string(activation)?,
-        };
+        if value.is_null() {
+            return Err(make_error_2007(activation, "display"));
+        }
+        let value = value.coerce_to_string(activation)?;
 
         text_format.display = if &value == b"block" {
             Some(TextDisplay::Block)
@@ -259,7 +258,7 @@ pub fn set_display<'gc>(
         };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_font<'gc>(
@@ -270,12 +269,12 @@ pub fn get_font<'gc>(
     let this = this.as_object().unwrap();
 
     if let Some(text_format) = this.as_text_format() {
-        return Ok(text_format.font.as_ref().map_or(Value::Null, |font| {
+        return Ok(text_format.font.as_ref().map_or(Value::NULL, |font| {
             AvmString::new(activation.gc(), font.as_wstr()).into()
         }));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_font<'gc>(
@@ -287,17 +286,15 @@ pub fn set_font<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.font = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => {
-                let font = value.coerce_to_string(activation)?;
-                Some(font.slice(0..64).unwrap_or(&font).to_owned())
-            }
+        text_format.font = if value.is_null() {
+            None
+        } else {
+            let font = value.coerce_to_string(activation)?;
+            Some(font.slice(0..64).unwrap_or(&font).to_owned())
         };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_indent<'gc>(
@@ -311,10 +308,10 @@ pub fn get_indent<'gc>(
         return Ok(text_format
             .indent
             .as_ref()
-            .map_or(Value::Null, |&indent| indent.into()));
+            .map_or(Value::NULL, |&indent| indent.into()));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_indent<'gc>(
@@ -326,14 +323,14 @@ pub fn set_indent<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.indent = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(round_to_even(value.coerce_to_number(activation)?).into()),
-        };
+        text_format.indent = if value.is_null() {
+                None
+            } else {
+                Some(round_to_even(value.coerce_to_number(activation)?).into())
+            };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_italic<'gc>(
@@ -347,10 +344,10 @@ pub fn get_italic<'gc>(
         return Ok(text_format
             .italic
             .as_ref()
-            .map_or(Value::Null, |&italic| italic.into()));
+            .map_or(Value::NULL, |&italic| italic.into()));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_italic<'gc>(
@@ -362,14 +359,14 @@ pub fn set_italic<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.italic = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(value.coerce_to_boolean()),
-        };
+        text_format.italic = if value.is_null() {
+                None
+            } else {
+                Some(value.coerce_to_boolean())
+            };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_kerning<'gc>(
@@ -383,10 +380,10 @@ pub fn get_kerning<'gc>(
         return Ok(text_format
             .kerning
             .as_ref()
-            .map_or(Value::Null, |&kerning| kerning.into()));
+            .map_or(Value::NULL, |&kerning| kerning.into()));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_kerning<'gc>(
@@ -398,14 +395,14 @@ pub fn set_kerning<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.kerning = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(value.coerce_to_boolean()),
-        };
+        text_format.kerning = if value.is_null() {
+                None
+            } else {
+                Some(value.coerce_to_boolean())
+            };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_leading<'gc>(
@@ -419,10 +416,10 @@ pub fn get_leading<'gc>(
         return Ok(text_format
             .leading
             .as_ref()
-            .map_or(Value::Null, |&leading| leading.into()));
+            .map_or(Value::NULL, |&leading| leading.into()));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_leading<'gc>(
@@ -434,14 +431,14 @@ pub fn set_leading<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.leading = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(round_to_even(value.coerce_to_number(activation)?).into()),
-        };
+        text_format.leading = if value.is_null() {
+                None
+            } else {
+                Some(round_to_even(value.coerce_to_number(activation)?).into())
+            };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_left_margin<'gc>(
@@ -455,10 +452,10 @@ pub fn get_left_margin<'gc>(
         return Ok(text_format
             .left_margin
             .as_ref()
-            .map_or(Value::Null, |&left_margin| left_margin.into()));
+            .map_or(Value::NULL, |&left_margin| left_margin.into()));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_left_margin<'gc>(
@@ -470,14 +467,14 @@ pub fn set_left_margin<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.left_margin = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(round_to_even(value.coerce_to_number(activation)?).into()),
-        };
+        text_format.left_margin = if value.is_null() {
+                None
+            } else {
+                Some(round_to_even(value.coerce_to_number(activation)?).into())
+            };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_letter_spacing<'gc>(
@@ -491,10 +488,10 @@ pub fn get_letter_spacing<'gc>(
         return Ok(text_format
             .letter_spacing
             .as_ref()
-            .map_or(Value::Null, |&letter_spacing| letter_spacing.into()));
+            .map_or(Value::NULL, |&letter_spacing| letter_spacing.into()));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_letter_spacing<'gc>(
@@ -506,14 +503,14 @@ pub fn set_letter_spacing<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.letter_spacing = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(value.coerce_to_number(activation)?),
+        text_format.letter_spacing = if value.is_null() {
+            None
+        } else {
+            Some(value.coerce_to_number(activation)?)
         };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_right_margin<'gc>(
@@ -527,10 +524,10 @@ pub fn get_right_margin<'gc>(
         return Ok(text_format
             .right_margin
             .as_ref()
-            .map_or(Value::Null, |&right_margin| right_margin.into()));
+            .map_or(Value::NULL, |&right_margin| right_margin.into()));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_right_margin<'gc>(
@@ -542,14 +539,14 @@ pub fn set_right_margin<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.right_margin = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(round_to_even(value.coerce_to_number(activation)?).into()),
-        };
+        text_format.right_margin = if value.is_null() {
+                None
+            } else {
+                Some(round_to_even(value.coerce_to_number(activation)?).into())
+            };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_size<'gc>(
@@ -563,10 +560,10 @@ pub fn get_size<'gc>(
         return Ok(text_format
             .size
             .as_ref()
-            .map_or(Value::Null, |&size| size.into()));
+            .map_or(Value::NULL, |&size| size.into()));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_size<'gc>(
@@ -578,14 +575,14 @@ pub fn set_size<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.size = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(round_to_even(value.coerce_to_number(activation)?).into()),
-        };
+        text_format.size = if value.is_null() {
+                None
+            } else {
+                Some(round_to_even(value.coerce_to_number(activation)?).into())
+            };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_tab_stops<'gc>(
@@ -599,13 +596,13 @@ pub fn get_tab_stops<'gc>(
         return text_format
             .tab_stops
             .as_ref()
-            .map_or(Ok(Value::Null), |tab_stops| {
+            .map_or(Ok(Value::NULL), |tab_stops| {
                 let tab_stop_storage = tab_stops.iter().copied().collect();
                 Ok(ArrayObject::from_storage(activation.context, tab_stop_storage).into())
             });
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_tab_stops<'gc>(
@@ -624,7 +621,7 @@ pub fn set_tab_stops<'gc>(
 
                 let tab_stops: Result<Vec<_>, Error<'gc>> = (0..length)
                     .map(|i| {
-                        let value = array_storage.get(i).unwrap_or(Value::Number(0.0));
+                        let value = array_storage.get(i).unwrap_or(Value::from_f64(0.0));
 
                         Ok(round_to_even(value.coerce_to_number(activation)?).into())
                     })
@@ -635,7 +632,7 @@ pub fn set_tab_stops<'gc>(
         };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_target<'gc>(
@@ -646,12 +643,12 @@ pub fn get_target<'gc>(
     let this = this.as_object().unwrap();
 
     if let Some(text_format) = this.as_text_format() {
-        return Ok(text_format.target.as_ref().map_or(Value::Null, |target| {
+        return Ok(text_format.target.as_ref().map_or(Value::NULL, |target| {
             AvmString::new(activation.gc(), target.as_wstr()).into()
         }));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_target<'gc>(
@@ -666,7 +663,7 @@ pub fn set_target<'gc>(
         text_format.target = target.map(|t| t.as_wstr().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_underline<'gc>(
@@ -680,10 +677,10 @@ pub fn get_underline<'gc>(
         return Ok(text_format
             .underline
             .as_ref()
-            .map_or(Value::Null, |&underline| underline.into()));
+            .map_or(Value::NULL, |&underline| underline.into()));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_underline<'gc>(
@@ -695,14 +692,14 @@ pub fn set_underline<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.underline = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(value.coerce_to_boolean()),
-        };
+        text_format.underline = if value.is_null() {
+                None
+            } else {
+                Some(value.coerce_to_boolean())
+            };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_url<'gc>(
@@ -713,12 +710,12 @@ pub fn get_url<'gc>(
     let this = this.as_object().unwrap();
 
     if let Some(text_format) = this.as_text_format() {
-        return Ok(text_format.url.as_ref().map_or(Value::Null, |url| {
+        return Ok(text_format.url.as_ref().map_or(Value::NULL, |url| {
             AvmString::new(activation.gc(), url.as_wstr()).into()
         }));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_url<'gc>(
@@ -733,5 +730,5 @@ pub fn set_url<'gc>(
         text_format.url = url.map(|u| u.as_wstr().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

@@ -1,5 +1,5 @@
 use crate::avm2::function::FunctionArgs;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, FunctionObject, Object, TObject};
 use crate::avm2::{Activation, Error};
 use crate::net_connection::ResponderCallback;
@@ -14,7 +14,7 @@ pub fn responder_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::ResponderObject);
 
     Ok(ResponderObject(Gc::new(
         activation.gc(),

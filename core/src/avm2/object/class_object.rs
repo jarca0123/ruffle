@@ -12,7 +12,7 @@ use crate::avm2::error::{
 use crate::avm2::function::{FunctionArgs, exec};
 use crate::avm2::method::{Method, MethodAssociation, NativeMethodImpl};
 use crate::avm2::object::function_object::FunctionObject;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{Object, ScriptObject, TObject};
 use crate::avm2::property::Property;
 use crate::avm2::scope::{Scope, ScopeChain};
@@ -181,7 +181,7 @@ impl<'gc> ClassObject<'gc> {
                 // We pass `custom_new` the temporary vtable of the class object
                 // because we don't have the full vtable created yet. We'll
                 // set it to the true vtable in `into_finished_class`.
-                base: ScriptObjectData::custom_new(c_class, None, c_class.vtable()),
+                base: ScriptObjectData::custom_new(c_class, None, c_class.vtable(), ObjectType::ClassObject),
                 class,
                 prototype: Lock::new(None),
                 class_scope: scope,
@@ -802,9 +802,10 @@ impl<'gc> TObject<'gc> for ClassObject<'gc> {
 
         //Because `null` is a valid parameter, we have to accept values as
         //parameters instead of objects. We coerce them to objects now.
-        let object_param = match nullable_params[0] {
-            Value::Null => None,
-            v => Some(v),
+        let object_param = if nullable_params[0].is_null() {
+            None
+        } else {
+            Some(nullable_params[0])
         };
         let class_param = match object_param {
             None => None,

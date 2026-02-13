@@ -8,7 +8,7 @@ use crate::avm2::globals::slots::{
 };
 use crate::avm2::object::{ClassObject, Object, StageObject, TObject as _};
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueKind};
 use crate::display_object::{MovieClip, SoundTransform, TDisplayObject, TDisplayObjectContainer};
 use swf::{Rectangle, Twips};
 
@@ -68,7 +68,7 @@ pub fn construct_children<'gc>(
     }
     clip.set_constructing_frame(false);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `dropTarget`'s getter
@@ -87,7 +87,7 @@ pub fn get_drop_target<'gc>(
         return Ok(mc.object2_or_null());
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 /// Implements `graphics`.
@@ -100,18 +100,19 @@ pub fn get_graphics<'gc>(
 
     if let Some(dobj) = this.as_display_object() {
         // Lazily initialize the `Graphics` object in a hidden property.
-        let graphics = match this.get_slot(sprite_slots::_GRAPHICS) {
-            Value::Undefined | Value::Null => {
+        let slot = this.get_slot(sprite_slots::_GRAPHICS);
+        let graphics = match slot.kind() {
+            ValueKind::Undefined | ValueKind::Null => {
                 let graphics = Value::from(StageObject::graphics(activation, dobj));
                 this.set_slot(sprite_slots::_GRAPHICS, graphics, activation)?;
                 graphics
             }
-            graphics => graphics,
+            _ => slot,
         };
         return Ok(graphics);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `soundTransform`'s getter
@@ -128,7 +129,7 @@ pub fn get_sound_transform<'gc>(
         return Ok(dobj_st.into_avm2_object(activation)?.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `soundTransform`'s setter
@@ -146,7 +147,7 @@ pub fn set_sound_transform<'gc>(
         dobj.set_sound_transform(activation.context, dobj_st);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `buttonMode`'s getter
@@ -161,7 +162,7 @@ pub fn get_button_mode<'gc>(
         return Ok(mc.forced_button_mode().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `buttonMode`'s setter
@@ -178,7 +179,7 @@ pub fn set_button_mode<'gc>(
         mc.set_forced_button_mode(forced_button_mode);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Starts dragging this display object, making it follow the cursor.
@@ -241,7 +242,7 @@ pub fn start_drag<'gc>(
         };
         *activation.context.drag_object = Some(drag_object);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn stop_drag<'gc>(
@@ -257,7 +258,7 @@ pub fn stop_drag<'gc>(
     crate::player::Player::update_drag(activation.context);
 
     *activation.context.drag_object = None;
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `useHandCursor`'s getter
@@ -275,7 +276,7 @@ pub fn get_use_hand_cursor<'gc>(
         return Ok(mc.avm2_use_hand_cursor().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `useHandCursor`'s setter
@@ -293,7 +294,7 @@ pub fn set_use_hand_cursor<'gc>(
         mc.set_avm2_use_hand_cursor(args.get_bool(0));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `hitArea`'s getter
@@ -312,7 +313,7 @@ pub fn get_hit_area<'gc>(
         return Ok(mc.object2_or_null());
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 /// Implements `hitArea`'s setter
@@ -333,5 +334,5 @@ pub fn set_hit_area<'gc>(
         mc.set_hit_area(activation.gc(), object);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

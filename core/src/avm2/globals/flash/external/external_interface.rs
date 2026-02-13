@@ -53,7 +53,7 @@ pub fn add_callback<'gc>(
         .context
         .external_interface
         .add_callback(name.to_string(), Callback::Avm2 { method });
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_object_id<'gc>(
@@ -64,6 +64,6 @@ pub fn get_object_id<'gc>(
     if let Some(id) = activation.context.external_interface.get_id() {
         Ok(AvmString::new_utf8(activation.gc(), id).into())
     } else {
-        Ok(Value::Null)
+        Ok(Value::NULL)
     }
 }

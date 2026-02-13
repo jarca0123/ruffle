@@ -18,7 +18,7 @@ pub fn init<'gc>(
     evt.set_event_type(args.get_string(activation, 0));
     evt.set_bubbles(args.get_bool(1));
     evt.set_cancelable(args.get_bool(2));
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `bubbles` property's getter
@@ -33,7 +33,7 @@ pub fn get_bubbles<'gc>(
         return Ok(evt.is_bubbling().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `cancelable` property's getter
@@ -48,7 +48,7 @@ pub fn get_cancelable<'gc>(
         return Ok(evt.is_cancelable().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `type` property's getter
@@ -63,7 +63,7 @@ pub fn get_type<'gc>(
         return Ok(evt.event_type().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `target` property's getter
@@ -75,10 +75,10 @@ pub fn get_target<'gc>(
     let this = this.as_object().unwrap();
 
     if let Some(evt) = this.as_event() {
-        return Ok(evt.target().map(|o| o.into()).unwrap_or(Value::Null));
+        return Ok(evt.target().map(|o| o.into()).unwrap_or(Value::NULL));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `currentTarget` property's getter
@@ -93,10 +93,10 @@ pub fn get_current_target<'gc>(
         return Ok(evt
             .current_target()
             .map(|o| o.into())
-            .unwrap_or(Value::Null));
+            .unwrap_or(Value::NULL));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `eventPhase` property's getter
@@ -112,7 +112,7 @@ pub fn get_event_phase<'gc>(
         return Ok(event_phase.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `isDefaultPrevented`
@@ -127,7 +127,7 @@ pub fn is_default_prevented<'gc>(
         return Ok(evt.is_cancelled().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `preventDefault`
@@ -142,7 +142,7 @@ pub fn prevent_default<'gc>(
         evt.cancel();
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `stopPropagation`
@@ -157,7 +157,7 @@ pub fn stop_propagation<'gc>(
         evt.stop_propagation();
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `stopImmediatePropagation`
@@ -172,5 +172,5 @@ pub fn stop_immediate_propagation<'gc>(
         evt.stop_immediate_propagation();
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

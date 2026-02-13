@@ -1,4 +1,4 @@
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, TObject};
 use crate::avm2::{Activation, Error};
 use crate::backend::ui::FileDialogResult;
@@ -12,7 +12,7 @@ pub fn file_reference_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::FileReferenceObject);
 
     Ok(FileReferenceObject(Gc::new(
         activation.gc(),

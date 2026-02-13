@@ -5,9 +5,9 @@ use crate::avm2::activation::Activation;
 use crate::avm2::call_stack::CallStack;
 use crate::avm2::function::FunctionArgs;
 use crate::avm2::globals::slots::error as error_slots;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, TObject};
-use crate::avm2::value::Value;
+use crate::avm2::value::ValueKind;
 use crate::string::{AvmString, WStr, WString};
 use core::fmt;
 use gc_arena::{Collect, Gc, GcWeak};
@@ -55,7 +55,7 @@ impl<'gc> ErrorObject<'gc> {
     /// Allocates a new `ErrorObject` for the given class, without running the
     /// class initializer.
     pub fn new(activation: &mut Activation<'_, 'gc>, class: ClassObject<'gc>) -> Self {
-        let base = ScriptObjectData::new(class);
+        let base = ScriptObjectData::new(class, ObjectType::ErrorObject);
 
         // Stack trace is always collected for debugging purposes.
         let call_stack = activation.avm2().capture_call_stack();
@@ -90,15 +90,17 @@ impl<'gc> ErrorObject<'gc> {
     }
 
     pub fn display(self) -> WString {
-        let name = match self.base().get_slot(error_slots::NAME) {
-            Value::String(string) => string.as_wstr(),
-            Value::Null => WStr::from_units(b"null"),
+        let name_val = self.base().get_slot(error_slots::NAME);
+        let name = match name_val.kind() {
+            ValueKind::String(string) => string.as_wstr(),
+            ValueKind::Null => WStr::from_units(b"null"),
             _ => unreachable!("String-typed slot must be String or Null"),
         };
 
-        let message = match self.base().get_slot(error_slots::MESSAGE) {
-            Value::String(string) => string.as_wstr(),
-            Value::Null => WStr::from_units(b"null"),
+        let message_val = self.base().get_slot(error_slots::MESSAGE);
+        let message = match message_val.kind() {
+            ValueKind::String(string) => string.as_wstr(),
+            ValueKind::Null => WStr::from_units(b"null"),
             _ => unreachable!("String-typed slot must be String or Null"),
         };
         if message.is_empty() {

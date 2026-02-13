@@ -51,7 +51,7 @@ pub fn set_color_transform<'gc>(
     if let Some(parent) = dobj.parent() {
         parent.invalidate_cached_bitmap();
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_matrix<'gc>(
@@ -62,7 +62,7 @@ pub fn get_matrix<'gc>(
     let this = this.as_object().unwrap();
 
     if get_display_object(this).base().has_matrix3d_stub() {
-        Ok(Value::Null)
+        Ok(Value::NULL)
     } else {
         let matrix = matrix_from_transform_object(this);
         matrix_to_object(matrix, activation)
@@ -79,7 +79,7 @@ pub fn set_matrix<'gc>(
     let dobj = get_display_object(this);
     let Some(obj) = args.try_get_object(0) else {
         dobj.base().set_has_matrix3d_stub(true);
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     let matrix = object_to_matrix(obj, activation)?;
@@ -90,7 +90,7 @@ pub fn set_matrix<'gc>(
         parent.invalidate_cached_bitmap();
     }
     dobj.base().set_has_matrix3d_stub(false);
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_concatenated_matrix<'gc>(
@@ -218,7 +218,7 @@ pub fn matrix3d_to_object<'gc>(
     let number = activation.avm2().class_defs().number;
     let mut raw_data_storage = VectorStorage::new(16, true, Some(number));
     for (i, data) in matrix.raw_data.iter().enumerate() {
-        raw_data_storage.set(i, Value::Number(*data), activation)?;
+        raw_data_storage.set(i, Value::from_f64(*data), activation)?;
     }
     let vector = VectorObject::from_vector(raw_data_storage, activation).into();
     let object = activation
@@ -370,7 +370,7 @@ pub fn get_matrix_3d<'gc>(
         let matrix3d = Matrix3D::from_matrix(matrix);
         matrix3d_to_object(matrix3d, activation)
     } else {
-        Ok(Value::Null)
+        Ok(Value::NULL)
     }
 }
 
@@ -406,7 +406,7 @@ pub fn set_matrix_3d<'gc>(
     }
     display_object.base().set_has_matrix3d_stub(has_matrix3d);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_perspective_projection<'gc>(
@@ -436,7 +436,7 @@ pub fn get_perspective_projection<'gc>(
         )?;
         Ok(object.into())
     } else {
-        Ok(Value::Null)
+        Ok(Value::NULL)
     }
 }
 
@@ -457,7 +457,7 @@ pub fn set_perspective_projection<'gc>(
 
     get_display_object(this).set_perspective_projection(perspective_projection);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_relative_matrix_3d<'gc>(
@@ -473,7 +473,7 @@ pub fn get_relative_matrix_3d<'gc>(
 
     let display_object = get_display_object(this);
     if !display_object.base().has_matrix3d_stub() {
-        return Ok(Value::Null);
+        return Ok(Value::NULL);
     }
 
     matrix3d_to_object(Matrix3D::from_matrix(Matrix::IDENTITY), activation)

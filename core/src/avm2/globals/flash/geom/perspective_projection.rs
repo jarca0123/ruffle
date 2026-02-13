@@ -66,7 +66,7 @@ pub fn set_focal_length<'gc>(
 
     sync_to_display_object(this)?;
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_field_of_view<'gc>(
@@ -106,7 +106,7 @@ pub fn set_field_of_view<'gc>(
 
     sync_to_display_object(this)?;
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_projection_center<'gc>(
@@ -147,7 +147,7 @@ pub fn set_projection_center<'gc>(
 
     sync_to_display_object(this)?;
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn to_matrix_3d<'gc>(

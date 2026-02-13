@@ -14,7 +14,8 @@ use crate::avm2::vtable::VTable;
 use crate::avm2::{Error, Multiname, Namespace};
 use crate::ecma_conversions::{f64_to_wrapping_i32, f64_to_wrapping_u32};
 use crate::string::{AvmAtom, AvmString, WStr};
-use gc_arena::Collect;
+use gc_arena::{Collect, Gc};
+use gc_arena::collect::Trace;
 use num_bigint::BigInt;
 use num_traits::{ToPrimitive, Zero};
 use ruffle_macros::istr;
@@ -23,6 +24,7 @@ use swf::avm2::types::{DefaultValue as AbcDefaultValue, Index};
 
 use super::class::Class;
 use super::e4x::E4XNode;
+use super::object::ScriptObjectData;
 
 /// Indicate what kind of primitive coercion would be preferred when coercing
 /// objects.
@@ -37,40 +39,287 @@ pub enum Hint {
     Number,
 }
 
-/// An AVM2 value.
-#[derive(Clone, Copy, Collect, Debug)]
-#[collect(no_drop)]
-pub enum Value<'gc> {
+// ---------------------------------------------------------------------------
+// NaN-boxing constants
+// ---------------------------------------------------------------------------
+
+/// Any bit pattern strictly below this is an f64 (with NaN canonicalized).
+const TAGGED_BOUNDARY: u64 = 0xFFF9_0000_0000_0000;
+
+const TAG_UNDEFINED: u64 = 0xFFF9_0000_0000_0000;
+const TAG_NULL: u64 = 0xFFFA_0000_0000_0000;
+const TAG_BOOL: u64 = 0xFFFB_0000_0000_0000;
+const TAG_INTEGER: u64 = 0xFFFC_0000_0000_0000;
+const TAG_STRING: u64 = 0xFFFD_0000_0000_0000;
+const TAG_OBJECT: u64 = 0xFFFE_0000_0000_0000;
+
+/// Mask to extract the 48-bit payload from a tagged value.
+const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+/// The canonical NaN bit pattern we use.
+const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
+
+// ---------------------------------------------------------------------------
+// Value – NaN-boxed 8-byte representation
+// ---------------------------------------------------------------------------
+
+/// An AVM2 value, NaN-boxed into 8 bytes.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct Value<'gc> {
+    bits: u64,
+    _marker: std::marker::PhantomData<Gc<'gc, ()>>,
+}
+
+// This type is used very frequently, so make sure it's exactly 8 bytes.
+const _: () = assert!(size_of::<Value<'_>>() == 8);
+
+/// Enum for pattern-matching on a `Value`.
+///
+/// Obtain via `value.kind()`.
+#[derive(Clone, Copy, Debug)]
+pub enum ValueKind<'gc> {
     Undefined,
     Null,
     Bool(bool),
     Number(f64),
-    // note: this value should never reach +/- 1<<28; this is currently not enforced (TODO).
-    // Ruffle currently won't break if you break that invariant,
-    // but some FP compatibility edge cases depend on it, so we should do this at some point.
     Integer(i32),
     String(AvmString<'gc>),
     Object(Object<'gc>),
 }
 
-// This type is used very frequently, so make sure it doesn't unexpectedly grow.
-const _: () = assert!(size_of::<Value<'_>>() <= 16);
+// ---------------------------------------------------------------------------
+// Constructors
+// ---------------------------------------------------------------------------
+
+impl<'gc> Value<'gc> {
+    pub const UNDEFINED: Self = Value {
+        bits: TAG_UNDEFINED,
+        _marker: std::marker::PhantomData,
+    };
+
+    pub const NULL: Self = Value {
+        bits: TAG_NULL,
+        _marker: std::marker::PhantomData,
+    };
+
+    #[inline(always)]
+    pub fn from_f64(n: f64) -> Self {
+        let bits = n.to_bits();
+        // Canonicalize NaN: any NaN that would collide with our tag space
+        // gets replaced with the canonical quiet NaN.
+        let bits = if bits >= TAGGED_BOUNDARY {
+            CANONICAL_NAN
+        } else {
+            bits
+        };
+        Value {
+            bits,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    pub fn from_bool(b: bool) -> Self {
+        Value {
+            bits: TAG_BOOL | (b as u64),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    pub fn from_integer(i: i32) -> Self {
+        Value {
+            bits: TAG_INTEGER | (i as u32 as u64),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    pub fn from_string(s: AvmString<'gc>) -> Self {
+        let ptr = Gc::as_ptr(Gc::erase(s.as_gc())) as u64;
+        debug_assert!(
+            ptr & !PAYLOAD_MASK == 0,
+            "String pointer exceeds 48-bit payload"
+        );
+        Value {
+            bits: TAG_STRING | ptr,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    pub fn from_object(o: Object<'gc>) -> Self {
+        let ptr = Gc::as_ptr(Gc::erase(o.as_gc())) as u64;
+        debug_assert!(
+            ptr & !PAYLOAD_MASK == 0,
+            "Object pointer exceeds 48-bit payload"
+        );
+        Value {
+            bits: TAG_OBJECT | ptr,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decoding helpers
+// ---------------------------------------------------------------------------
+
+impl<'gc> Value<'gc> {
+    #[inline(always)]
+    fn is_tagged(self) -> bool {
+        self.bits >= TAGGED_BOUNDARY
+    }
+
+    /// Extract the tag from the top 16 bits (only valid if `is_tagged()`).
+    #[inline(always)]
+    fn tag_prefix(self) -> u64 {
+        self.bits & !PAYLOAD_MASK
+    }
+
+    #[inline(always)]
+    fn payload(self) -> u64 {
+        self.bits & PAYLOAD_MASK
+    }
+
+    /// Decode into `ValueKind` for pattern matching.
+    #[inline]
+    pub fn kind(self) -> ValueKind<'gc> {
+        if !self.is_tagged() {
+            return ValueKind::Number(f64::from_bits(self.bits));
+        }
+        match self.tag_prefix() {
+            TAG_UNDEFINED => ValueKind::Undefined,
+            TAG_NULL => ValueKind::Null,
+            TAG_BOOL => ValueKind::Bool(self.payload() != 0),
+            TAG_INTEGER => ValueKind::Integer(self.payload() as u32 as i32),
+            TAG_STRING => {
+                let ptr = self.payload() as *const ();
+                ValueKind::String(unsafe { AvmString::from_raw_gc_ptr(ptr) })
+            }
+            TAG_OBJECT => {
+                let ptr = self.payload() as *const ();
+                let gc = unsafe { Gc::from_ptr(ptr as *const ScriptObjectData<'gc>) };
+                ValueKind::Object(unsafe { Object::from_gc(gc) })
+            }
+            _ => unreachable!("Invalid NaN-box tag"),
+        }
+    }
+
+    // Fast-path accessors ---------------------------------------------------
+
+    #[inline(always)]
+    pub fn is_undefined(self) -> bool {
+        self.bits == TAG_UNDEFINED
+    }
+
+    #[inline(always)]
+    pub fn is_null(self) -> bool {
+        self.bits == TAG_NULL
+    }
+
+    #[inline(always)]
+    pub fn is_null_or_undefined(self) -> bool {
+        self.bits == TAG_UNDEFINED || self.bits == TAG_NULL
+    }
+
+    #[inline(always)]
+    pub fn is_number(self) -> bool {
+        !self.is_tagged() || self.tag_prefix() == TAG_INTEGER
+    }
+
+    #[inline(always)]
+    pub fn is_integer(self) -> bool {
+        self.tag_prefix() == TAG_INTEGER && self.is_tagged()
+    }
+
+    #[inline(always)]
+    pub fn is_string(self) -> bool {
+        self.is_tagged() && self.tag_prefix() == TAG_STRING
+    }
+
+    #[inline(always)]
+    pub fn is_object(self) -> bool {
+        self.is_tagged() && self.tag_prefix() == TAG_OBJECT
+    }
+
+    #[inline(always)]
+    pub fn is_bool(self) -> bool {
+        self.is_tagged() && self.tag_prefix() == TAG_BOOL
+    }
+
+    #[inline(always)]
+    pub fn as_object(&self) -> Option<Object<'gc>> {
+        if self.is_tagged() && self.tag_prefix() == TAG_OBJECT {
+            let ptr = self.payload() as *const ();
+            let gc = unsafe { Gc::from_ptr(ptr as *const ScriptObjectData<'gc>) };
+            Some(unsafe { Object::from_gc(gc) })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_string(&self) -> Option<AvmString<'gc>> {
+        if self.is_tagged() && self.tag_prefix() == TAG_STRING {
+            let ptr = self.payload() as *const ();
+            Some(unsafe { AvmString::from_raw_gc_ptr(ptr) })
+        } else {
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Manual Collect impl — traces String and Object GC pointers
+// ---------------------------------------------------------------------------
+
+unsafe impl<'gc> Collect<'gc> for Value<'gc> {
+    const NEEDS_TRACE: bool = true;
+
+    fn trace<C: Trace<'gc>>(&self, cc: &mut C) {
+        if !self.is_tagged() {
+            return;
+        }
+        match self.tag_prefix() {
+            TAG_STRING => {
+                let ptr = self.payload() as *const ();
+                let gc: Gc<'gc, ()> = unsafe { Gc::from_ptr(ptr) };
+                cc.trace_gc(gc);
+            }
+            TAG_OBJECT => {
+                let ptr = self.payload() as *const ();
+                let gc: Gc<'gc, ()> = unsafe { Gc::from_ptr(ptr) };
+                cc.trace_gc(gc);
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// From impls
+// ---------------------------------------------------------------------------
 
 impl<'gc> From<AvmString<'gc>> for Value<'gc> {
+    #[inline]
     fn from(string: AvmString<'gc>) -> Self {
-        Value::String(string)
+        Value::from_string(string)
     }
 }
 
 impl<'gc> From<AvmAtom<'gc>> for Value<'gc> {
+    #[inline]
     fn from(atom: AvmAtom<'gc>) -> Self {
-        Value::String(atom.into())
+        Value::from_string(atom.into())
     }
 }
 
 impl From<bool> for Value<'_> {
+    #[inline]
     fn from(value: bool) -> Self {
-        Value::Bool(value)
+        Value::from_bool(value)
     }
 }
 
@@ -78,89 +327,126 @@ impl<'gc, T> From<T> for Value<'gc>
 where
     Object<'gc>: From<T>,
 {
+    #[inline]
     fn from(value: T) -> Self {
-        Value::Object(Object::from(value))
+        Value::from_object(Object::from(value))
     }
 }
 
 impl From<f64> for Value<'_> {
+    #[inline]
     fn from(value: f64) -> Self {
-        Value::Number(value)
+        Value::from_f64(value)
     }
 }
 
 impl From<f32> for Value<'_> {
+    #[inline]
     fn from(value: f32) -> Self {
-        Value::Number(f64::from(value))
+        Value::from_f64(f64::from(value))
     }
 }
 
 impl From<u8> for Value<'_> {
+    #[inline]
     fn from(value: u8) -> Self {
-        Value::Integer(i32::from(value))
+        Value::from_integer(i32::from(value))
     }
 }
 
 impl From<i8> for Value<'_> {
+    #[inline]
     fn from(value: i8) -> Self {
-        Value::Integer(i32::from(value))
+        Value::from_integer(i32::from(value))
     }
 }
 
 impl From<i16> for Value<'_> {
+    #[inline]
     fn from(value: i16) -> Self {
-        Value::Integer(i32::from(value))
+        Value::from_integer(i32::from(value))
     }
 }
 
 impl From<u16> for Value<'_> {
+    #[inline]
     fn from(value: u16) -> Self {
-        Value::Integer(i32::from(value))
+        Value::from_integer(i32::from(value))
     }
 }
 
 impl From<i32> for Value<'_> {
+    #[inline]
     fn from(value: i32) -> Self {
         if fits_in_value_integer_i32(value) {
-            Value::Integer(value)
+            Value::from_integer(value)
         } else {
-            Value::Number(value as f64)
+            Value::from_f64(value as f64)
         }
     }
 }
 
 impl From<u32> for Value<'_> {
+    #[inline]
     fn from(value: u32) -> Self {
         if fits_in_value_integer_u32(value) {
-            Value::Integer(value as i32)
+            Value::from_integer(value as i32)
         } else {
-            Value::Number(value as f64)
+            Value::from_f64(value as f64)
         }
     }
 }
 
 impl From<usize> for Value<'_> {
+    #[inline]
     fn from(value: usize) -> Self {
-        Value::Number(value as f64)
+        Value::from_f64(value as f64)
     }
 }
 
+// ---------------------------------------------------------------------------
+// PartialEq, Debug
+// ---------------------------------------------------------------------------
+
 impl PartialEq for Value<'_> {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::Undefined, Value::Undefined) => true,
-            (Value::Null, Value::Null) => true,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Number(a), Value::Number(b)) => a == b,
-            (Value::Number(a), Value::Integer(b)) => *a == *b as f64,
-            (Value::Integer(a), Value::Number(b)) => *a as f64 == *b,
-            (Value::Integer(a), Value::Integer(b)) => a == b,
-            (Value::String(a), Value::String(b)) => a == b,
-            (Value::Object(a), Value::Object(b)) => Object::ptr_eq(*a, *b),
+        // Fast path: bit-identical values are equal (handles Undefined, Null,
+        // Bool, Integer, and pointer-identical String/Object).
+        if self.bits == other.bits {
+            return true;
+        }
+        match (self.kind(), other.kind()) {
+            // Number ↔ Number (handles NaN ≠ NaN correctly since we already
+            // checked bit-equality above)
+            (ValueKind::Number(a), ValueKind::Number(b)) => a == b,
+            // Cross Number/Integer comparison
+            (ValueKind::Number(a), ValueKind::Integer(b)) => a == b as f64,
+            (ValueKind::Integer(a), ValueKind::Number(b)) => a as f64 == b,
+            // String content equality (pointer equality already caught above)
+            (ValueKind::String(a), ValueKind::String(b)) => a == b,
+            // Object pointer equality (already caught above)
             _ => false,
         }
     }
 }
+
+impl std::fmt::Debug for Value<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind() {
+            ValueKind::Undefined => write!(f, "Undefined"),
+            ValueKind::Null => write!(f, "Null"),
+            ValueKind::Bool(b) => f.debug_tuple("Bool").field(&b).finish(),
+            ValueKind::Number(n) => f.debug_tuple("Number").field(&n).finish(),
+            ValueKind::Integer(i) => f.debug_tuple("Integer").field(&i).finish(),
+            ValueKind::String(s) => f.debug_tuple("String").field(&s).finish(),
+            ValueKind::Object(o) => f.debug_tuple("Object").field(&o).finish(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Utility functions (unchanged)
+// ---------------------------------------------------------------------------
 
 fn fits_in_value_integer_i32(value: i32) -> bool {
     value < (1 << 28) && value >= -(1 << 28)
@@ -525,8 +811,8 @@ pub fn abc_default_value<'gc>(
             .map(Into::into),
         AbcDefaultValue::True => Ok(true.into()),
         AbcDefaultValue::False => Ok(false.into()),
-        AbcDefaultValue::Null => Ok(Value::Null),
-        AbcDefaultValue::Undefined => Ok(Value::Undefined),
+        AbcDefaultValue::Null => Ok(Value::NULL),
+        AbcDefaultValue::Undefined => Ok(Value::UNDEFINED),
         AbcDefaultValue::Namespace(ns)
         | AbcDefaultValue::Package(ns)
         | AbcDefaultValue::PackageInternal(ns)
@@ -540,10 +826,14 @@ pub fn abc_default_value<'gc>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Methods on Value
+// ---------------------------------------------------------------------------
+
 impl<'gc> Value<'gc> {
     pub fn as_namespace(&self) -> Result<Namespace<'gc>, Error<'gc>> {
-        match self {
-            Value::Object(ns) => ns
+        match self.kind() {
+            ValueKind::Object(ns) => ns
                 .as_namespace()
                 .ok_or_else(|| "Expected Namespace, found Object".into()),
             _ => Err(format!("Expected Namespace, found {self:?}").into()),
@@ -561,21 +851,21 @@ impl<'gc> Value<'gc> {
     /// that's why this method is provided in order to cover such cases.
     ///
     /// The rule of thumb is to normalize the value before differentiating
-    /// between a [`Value::Number`] and [`Value::Integer`]. If there's no need
-    /// to differentiate between those variants, no normalization is needed.
+    /// between a Number and Integer. If there's no need to differentiate
+    /// between those variants, no normalization is needed.
     pub fn normalize(self) -> Self {
-        match self {
-            Value::Number(n) => {
+        match self.kind() {
+            ValueKind::Number(n) => {
                 let i = n as i32;
                 if n.to_bits() == (i as f64).to_bits() && fits_in_value_integer_i32(i) {
-                    Value::Integer(i)
+                    Value::from_integer(i)
                 } else {
                     self
                 }
             }
-            Value::Integer(i) => {
+            ValueKind::Integer(i) => {
                 if !fits_in_value_integer_i32(i) {
-                    Value::Number(i as f64)
+                    Value::from_f64(i as f64)
                 } else {
                     self
                 }
@@ -588,12 +878,13 @@ impl<'gc> Value<'gc> {
     ///
     /// This function performs no numerical coercion, nor are any methods called.
     /// If the value is not numeric, None is returned.
+    #[inline]
     pub fn try_as_f64(&self) -> Option<f64> {
-        Some(match self {
-            Value::Number(num) => *num,
-            Value::Integer(num) => *num as f64,
-            _ => return None,
-        })
+        match self.kind() {
+            ValueKind::Number(num) => Some(num),
+            ValueKind::Integer(num) => Some(num as f64),
+            _ => None,
+        }
     }
 
     /// Get the numerical portion of the value, if it exists.
@@ -606,18 +897,18 @@ impl<'gc> Value<'gc> {
 
     /// Like `as_f64`, but for `i32`
     pub fn as_i32(&self) -> i32 {
-        match self {
-            Value::Number(num) => f64_to_wrapping_i32(*num),
-            Value::Integer(num) => *num,
+        match self.kind() {
+            ValueKind::Number(num) => f64_to_wrapping_i32(num),
+            ValueKind::Integer(num) => num,
             _ => panic!("Expected Number or Integer"),
         }
     }
 
     /// Like `as_f64`, but for `u32`
     pub fn as_u32(&self) -> u32 {
-        match self {
-            Value::Number(num) => f64_to_wrapping_u32(*num),
-            Value::Integer(num) => *num as u32,
+        match self.kind() {
+            ValueKind::Number(num) => f64_to_wrapping_u32(num),
+            ValueKind::Integer(num) => num as u32,
             _ => panic!("Expected Number or Integer"),
         }
     }
@@ -625,14 +916,14 @@ impl<'gc> Value<'gc> {
     // If the current value represents an index (a unsigned integer less than u32::MAX),
     // then return that value. Returns None otherwise.
     pub fn try_as_index(&self) -> Option<usize> {
-        Some(match self {
-            value @ Value::Integer(num) if value.is_u32() => *num as usize,
-            value @ Value::Number(num) if value.is_u32() && *num < u32::MAX as f64 => {
+        match self.kind() {
+            ValueKind::Integer(num) if self.is_u32() => Some(num as usize),
+            ValueKind::Number(num) if self.is_u32() && num < u32::MAX as f64 => {
                 assert!(num.is_finite());
-                *num as usize
+                Some(num as usize)
             }
-            _ => return None,
-        })
+            _ => None,
+        }
     }
 
     /// Yields `true` if the given value is an unboxed primitive value.
@@ -640,8 +931,9 @@ impl<'gc> Value<'gc> {
     /// Note: Boxed primitive values are not considered primitive - it is
     /// expected that their `toString`/`valueOf` handlers have already had a
     /// chance to unbox the primitive contained within.
+    #[inline]
     pub fn is_primitive(&self) -> bool {
-        !matches!(self, Value::Object(_))
+        !self.is_object()
     }
 
     /// Coerce the value to a boolean.
@@ -649,13 +941,13 @@ impl<'gc> Value<'gc> {
     /// Boolean coercion happens according to the rules specified in the ES4
     /// draft proposals, which appear to be identical to ECMA-262 Edition 3.
     pub fn coerce_to_boolean(&self) -> bool {
-        match self {
-            Value::Undefined | Value::Null => false,
-            Value::Bool(b) => *b,
-            Value::Number(f) => !f.is_nan() && *f != 0.0,
-            Value::Integer(i) => *i != 0,
-            Value::String(s) => !s.is_empty(),
-            Value::Object(_) => true,
+        match self.kind() {
+            ValueKind::Undefined | ValueKind::Null => false,
+            ValueKind::Bool(b) => b,
+            ValueKind::Number(f) => !f.is_nan() && f != 0.0,
+            ValueKind::Integer(i) => i != 0,
+            ValueKind::String(s) => !s.is_empty(),
+            ValueKind::Object(_) => true,
         }
     }
 
@@ -676,49 +968,49 @@ impl<'gc> Value<'gc> {
         hint: Option<Hint>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        let hint = hint.unwrap_or_else(|| match self {
-            Value::Object(o) => o.default_hint(),
+        let hint = hint.unwrap_or_else(|| match self.kind() {
+            ValueKind::Object(o) => o.default_hint(),
             _ => Hint::Number,
         });
 
-        match self {
-            Value::Object(_) if hint == Hint::String => {
-                let prim = self.call_public_property(
-                    istr!("toString"),
-                    FunctionArgs::empty(),
-                    activation,
-                )?;
-                if prim.is_primitive() {
-                    return Ok(prim);
-                }
+        if !self.is_object() {
+            return Ok(*self);
+        }
 
-                let prim =
-                    self.call_public_property(istr!("valueOf"), FunctionArgs::empty(), activation)?;
-                if prim.is_primitive() {
-                    return Ok(prim);
-                }
-
-                Err(make_error_1050(activation, *self))
+        if hint == Hint::String {
+            let prim = self.call_public_property(
+                istr!("toString"),
+                FunctionArgs::empty(),
+                activation,
+            )?;
+            if prim.is_primitive() {
+                return Ok(prim);
             }
-            Value::Object(_) if hint == Hint::Number => {
-                let prim =
-                    self.call_public_property(istr!("valueOf"), FunctionArgs::empty(), activation)?;
-                if prim.is_primitive() {
-                    return Ok(prim);
-                }
 
-                let prim = self.call_public_property(
-                    istr!("toString"),
-                    FunctionArgs::empty(),
-                    activation,
-                )?;
-                if prim.is_primitive() {
-                    return Ok(prim);
-                }
-
-                Err(make_error_1050(activation, *self))
+            let prim =
+                self.call_public_property(istr!("valueOf"), FunctionArgs::empty(), activation)?;
+            if prim.is_primitive() {
+                return Ok(prim);
             }
-            _ => Ok(*self),
+
+            Err(make_error_1050(activation, *self))
+        } else {
+            let prim =
+                self.call_public_property(istr!("valueOf"), FunctionArgs::empty(), activation)?;
+            if prim.is_primitive() {
+                return Ok(prim);
+            }
+
+            let prim = self.call_public_property(
+                istr!("toString"),
+                FunctionArgs::empty(),
+                activation,
+            )?;
+            if prim.is_primitive() {
+                return Ok(prim);
+            }
+
+            Err(make_error_1050(activation, *self))
         }
     }
 
@@ -734,18 +1026,18 @@ impl<'gc> Value<'gc> {
         &self,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<f64, Error<'gc>> {
-        Ok(match self {
-            Value::Undefined => f64::NAN,
-            Value::Null => 0.0,
-            Value::Bool(true) => 1.0,
-            Value::Bool(false) => 0.0,
-            Value::Number(n) => *n,
-            Value::Integer(i) => *i as f64,
-            Value::String(s) => {
+        Ok(match self.kind() {
+            ValueKind::Undefined => f64::NAN,
+            ValueKind::Null => 0.0,
+            ValueKind::Bool(true) => 1.0,
+            ValueKind::Bool(false) => 0.0,
+            ValueKind::Number(n) => n,
+            ValueKind::Integer(i) => i as f64,
+            ValueKind::String(s) => {
                 let swf_version = activation.context.root_swf.version();
-                string_to_f64(s, swf_version, true).unwrap_or_else(|| string_to_int(s, 0, true))
+                string_to_f64(&s, swf_version, true).unwrap_or_else(|| string_to_int(&s, 0, true))
             }
-            Value::Object(_) => self
+            ValueKind::Object(_) => self
                 .coerce_to_primitive(Some(Hint::Number), activation)?
                 .coerce_to_number(activation)?,
         })
@@ -759,12 +1051,12 @@ impl<'gc> Value<'gc> {
     /// Numerical conversions occur according to ECMA-262 3rd Edition's
     /// ToUint32 algorithm which appears to match AVM2.
     pub fn coerce_to_u32(&self, activation: &mut Activation<'_, 'gc>) -> Result<u32, Error<'gc>> {
-        Ok(match self {
-            Value::Integer(i) => *i as u32,
-            Value::Number(n) => f64_to_wrapping_u32(*n),
-            Value::Bool(b) => *b as u32,
-            Value::Undefined | Value::Null => 0,
-            Value::String(_) | Value::Object(_) => {
+        Ok(match self.kind() {
+            ValueKind::Integer(i) => i as u32,
+            ValueKind::Number(n) => f64_to_wrapping_u32(n),
+            ValueKind::Bool(b) => b as u32,
+            ValueKind::Undefined | ValueKind::Null => 0,
+            ValueKind::String(_) | ValueKind::Object(_) => {
                 f64_to_wrapping_u32(self.coerce_to_number(activation)?)
             }
         })
@@ -778,12 +1070,12 @@ impl<'gc> Value<'gc> {
     /// Numerical conversions occur according to ECMA-262 3rd Edition's
     /// ToInt32 algorithm which appears to match AVM2.
     pub fn coerce_to_i32(&self, activation: &mut Activation<'_, 'gc>) -> Result<i32, Error<'gc>> {
-        Ok(match self {
-            Value::Integer(i) => *i,
-            Value::Number(n) => f64_to_wrapping_i32(*n),
-            Value::Bool(b) => *b as i32,
-            Value::Undefined | Value::Null => 0,
-            Value::String(_) | Value::Object(_) => {
+        Ok(match self.kind() {
+            ValueKind::Integer(i) => i,
+            ValueKind::Number(n) => f64_to_wrapping_i32(n),
+            ValueKind::Bool(b) => b as i32,
+            ValueKind::Undefined | ValueKind::Null => 0,
+            ValueKind::String(_) | ValueKind::Object(_) => {
                 f64_to_wrapping_i32(self.coerce_to_number(activation)?)
             }
         })
@@ -818,23 +1110,23 @@ impl<'gc> Value<'gc> {
     ///
     /// TODO: The cutoffs change based on SWF/ABC version. Targeting FP10.3 in
     /// Animate CC 2020 significantly reduces them (towards zero).
-    pub fn coerce_to_string<'a>(
-        &'a self,
+    pub fn coerce_to_string(
+        &self,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<AvmString<'gc>, Error<'gc>> {
-        Ok(match self {
-            Value::Undefined => istr!("undefined"),
-            Value::Null => istr!("null"),
-            Value::Bool(true) => istr!("true"),
-            Value::Bool(false) => istr!("false"),
-            Value::Number(n) if n.is_nan() => istr!("NaN"),
-            Value::Number(n) if *n == 0.0 => istr!("0"),
-            Value::Number(n) if *n < 0.0 => AvmString::new_utf8(
+        Ok(match self.kind() {
+            ValueKind::Undefined => istr!("undefined"),
+            ValueKind::Null => istr!("null"),
+            ValueKind::Bool(true) => istr!("true"),
+            ValueKind::Bool(false) => istr!("false"),
+            ValueKind::Number(n) if n.is_nan() => istr!("NaN"),
+            ValueKind::Number(n) if n == 0.0 => istr!("0"),
+            ValueKind::Number(n) if n < 0.0 => AvmString::new_utf8(
                 activation.gc(),
-                format!("-{}", Value::Number(-n).coerce_to_string(activation)?),
+                format!("-{}", Value::from_f64(-n).coerce_to_string(activation)?),
             ),
-            Value::Number(n) if n.is_infinite() => istr!("Infinity"),
-            Value::Number(n) => {
+            ValueKind::Number(n) if n.is_infinite() => istr!("Infinity"),
+            ValueKind::Number(n) => {
                 let digits = n.log10().floor();
 
                 // TODO: This needs to limit precision in the resulting decimal
@@ -856,15 +1148,15 @@ impl<'gc> Value<'gc> {
                     AvmString::new_utf8(activation.gc(), n.to_string())
                 }
             }
-            Value::Integer(i) => {
-                if *i >= 0 && *i < 10 {
-                    activation.strings().ascii_char(b'0' + *i as u8)
+            ValueKind::Integer(i) => {
+                if i >= 0 && i < 10 {
+                    activation.strings().ascii_char(b'0' + i as u8)
                 } else {
                     AvmString::new_utf8(activation.gc(), i.to_string())
                 }
             }
-            Value::String(s) => *s,
-            Value::Object(_) => self
+            ValueKind::String(s) => s,
+            ValueKind::Object(_) => self
                 .coerce_to_primitive(Some(Hint::String), activation)?
                 .coerce_to_string(activation)?,
         })
@@ -880,9 +1172,9 @@ impl<'gc> Value<'gc> {
         &self,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<String, Error<'gc>> {
-        Ok(match self {
-            Value::String(s) => format!("\"{s}\""),
-            Value::Object(obj) => {
+        Ok(match self.kind() {
+            ValueKind::String(s) => format!("\"{s}\""),
+            ValueKind::Object(obj) => {
                 // Flash prints the class name (ignoring the toString() impl on the object),
                 // followed by something that looks like an address (it varies between executions).
                 // For now, we just set the "address" to all zeroes, on the off chance that some
@@ -902,19 +1194,11 @@ impl<'gc> Value<'gc> {
         activation: &mut Activation<'_, 'gc>,
         name: Option<&Multiname<'gc>>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        if matches!(self, Value::Null | Value::Undefined) {
+        if self.is_null_or_undefined() {
             return Err(error::make_null_or_undefined_error(activation, *self, name));
         }
 
         Ok(*self)
-    }
-
-    #[inline(always)]
-    pub fn as_object(&self) -> Option<Object<'gc>> {
-        match self {
-            Value::Object(o) => Some(*o),
-            _ => None,
-        }
     }
 
     /// Retrieve a property by Multiname lookup.
@@ -1317,39 +1601,36 @@ impl<'gc> Value<'gc> {
         activation: &mut Activation<'_, 'gc>,
         multiname: &Multiname<'gc>,
     ) -> Result<bool, Error<'gc>> {
-        match self {
-            Value::Object(object) => {
-                match object.vtable().get_trait(multiname) {
-                    None => {
-                        if object.instance_class().is_sealed() {
-                            Ok(false)
-                        } else {
-                            object.delete_property_local(activation, multiname)
-                        }
-                    }
-                    _ => {
-                        // Similar to the get_property special case for XML/XMLList.
-                        if (object.as_xml_object().is_some()
-                            || object.as_xml_list_object().is_some())
-                            && multiname.contains_public_namespace()
-                        {
-                            return object.delete_property_local(activation, multiname);
-                        }
-
+        if let Some(object) = self.as_object() {
+            match object.vtable().get_trait(multiname) {
+                None => {
+                    if object.instance_class().is_sealed() {
                         Ok(false)
+                    } else {
+                        object.delete_property_local(activation, multiname)
                     }
                 }
-            }
-            _ => {
-                let instance_class = self.instance_class(activation);
+                _ => {
+                    // Similar to the get_property special case for XML/XMLList.
+                    if (object.as_xml_object().is_some()
+                        || object.as_xml_list_object().is_some())
+                        && multiname.contains_public_namespace()
+                    {
+                        return object.delete_property_local(activation, multiname);
+                    }
 
-                Err(error::make_reference_error(
-                    activation,
-                    error::ReferenceErrorCode::InvalidDelete,
-                    multiname,
-                    instance_class,
-                ))
+                    Ok(false)
+                }
             }
+        } else {
+            let instance_class = self.instance_class(activation);
+
+            Err(error::make_reference_error(
+                activation,
+                error::ReferenceErrorCode::InvalidDelete,
+                multiname,
+                instance_class,
+            ))
         }
     }
 
@@ -1431,7 +1712,7 @@ impl<'gc> Value<'gc> {
                         object_class,
                     )?;
 
-                    dynamic_lookup.unwrap_or(Value::Undefined)
+                    dynamic_lookup.unwrap_or(Value::UNDEFINED)
                 };
 
                 value.construct(activation, arguments)
@@ -1454,9 +1735,10 @@ impl<'gc> Value<'gc> {
         activation: &mut Activation<'_, 'gc>,
         name: &Multiname<'gc>,
     ) -> bool {
-        match self {
-            Value::Object(object) => object.has_own_property(name),
-            _ => self.vtable(activation).has_trait(name),
+        if let Some(object) = self.as_object() {
+            object.has_own_property(name)
+        } else {
+            self.vtable(activation).has_trait(name)
         }
     }
 
@@ -1492,12 +1774,16 @@ impl<'gc> Value<'gc> {
         receiver: Value<'gc>,
         args: FunctionArgs<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        match self.as_object() {
-            Some(Object::ClassObject(class_object)) => class_object.call(activation, args),
-            Some(Object::FunctionObject(function_object)) => {
+        if let Some(obj) = self.as_object() {
+            if let Some(class_object) = obj.as_class_object() {
+                class_object.call(activation, args)
+            } else if let Some(function_object) = obj.as_function_object() {
                 function_object.call(activation, receiver, args)
+            } else {
+                Err(make_error_1006(activation))
             }
-            _ => Err(make_error_1006(activation)),
+        } else {
+            Err(make_error_1006(activation))
         }
     }
 
@@ -1506,14 +1792,16 @@ impl<'gc> Value<'gc> {
         activation: &mut Activation<'_, 'gc>,
         args: FunctionArgs<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        match self.as_object() {
-            Some(Object::ClassObject(class_object)) => {
+        if let Some(obj) = self.as_object() {
+            if let Some(class_object) = obj.as_class_object() {
                 class_object.construct_with_args(activation, args)
-            }
-            Some(Object::FunctionObject(function_object)) => {
+            } else if let Some(function_object) = obj.as_function_object() {
                 function_object.construct(activation, args).map(Into::into)
+            } else {
+                Err(make_error_1007(activation))
             }
-            _ => Err(make_error_1007(activation)),
+        } else {
+            Err(make_error_1007(activation))
         }
     }
 
@@ -1546,11 +1834,11 @@ impl<'gc> Value<'gc> {
             return Ok(self.coerce_to_boolean().into());
         }
 
-        if matches!(self, Value::Undefined) || matches!(self, Value::Null) {
+        if self.is_undefined() || self.is_null() {
             if class.is_builtin_void() {
-                return Ok(Value::Undefined);
+                return Ok(Value::UNDEFINED);
             }
-            return Ok(Value::Null);
+            return Ok(Value::NULL);
         }
 
         if class.is_builtin_string() {
@@ -1570,18 +1858,13 @@ impl<'gc> Value<'gc> {
         Err(make_error_1034(activation, *self, class))
     }
 
-    /// Determine if this value is any kind of number.
-    pub fn is_number(&self) -> bool {
-        matches!(self, Value::Number(_) | Value::Integer(_))
-    }
-
     /// Determine if this value is a number representable as a u32 without loss
     /// of precision.
     #[expect(clippy::float_cmp)]
     pub fn is_u32(&self) -> bool {
-        match self {
-            Value::Number(n) => *n == (*n as u32 as f64),
-            Value::Integer(i) => *i >= 0,
+        match self.kind() {
+            ValueKind::Number(n) => n == (n as u32 as f64),
+            ValueKind::Integer(i) => i >= 0,
             _ => false,
         }
     }
@@ -1590,9 +1873,9 @@ impl<'gc> Value<'gc> {
     /// loss of precision.
     #[expect(clippy::float_cmp)]
     pub fn is_i32(&self) -> bool {
-        match self {
-            Value::Number(n) => *n == (*n as i32 as f64),
-            Value::Integer(_) => true,
+        match self.kind() {
+            ValueKind::Number(n) => n == (n as i32 as f64),
+            ValueKind::Integer(_) => true,
             _ => false,
         }
     }
@@ -1615,19 +1898,19 @@ impl<'gc> Value<'gc> {
         }
 
         if type_class.is_builtin_void() {
-            return matches!(self, Value::Undefined);
+            return self.is_undefined();
         }
 
         if type_class.is_builtin_boolean() {
-            return matches!(self, Value::Bool(_));
+            return self.is_bool();
         }
 
         if type_class.is_builtin_string() {
-            return matches!(self, Value::String(_));
+            return self.is_string();
         }
 
         if type_class.is_builtin_object() {
-            return !matches!(self, Value::Undefined | Value::Null);
+            return !self.is_null_or_undefined();
         }
 
         if let Some(o) = self.as_object() {
@@ -1644,13 +1927,13 @@ impl<'gc> Value<'gc> {
     pub fn vtable(&self, activation: &mut Activation<'_, 'gc>) -> VTable<'gc> {
         let classes = activation.avm2().classes();
 
-        match self {
-            Value::Bool(_) => classes.boolean.instance_vtable(),
-            Value::Number(_) | Value::Integer(_) => classes.number.instance_vtable(),
-            Value::String(_) => classes.string.instance_vtable(),
-            Value::Object(obj) => obj.vtable(),
+        match self.kind() {
+            ValueKind::Bool(_) => classes.boolean.instance_vtable(),
+            ValueKind::Number(_) | ValueKind::Integer(_) => classes.number.instance_vtable(),
+            ValueKind::String(_) => classes.string.instance_vtable(),
+            ValueKind::Object(obj) => obj.vtable(),
 
-            Value::Undefined | Value::Null => {
+            ValueKind::Undefined | ValueKind::Null => {
                 unreachable!("Should not have Undefined or Null in `vtable`")
             }
         }
@@ -1663,13 +1946,13 @@ impl<'gc> Value<'gc> {
     pub fn instance_class(&self, activation: &mut Activation<'_, 'gc>) -> Class<'gc> {
         let class_defs = activation.avm2().class_defs();
 
-        match self {
-            Value::Bool(_) => class_defs.boolean,
-            Value::Number(_) | Value::Integer(_) => class_defs.number,
-            Value::String(_) => class_defs.string,
-            Value::Object(obj) => obj.instance_class(),
+        match self.kind() {
+            ValueKind::Bool(_) => class_defs.boolean,
+            ValueKind::Number(_) | ValueKind::Integer(_) => class_defs.number,
+            ValueKind::String(_) => class_defs.string,
+            ValueKind::Object(obj) => obj.instance_class(),
 
-            Value::Undefined | Value::Null => {
+            ValueKind::Undefined | ValueKind::Null => {
                 unreachable!("Should not have Undefined or Null in `instance_class`")
             }
         }
@@ -1682,13 +1965,13 @@ impl<'gc> Value<'gc> {
     pub fn proto(&self, activation: &mut Activation<'_, 'gc>) -> Option<Object<'gc>> {
         let classes = activation.avm2().classes();
 
-        match self {
-            Value::Bool(_) => Some(classes.boolean.prototype()),
-            Value::Number(_) | Value::Integer(_) => Some(classes.number.prototype()),
-            Value::String(_) => Some(classes.string.prototype()),
-            Value::Object(obj) => obj.proto(),
+        match self.kind() {
+            ValueKind::Bool(_) => Some(classes.boolean.prototype()),
+            ValueKind::Number(_) | ValueKind::Integer(_) => Some(classes.number.prototype()),
+            ValueKind::String(_) => Some(classes.string.prototype()),
+            ValueKind::Object(obj) => obj.proto(),
 
-            Value::Undefined | Value::Null => {
+            ValueKind::Undefined | ValueKind::Null => {
                 unreachable!("Should not have Undefined or Null in `proto`")
             }
         }
@@ -1716,10 +1999,12 @@ impl<'gc> Value<'gc> {
         activation: &mut Activation<'_, 'gc>,
         class_or_function_object: Object<'gc>,
     ) -> bool {
-        let type_proto = match class_or_function_object {
-            Object::ClassObject(class_object) => Some(class_object.prototype()),
-            Object::FunctionObject(function_object) => function_object.prototype(),
-            _ => panic!("Object must be either ClassObject or FunctionObject"),
+        let type_proto = if let Some(class_object) = class_or_function_object.as_class_object() {
+            Some(class_object.prototype())
+        } else if let Some(function_object) = class_or_function_object.as_function_object() {
+            function_object.prototype()
+        } else {
+            panic!("Object must be either ClassObject or FunctionObject")
         };
 
         if let Some(type_proto) = type_proto {
@@ -1766,7 +2051,7 @@ impl<'gc> Value<'gc> {
         // for XML and XMLList types. Because they are objects in Ruffle we
         // have to be a bit more complicated and factor out the code into
         // a separate method.
-        if let Value::Object(obj) = self {
+        if let Some(obj) = self.as_object() {
             if let Some(xml_list_obj) = obj.as_xml_list_object() {
                 return xml_list_obj.equals(other, activation);
             }
@@ -1776,7 +2061,7 @@ impl<'gc> Value<'gc> {
             }
 
             if let Some(self_qname) = obj.as_qname_object() {
-                if let Value::Object(Object::QNameObject(other_qname)) = other {
+                if let Some(other_qname) = other.as_object().and_then(|o| o.as_qname_object()) {
                     return Ok(self_qname.uri(activation.strings())
                         == other_qname.uri(activation.strings())
                         && self_qname.local_name(activation.strings())
@@ -1785,14 +2070,14 @@ impl<'gc> Value<'gc> {
             }
 
             if let Some(self_ns) = obj.as_namespace_object() {
-                if let Value::Object(Object::NamespaceObject(other_ns)) = other {
+                if let Some(other_ns) = other.as_object().and_then(|o| o.as_namespace_object()) {
                     return Ok(self_ns.namespace().as_uri(activation.strings())
                         == other_ns.namespace().as_uri(activation.strings()));
                 }
             }
         }
 
-        if let Value::Object(obj) = other {
+        if let Some(obj) = other.as_object() {
             if let Some(xml_list_obj) = obj.as_xml_list_object() {
                 return xml_list_obj.equals(self, activation);
             }
@@ -1802,11 +2087,11 @@ impl<'gc> Value<'gc> {
             }
         }
 
-        match (self, other) {
-            (Value::Undefined, Value::Undefined) => Ok(true),
-            (Value::Null, Value::Null) => Ok(true),
-            (Value::Integer(a), Value::Integer(b)) => Ok(a == b),
-            (Value::Number(_) | Value::Integer(_), Value::Number(_) | Value::Integer(_)) => {
+        match (self.kind(), other.kind()) {
+            (ValueKind::Undefined, ValueKind::Undefined) => Ok(true),
+            (ValueKind::Null, ValueKind::Null) => Ok(true),
+            (ValueKind::Integer(a), ValueKind::Integer(b)) => Ok(a == b),
+            (ValueKind::Number(_) | ValueKind::Integer(_), ValueKind::Number(_) | ValueKind::Integer(_)) => {
                 let a = self.coerce_to_number(activation)?;
                 let b = other.coerce_to_number(activation)?;
 
@@ -1824,38 +2109,38 @@ impl<'gc> Value<'gc> {
 
                 Ok(false)
             }
-            (Value::String(a), Value::String(b)) => Ok(a == b),
-            (Value::Bool(a), Value::Bool(b)) => Ok(a == b),
-            (Value::Object(a), Value::Object(b)) => Ok(Object::ptr_eq(*a, *b)),
-            (Value::Undefined, Value::Null) => Ok(true),
-            (Value::Null, Value::Undefined) => Ok(true),
-            (Value::Number(_) | Value::Integer(_), Value::String(_)) => {
+            (ValueKind::String(a), ValueKind::String(b)) => Ok(a == b),
+            (ValueKind::Bool(a), ValueKind::Bool(b)) => Ok(a == b),
+            (ValueKind::Object(a), ValueKind::Object(b)) => Ok(Object::ptr_eq(a, b)),
+            (ValueKind::Undefined, ValueKind::Null) => Ok(true),
+            (ValueKind::Null, ValueKind::Undefined) => Ok(true),
+            (ValueKind::Number(_) | ValueKind::Integer(_), ValueKind::String(_)) => {
                 let number_other = Value::from(other.coerce_to_number(activation)?);
 
                 self.abstract_eq(&number_other, activation)
             }
-            (Value::String(_), Value::Number(_) | Value::Integer(_)) => {
+            (ValueKind::String(_), ValueKind::Number(_) | ValueKind::Integer(_)) => {
                 let number_self = Value::from(self.coerce_to_number(activation)?);
 
                 number_self.abstract_eq(other, activation)
             }
-            (Value::Bool(_), _) => {
+            (ValueKind::Bool(_), _) => {
                 let number_self = Value::from(self.coerce_to_number(activation)?);
 
                 number_self.abstract_eq(other, activation)
             }
-            (_, Value::Bool(_)) => {
+            (_, ValueKind::Bool(_)) => {
                 let number_other = Value::from(other.coerce_to_number(activation)?);
 
                 self.abstract_eq(&number_other, activation)
             }
-            (Value::String(_) | Value::Number(_) | Value::Integer(_), Value::Object(_)) => {
+            (ValueKind::String(_) | ValueKind::Number(_) | ValueKind::Integer(_), ValueKind::Object(_)) => {
                 //TODO: Should this be `Hint::Number`, `Hint::String`, or no-hint?
                 let primitive_other = other.coerce_to_primitive(Some(Hint::Number), activation)?;
 
                 self.abstract_eq(&primitive_other, activation)
             }
-            (Value::Object(_), Value::String(_) | Value::Number(_) | Value::Integer(_)) => {
+            (ValueKind::Object(_), ValueKind::String(_) | ValueKind::Number(_) | ValueKind::Integer(_)) => {
                 //TODO: Should this be `Hint::Number`, `Hint::String`, or no-hint?
                 let primitive_self = self.coerce_to_primitive(Some(Hint::Number), activation)?;
 
@@ -1875,26 +2160,25 @@ impl<'gc> Value<'gc> {
         other: &Value<'gc>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Option<bool>, Error<'gc>> {
-        match (self, other) {
-            (Value::Integer(a), Value::Integer(b)) => Ok(Some(a < b)),
-            _ => {
-                let prim_self = self.coerce_to_primitive(Some(Hint::Number), activation)?;
-                let prim_other = other.coerce_to_primitive(Some(Hint::Number), activation)?;
-
-                if let (Value::String(s), Value::String(o)) = (&prim_self, &prim_other) {
-                    return Ok(Some(s.to_string().bytes().lt(o.to_string().bytes())));
-                }
-
-                let num_self = prim_self.coerce_to_number(activation)?;
-                let num_other = prim_other.coerce_to_number(activation)?;
-
-                if num_self.is_nan() || num_other.is_nan() {
-                    return Ok(None);
-                }
-
-                Ok(Some(num_self < num_other))
-            }
+        if let (ValueKind::Integer(a), ValueKind::Integer(b)) = (self.kind(), other.kind()) {
+            return Ok(Some(a < b));
         }
+
+        let prim_self = self.coerce_to_primitive(Some(Hint::Number), activation)?;
+        let prim_other = other.coerce_to_primitive(Some(Hint::Number), activation)?;
+
+        if let (Some(s), Some(o)) = (prim_self.as_string(), prim_other.as_string()) {
+            return Ok(Some(s.to_string().bytes().lt(o.to_string().bytes())));
+        }
+
+        let num_self = prim_self.coerce_to_number(activation)?;
+        let num_other = prim_other.coerce_to_number(activation)?;
+
+        if num_self.is_nan() || num_other.is_nan() {
+            return Ok(None);
+        }
+
+        Ok(Some(num_self < num_other))
     }
 }
 

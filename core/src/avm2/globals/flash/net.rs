@@ -60,7 +60,7 @@ fn parse_data<'gc>(
             .as_object()
             .expect("URLVariables object should be Value::Object");
         vars = object_to_index_map(activation, &obj).unwrap_or_default();
-    } else if *data != Value::Null {
+    } else if !data.is_null() {
         let str_data = data.coerce_to_string(activation)?.to_string();
         if !url.contains('?') {
             url.push('?');
@@ -81,26 +81,26 @@ pub fn navigate_to_url<'gc>(
 
     let target = args.get_string(activation, 1);
 
-    match request.get_slot(url_request_slots::_URL) {
-        Value::Null => Err(make_error_2007(activation, "url")),
-        url => {
-            let url = url.coerce_to_string(activation)?.to_string();
-            let method = request
-                .get_slot(url_request_slots::_METHOD)
-                .coerce_to_string(activation)?;
-            let method = NavigationMethod::from_method_str(&method).unwrap();
-            let data = request.get_slot(url_request_slots::_DATA);
-            let (url, vars) = parse_data(activation, &url, &data)?;
-
-            activation.context.navigator.navigate_to_url(
-                &url,
-                &target.to_utf8_lossy(),
-                Some((method, vars)),
-            );
-
-            Ok(Value::Undefined)
-        }
+    let url_value = request.get_slot(url_request_slots::_URL);
+    if url_value.is_null() {
+        return Err(make_error_2007(activation, "url"));
     }
+
+    let url = url_value.coerce_to_string(activation)?.to_string();
+    let method = request
+        .get_slot(url_request_slots::_METHOD)
+        .coerce_to_string(activation)?;
+    let method = NavigationMethod::from_method_str(&method).unwrap();
+    let data = request.get_slot(url_request_slots::_DATA);
+    let (url, vars) = parse_data(activation, &url, &data)?;
+
+    activation.context.navigator.navigate_to_url(
+        &url,
+        &target.to_utf8_lossy(),
+        Some((method, vars)),
+    );
+
+    Ok(Value::UNDEFINED)
 }
 
 pub fn register_class_alias<'gc>(
@@ -115,7 +115,7 @@ pub fn register_class_alias<'gc>(
         .unwrap();
 
     activation.avm2().register_class_alias(name, class_object);
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_class_by_alias<'gc>(

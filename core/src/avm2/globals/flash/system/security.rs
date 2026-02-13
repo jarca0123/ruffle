@@ -22,7 +22,7 @@ pub fn get_page_domain<'gc>(
     {
         if !url.origin().is_tuple() {
             tracing::warn!("flash.system.Security.pageDomain: Returning null for opaque origin");
-            return Ok(Value::Null);
+            return Ok(Value::NULL);
         }
 
         let mut domain = url.origin().ascii_serialization();
@@ -30,7 +30,7 @@ pub fn get_page_domain<'gc>(
         Ok(AvmString::new_utf8(activation.gc(), domain).into())
     } else {
         tracing::warn!("flash.system.Security.pageDomain: No page-url available");
-        Ok(Value::Null)
+        Ok(Value::NULL)
     }
 }
 
@@ -58,7 +58,7 @@ pub fn allow_domain<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm2_stub_method!(activation, "flash.system.Security", "allowDomain");
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn allow_insecure_domain<'gc>(
@@ -67,7 +67,7 @@ pub fn allow_insecure_domain<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm2_stub_method!(activation, "flash.system.Security", "allowInsecureDomain");
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn load_policy_file<'gc>(
@@ -76,7 +76,7 @@ pub fn load_policy_file<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm2_stub_method!(activation, "flash.system.Security", "loadPolicyFile");
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn show_settings<'gc>(
@@ -85,5 +85,5 @@ pub fn show_settings<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm2_stub_method!(activation, "flash.system.Security", "showSettings");
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

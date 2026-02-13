@@ -11,7 +11,7 @@ pub fn uint_constructor<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let uint_value = args
         .get_optional(0)
-        .unwrap_or(Value::Integer(0))
+        .unwrap_or(Value::from_integer(0))
         .coerce_to_u32(activation)?;
 
     Ok(uint_value.into())
@@ -24,7 +24,7 @@ pub fn call_handler<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     Ok(args
         .get_optional(0)
-        .unwrap_or(Value::Integer(0))
+        .unwrap_or(Value::from_integer(0))
         .coerce_to_u32(activation)?
         .into())
 }

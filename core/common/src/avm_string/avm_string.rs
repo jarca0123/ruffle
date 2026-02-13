@@ -54,6 +54,22 @@ impl<'gc> AvmString<'gc> {
         self.0.is_dependent()
     }
 
+    #[inline]
+    pub fn as_gc(self) -> Gc<'gc, AvmStringRepr<'gc>> {
+        self.0
+    }
+
+    /// Reconstruct an `AvmString` from a raw pointer previously obtained
+    /// via `Gc::as_ptr(Gc::erase(s.as_gc()))`.
+    ///
+    /// # Safety
+    /// The pointer must have been obtained from a valid `AvmString` that has
+    /// not been collected.
+    #[inline]
+    pub unsafe fn from_raw_gc_ptr(ptr: *const ()) -> Self {
+        Self(unsafe { Gc::from_ptr(ptr as *const AvmStringRepr<'gc>) })
+    }
+
     pub fn as_wstr(&self) -> &'gc WStr {
         Gc::as_ref(self.0).as_wstr()
     }

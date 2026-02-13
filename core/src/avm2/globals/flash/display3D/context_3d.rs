@@ -37,7 +37,7 @@ pub fn create_index_buffer<'gc>(
 
         return Ok(context.create_index_buffer(num_indices, activation));
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn create_vertex_buffer<'gc>(
@@ -65,7 +65,7 @@ pub fn create_vertex_buffer<'gc>(
             activation,
         ));
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn configure_back_buffer<'gc>(
@@ -84,7 +84,7 @@ pub fn configure_back_buffer<'gc>(
         let old_swf = activation.context.root_swf.version() < 30;
 
         if old_swf && width == 0 && height == 0 && anti_alias == 0 && !enable_depth_and_stencil {
-            return Ok(Value::Undefined);
+            return Ok(Value::UNDEFINED);
         }
 
         if width < 32 || width > 16384 {
@@ -132,7 +132,7 @@ pub fn configure_back_buffer<'gc>(
             wants_best_resolution_on_browser_zoom,
         );
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_vertex_buffer_at<'gc>(
@@ -173,7 +173,7 @@ pub fn set_vertex_buffer_at<'gc>(
 
         context.set_vertex_buffer_at(index, buffer, buffer_offset);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn create_program<'gc>(
@@ -186,7 +186,7 @@ pub fn create_program<'gc>(
     if let Some(context) = this.as_context_3d() {
         return Ok(context.create_program(activation));
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_program<'gc>(
@@ -200,7 +200,7 @@ pub fn set_program<'gc>(
         let program = args.try_get_object(0).map(|p| p.as_program_3d().unwrap());
         context.set_program(program);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn draw_triangles<'gc>(
@@ -221,7 +221,7 @@ pub fn draw_triangles<'gc>(
 
         context.draw_triangles(index_buffer, first_index, num_triangles);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn present<'gc>(
@@ -234,7 +234,7 @@ pub fn present<'gc>(
     if let Some(context) = this.as_context_3d() {
         context.present();
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_profile<'gc>(
@@ -256,7 +256,7 @@ pub fn get_profile<'gc>(
 
         return Ok(profile.into());
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_culling<'gc>(
@@ -284,7 +284,7 @@ pub fn set_culling<'gc>(
 
         context.set_culling(culling);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_program_constants_from_matrix<'gc>(
@@ -341,7 +341,7 @@ pub fn set_program_constants_from_matrix<'gc>(
 
         context.set_program_constants_from_matrix(is_vertex, first_register, matrix_raw_data);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_program_constants_from_vector<'gc>(
@@ -385,7 +385,7 @@ pub fn set_program_constants_from_vector<'gc>(
 
         context.set_program_constants_from_matrix(program_type, first_register, raw_data);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn clear<'gc>(
@@ -407,7 +407,7 @@ pub fn clear<'gc>(
 
         context.set_clear(red, green, blue, alpha, depth, stencil, mask);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn create_texture<'gc>(
@@ -439,7 +439,7 @@ pub fn create_texture<'gc>(
             activation,
         );
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn create_rectangle_texture<'gc>(
@@ -470,7 +470,7 @@ pub fn create_rectangle_texture<'gc>(
             activation,
         );
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn create_cube_texture<'gc>(
@@ -497,7 +497,7 @@ pub fn create_cube_texture<'gc>(
             activation,
         );
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_texture_at<'gc>(
@@ -528,7 +528,7 @@ pub fn set_texture_at<'gc>(
 
         context.set_texture_at(sampler, texture, cube);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_color_mask<'gc>(
@@ -547,7 +547,7 @@ pub fn set_color_mask<'gc>(
 
         context.set_color_mask(red, green, blue, alpha);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_depth_test<'gc>(
@@ -566,7 +566,7 @@ pub fn set_depth_test<'gc>(
 
         context.set_depth_test(depth_mask, pass_compare_mode);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_blend_factors<'gc>(
@@ -589,7 +589,7 @@ pub fn set_blend_factors<'gc>(
 
         context.set_blend_factors(source_factor, destination_factor);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_render_to_texture<'gc>(
@@ -648,7 +648,7 @@ pub fn set_render_to_texture<'gc>(
         anti_alias,
         surface_selector,
     );
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_render_to_back_buffer<'gc>(
@@ -660,7 +660,7 @@ pub fn set_render_to_back_buffer<'gc>(
 
     let context = this.as_context_3d().unwrap();
     context.set_render_to_back_buffer();
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_sampler_state_at<'gc>(
@@ -709,7 +709,7 @@ pub fn set_sampler_state_at<'gc>(
 
         context.set_sampler_state_at(sampler, wrap, filter);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_scissor_rectangle<'gc>(
@@ -745,7 +745,7 @@ pub fn set_scissor_rectangle<'gc>(
     };
 
     context3d.set_scissor_rectangle(rectangle);
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn dispose<'gc>(
@@ -760,5 +760,5 @@ pub fn dispose<'gc>(
         .unwrap()
         .stage3d()
         .set_context3d(None, activation.gc());
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

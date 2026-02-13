@@ -3,7 +3,7 @@
 use crate::avm2::Error;
 use crate::avm2::activation::Activation;
 use crate::avm2::domain::Domain;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, TObject};
 use core::fmt;
 use gc_arena::barrier::unlock;
@@ -16,7 +16,7 @@ pub fn application_domain_allocator<'gc>(
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
     let domain = activation.domain();
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::DomainObject);
 
     Ok(DomainObject(Gc::new(
         activation.gc(),
@@ -62,7 +62,7 @@ impl<'gc> DomainObject<'gc> {
     /// yourself.
     pub fn from_domain(activation: &mut Activation<'_, 'gc>, domain: Domain<'gc>) -> Self {
         let class = activation.avm2().classes().application_domain;
-        let base = ScriptObjectData::new(class);
+        let base = ScriptObjectData::new(class, ObjectType::DomainObject);
         DomainObject(Gc::new(
             activation.gc(),
             DomainObjectData {

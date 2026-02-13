@@ -24,5 +24,5 @@ pub fn get_prototype<'gc>(
         return Ok(class.prototype().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

@@ -36,7 +36,7 @@ pub fn upload_from_byte_array<'gc>(
         side,
         mip_level,
     )?;
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn upload_compressed_texture_from_byte_array<'gc>(
@@ -73,11 +73,11 @@ pub fn upload_compressed_texture_from_byte_array<'gc>(
             "uploadCompressedTextureFromByteArray",
             "with unsupported format"
         );
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     }
 
     do_compressed_upload(activation, texture, data, byte_array_offset, true)?;
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn upload_from_bitmap_data<'gc>(
@@ -112,5 +112,5 @@ pub fn upload_from_bitmap_data<'gc>(
             unreachable!("Argument is BitmapData-typed");
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

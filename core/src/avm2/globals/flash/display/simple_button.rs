@@ -99,7 +99,7 @@ pub fn init<'gc>(
         unreachable!();
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `downState`'s getter.
@@ -117,10 +117,10 @@ pub fn get_down_state<'gc>(
         return Ok(btn
             .get_state_child(ButtonState::DOWN)
             .map(|state| state.object2_or_null())
-            .unwrap_or(Value::Null));
+            .unwrap_or(Value::NULL));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `downState`'s setter.
@@ -142,7 +142,7 @@ pub fn set_down_state<'gc>(
         btn.set_state_child(activation.context, ButtonState::DOWN, new_state);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `overState`'s getter.
@@ -160,10 +160,10 @@ pub fn get_over_state<'gc>(
         return Ok(btn
             .get_state_child(ButtonState::OVER)
             .map(|state| state.object2_or_null())
-            .unwrap_or(Value::Null));
+            .unwrap_or(Value::NULL));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `overState`'s setter.
@@ -185,7 +185,7 @@ pub fn set_over_state<'gc>(
         btn.set_state_child(activation.context, ButtonState::OVER, new_state);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `hitTestState`'s getter.
@@ -203,10 +203,10 @@ pub fn get_hit_test_state<'gc>(
         return Ok(btn
             .get_state_child(ButtonState::HIT_TEST)
             .map(|state| state.object2_or_null())
-            .unwrap_or(Value::Null));
+            .unwrap_or(Value::NULL));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `hitTestState`'s setter.
@@ -228,7 +228,7 @@ pub fn set_hit_test_state<'gc>(
         btn.set_state_child(activation.context, ButtonState::HIT_TEST, new_state);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `upState`'s getter.
@@ -246,10 +246,10 @@ pub fn get_up_state<'gc>(
         return Ok(btn
             .get_state_child(ButtonState::UP)
             .map(|state| state.object2_or_null())
-            .unwrap_or(Value::Null));
+            .unwrap_or(Value::NULL));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `upState`'s setter.
@@ -271,7 +271,7 @@ pub fn set_up_state<'gc>(
         btn.set_state_child(activation.context, ButtonState::UP, new_state);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `trackAsMenu`'s getter
@@ -289,7 +289,7 @@ pub fn get_track_as_menu<'gc>(
         return Ok((btn.button_tracking() == ButtonTracking::Menu).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `trackAsMenu`'s setter
@@ -310,7 +310,7 @@ pub fn set_track_as_menu<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `enabled`'s getter
@@ -328,7 +328,7 @@ pub fn get_enabled<'gc>(
         return Ok(btn.enabled().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `enabled`'s setter
@@ -346,7 +346,7 @@ pub fn set_enabled<'gc>(
         btn.set_enabled(activation.context, args.get_bool(0));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `useHandCursor`'s getter
@@ -364,7 +364,7 @@ pub fn get_use_hand_cursor<'gc>(
         return Ok(btn.use_hand_cursor().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `useHandCursor`'s setter
@@ -382,5 +382,5 @@ pub fn set_use_hand_cursor<'gc>(
         btn.set_use_hand_cursor(args.get_bool(0));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

@@ -15,7 +15,7 @@ pub fn object_constructor<'gc>(
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(arg) = args.get_optional(0) {
-        if !matches!(arg, Value::Undefined | Value::Null) {
+        if !arg.is_null_or_undefined() {
             return Ok(arg);
         }
     }
@@ -68,7 +68,7 @@ pub fn is_prototype_of<'gc>(
         let target_proto = args.get_value(0);
 
         // `null` and `undefined` have no prototype
-        if matches!(target_proto, Value::Undefined | Value::Null) {
+        if target_proto.is_null_or_undefined() {
             return Ok(false.into());
         }
 
@@ -127,5 +127,5 @@ pub fn _set_property_is_enumerable<'gc>(
         ));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

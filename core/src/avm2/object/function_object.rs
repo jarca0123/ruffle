@@ -5,7 +5,7 @@ use crate::avm2::activation::Activation;
 use crate::avm2::error::make_error_1064;
 use crate::avm2::function::{BoundMethod, FunctionArgs};
 use crate::avm2::method::Method;
-use crate::avm2::object::script_object::{ScriptObject, ScriptObjectData};
+use crate::avm2::object::script_object::{ObjectType, ScriptObject, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, TObject};
 use crate::avm2::scope::ScopeChain;
 use crate::avm2::value::Value;
@@ -73,7 +73,7 @@ impl<'gc> FunctionObject<'gc> {
         let function_object = FunctionObject(Gc::new(
             context.gc(),
             FunctionObjectData {
-                base: ScriptObjectData::new(fn_class),
+                base: ScriptObjectData::new(fn_class, ObjectType::FunctionObject),
                 exec,
                 prototype: Lock::new(Some(es3_proto)),
             },
@@ -132,7 +132,7 @@ impl<'gc> FunctionObject<'gc> {
 
         // If the constructor returns an object, use that instead of the created instance
         // TODO: avmplus returns null here if the constructor returns null
-        if let Value::Object(obj) = result {
+        if let Some(obj) = result.as_object() {
             Ok(obj)
         } else {
             Ok(instance)

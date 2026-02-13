@@ -108,12 +108,12 @@ impl<'gc> VectorStorage<'gc> {
     pub fn default(&self) -> Value<'gc> {
         if let Some(value_type) = self.value_type {
             if value_type.is_builtin_numeric() {
-                Value::Integer(0)
+                Value::from_integer(0)
             } else {
-                Value::Null
+                Value::NULL
             }
         } else {
-            Value::Null
+            Value::NULL
         }
     }
 
@@ -220,12 +220,12 @@ impl<'gc> VectorStorage<'gc> {
             Ok(v)
         } else if let Some(value_type) = self.value_type() {
             if value_type.is_builtin_numeric() {
-                Ok(Value::Integer(0))
+                Ok(Value::from_integer(0))
             } else {
-                Ok(Value::Undefined)
+                Ok(Value::UNDEFINED)
             }
         } else {
-            Ok(Value::Undefined)
+            Ok(Value::UNDEFINED)
         }
     }
 
@@ -262,12 +262,12 @@ impl<'gc> VectorStorage<'gc> {
             Ok(self.storage.remove(0))
         } else if let Some(value_type) = self.value_type() {
             if value_type.is_builtin_numeric() {
-                Ok(Value::Integer(0))
+                Ok(Value::from_integer(0))
             } else {
-                Ok(Value::Undefined)
+                Ok(Value::UNDEFINED)
             }
         } else {
-            Ok(Value::Undefined)
+            Ok(Value::UNDEFINED)
         }
     }
 

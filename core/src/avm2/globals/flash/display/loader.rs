@@ -13,7 +13,7 @@ use crate::avm2::object::LoaderInfoObject;
 use crate::avm2::object::LoaderStream;
 use crate::avm2::object::TObject as _;
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueKind};
 use crate::avm2::{Error, Object};
 use crate::avm2_stub_method;
 use crate::backend::navigator::{NavigationMethod, Request};
@@ -125,7 +125,7 @@ pub fn load<'gc>(
     );
     activation.context.navigator.spawn_future(future);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn request_from_url_request<'gc>(
@@ -135,9 +135,10 @@ pub fn request_from_url_request<'gc>(
     // FIXME: set `followRedirects`  and `userAgent`
     // from the `URLRequest`
 
-    let mut url = match url_request.get_slot(url_request_slots::_URL) {
-        Value::Null => return Err(make_error_2007(activation, "url")),
-        url => url.coerce_to_string(activation)?.to_string(),
+    let url_val = url_request.get_slot(url_request_slots::_URL);
+    let mut url = match url_val.kind() {
+        ValueKind::Null => return Err(make_error_2007(activation, "url")),
+        _ => url_val.coerce_to_string(activation)?.to_string(),
     };
 
     let method = url_request
@@ -179,9 +180,9 @@ pub fn request_from_url_request<'gc>(
     let mut method =
         NavigationMethod::from_method_str(&method).expect("URLRequest should have a valid method");
     let data = url_request.get_slot(url_request_slots::_DATA);
-    let body = match (method, data) {
-        (_, Value::Null | Value::Undefined) => None,
-        (NavigationMethod::Get, data) => {
+    let body = match (method, data.kind()) {
+        (_, ValueKind::Null | ValueKind::Undefined) => None,
+        (NavigationMethod::Get, _) => {
             // This looks "wrong" but it's Flash-correct.
             // It simply appends the data to the URL if there's already a query,
             // otherwise it adds ?data.
@@ -193,7 +194,7 @@ pub fn request_from_url_request<'gc>(
             url.push_str(&data.coerce_to_string(activation)?.to_string());
             None
         }
-        (NavigationMethod::Post, data) => {
+        (NavigationMethod::Post, _) => {
             let content_type = url_request
                 .get_slot(url_request_slots::_CONTENT_TYPE)
                 .coerce_to_string(activation)?
@@ -287,7 +288,7 @@ pub fn load_bytes<'gc>(
         ));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn unload<'gc>(
@@ -309,5 +310,5 @@ pub fn unload<'gc>(
 
     loader_info.unload(activation.context);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

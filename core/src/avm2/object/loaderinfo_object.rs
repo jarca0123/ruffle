@@ -1,7 +1,7 @@
 //! Loader-info object
 
 use crate::avm2::activation::Activation;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{EventObject, Object, StageObject, TObject};
 use crate::avm2::{Avm2, Error};
 use crate::context::UpdateContext;
@@ -113,7 +113,7 @@ impl<'gc> LoaderInfoObject<'gc> {
         is_stage: bool,
     ) -> Result<Self, Error<'gc>> {
         let class = activation.avm2().classes().loaderinfo;
-        let base = ScriptObjectData::new(class);
+        let base = ScriptObjectData::new(class, ObjectType::LoaderInfoObject);
 
         let object = LoaderInfoObject(Gc::new(
             activation.gc(),

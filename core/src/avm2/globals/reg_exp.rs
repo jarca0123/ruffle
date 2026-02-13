@@ -5,10 +5,10 @@ use ruffle_macros::istr;
 use crate::avm2::Error;
 use crate::avm2::activation::Activation;
 use crate::avm2::error::make_error_1100;
-use crate::avm2::object::{ArrayObject, Object, TObject as _};
+use crate::avm2::object::{ArrayObject, TObject as _};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::regexp::RegExpFlags;
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueKind};
 use crate::string::AvmString;
 
 pub use crate::avm2::object::reg_exp_allocator;
@@ -22,25 +22,29 @@ pub fn init<'gc>(
     let this = this.as_object().unwrap();
 
     if let Some(mut regexp) = this.as_regexp_mut(activation.gc()) {
-        let source: AvmString<'gc> = match args.get_value(0) {
-            Value::Undefined => istr!(""),
-            Value::Object(Object::RegExpObject(o)) => {
-                if !matches!(args.get_value(1), Value::Undefined) {
+        let arg0 = args.get_value(0);
+        let source: AvmString<'gc> = match arg0.kind() {
+            ValueKind::Undefined => istr!(""),
+            ValueKind::Object(o_obj) => {
+                let o = o_obj.as_regexp_object().unwrap();
+                if !args.get_value(1).is_undefined() {
                     return Err(make_error_1100(activation));
                 }
                 let other = o.regexp();
                 regexp.set_source(other.source());
                 regexp.set_flags(other.flags());
-                return Ok(Value::Undefined);
+                return Ok(Value::UNDEFINED);
             }
-            arg => arg.coerce_to_string(activation)?,
+            _ => arg0.coerce_to_string(activation)?,
         };
 
         regexp.set_source(source);
 
-        let flag_chars = match args.get_value(1) {
-            Value::Undefined => istr!(""),
-            arg => arg.coerce_to_string(activation)?,
+        let arg1 = args.get_value(1);
+        let flag_chars = if arg1.is_undefined() {
+            istr!("")
+        } else {
+            arg1.coerce_to_string(activation)?
         };
 
         let mut flags = RegExpFlags::empty();
@@ -58,7 +62,7 @@ pub fn init<'gc>(
         regexp.set_flags(flags);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn call_handler<'gc>(
@@ -88,7 +92,7 @@ pub fn get_dotall<'gc>(
         return Ok(regexp.flags().contains(RegExpFlags::DOTALL).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `RegExp.extended`
@@ -103,7 +107,7 @@ pub fn get_extended<'gc>(
         return Ok(regexp.flags().contains(RegExpFlags::EXTENDED).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `RegExp.global`
@@ -118,7 +122,7 @@ pub fn get_global<'gc>(
         return Ok(regexp.flags().contains(RegExpFlags::GLOBAL).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `RegExp.ignoreCase`
@@ -133,7 +137,7 @@ pub fn get_ignore_case<'gc>(
         return Ok(regexp.flags().contains(RegExpFlags::IGNORE_CASE).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `RegExp.multiline`
@@ -148,7 +152,7 @@ pub fn get_multiline<'gc>(
         return Ok(regexp.flags().contains(RegExpFlags::MULTILINE).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `RegExp.lastIndex`'s getter
@@ -163,7 +167,7 @@ pub fn get_last_index<'gc>(
         return Ok(re.last_index().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `RegExp.lastIndex`'s setter
@@ -180,7 +184,7 @@ pub fn set_last_index<'gc>(
         re.set_last_index(i as usize);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `RegExp.source`
@@ -195,7 +199,7 @@ pub fn get_source<'gc>(
         return Ok(re.source().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `RegExp.exec`
@@ -211,13 +215,13 @@ pub fn exec<'gc>(
 
         let matched = match re.exec(text) {
             Some(matched) => matched,
-            None => return Ok(Value::Null),
+            None => return Ok(Value::NULL),
         };
 
         let storage = matched
             .groups()
             .map(|range| {
-                range.map_or(Value::Undefined, |range| {
+                range.map_or(Value::UNDEFINED, |range| {
                     activation.strings().substring(text, range).into()
                 })
             })
@@ -239,7 +243,7 @@ pub fn exec<'gc>(
 
         object.set_dynamic_property(
             istr!("index"),
-            Value::Number(matched.start() as f64),
+            Value::from_f64(matched.start() as f64),
             activation.gc(),
         );
 
@@ -248,7 +252,7 @@ pub fn exec<'gc>(
         return Ok(object.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `RegExp.test`
@@ -264,5 +268,5 @@ pub fn test<'gc>(
         return Ok(re.test(text).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

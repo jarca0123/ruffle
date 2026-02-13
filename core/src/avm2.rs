@@ -102,7 +102,7 @@ pub use crate::avm2::object::{
     SharedObjectObject, SoundChannelObject, StageObject, TObject,
 };
 pub use crate::avm2::qname::QName;
-pub use crate::avm2::value::Value;
+pub use crate::avm2::value::{Value, ValueKind};
 
 use self::api_version::ApiVersion;
 use self::object::WeakObject;

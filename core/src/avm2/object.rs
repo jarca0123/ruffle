@@ -125,8 +125,8 @@ pub use crate::avm2::object::responder_object::{
     ResponderObject, ResponderObjectWeak, responder_allocator,
 };
 pub use crate::avm2::object::script_object::{
-    ScriptObject, ScriptObjectData, ScriptObjectHandle, ScriptObjectWeak, ScriptObjectWrapper,
-    get_dynamic_property, scriptobject_allocator,
+    ObjectType, ScriptObject, ScriptObjectData, ScriptObjectHandle, ScriptObjectWeak,
+    ScriptObjectWrapper, get_dynamic_property, scriptobject_allocator,
 };
 pub use crate::avm2::object::security_domain_object::{
     SecurityDomainObject, SecurityDomainObjectWeak,
@@ -166,13 +166,13 @@ pub use crate::avm2::object::xml_list_object::{
 pub use crate::avm2::object::xml_object::{XmlObject, XmlObjectWeak, xml_allocator};
 use crate::font::Font;
 
-/// Represents an object that can be directly interacted with by the AVM2
-/// runtime.
+/// Transient enum for pattern matching on object types. Created on demand
+/// via `Object::kind()`. Never stored — use `Object` for storage.
 #[enum_trait_object(
     #[expect(clippy::enum_variant_names)]
     #[derive(Clone, Collect, Debug, Copy)]
     #[collect(no_drop)]
-    pub enum Object<'gc> {
+    pub enum ObjectKind<'gc> {
         ScriptObject(ScriptObject<'gc>),
         FunctionObject(FunctionObject<'gc>),
         NamespaceObject(NamespaceObject<'gc>),
@@ -226,7 +226,6 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
     fn gc_base(&self) -> Gc<'gc, ScriptObjectData<'gc>>;
 
     #[inline(always)]
-    #[no_dynamic]
     fn base(&self) -> ScriptObjectWrapper<'gc> {
         let gc_base = self.gc_base();
         ScriptObjectWrapper(gc_base)
@@ -251,7 +250,6 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
     /// and always gets a dynamic property on the base ScriptObject. If the
     /// object is sealed, or the dynamic property does not exist on the
     /// ScriptObject, this returns `None`.
-    #[no_dynamic]
     fn get_dynamic_property(self, local_name: AvmString<'gc>) -> Option<Value<'gc>> {
         use crate::avm2::object::script_object::maybe_int_property;
 
@@ -296,7 +294,6 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
     /// in it, this method will still declare a dynamic property on the object
     /// with the same name, so take care to only call this method on objects
     /// that are known to not have the property `local_name` in their vtable.
-    #[no_dynamic]
     fn set_dynamic_property(
         self,
         local_name: AvmString<'gc>,
@@ -385,7 +382,6 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
     ///
     /// This method will panic when called on a non-dynamic (sealed) object, as
     /// sealed objects don't have dynamic properties to delete anyway.
-    #[no_dynamic]
     fn delete_dynamic_property(self, name: AvmString<'gc>, mc: &Mutation<'gc>) {
         use crate::avm2::object::script_object::maybe_int_property;
 
@@ -397,7 +393,6 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
     }
 
     /// Retrieve a slot by its index.
-    #[no_dynamic]
     #[inline(always)]
     fn get_slot(self, id: u32) -> Value<'gc> {
         let base = self.base();
@@ -406,7 +401,6 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
     }
 
     /// Set a slot by its index.
-    #[no_dynamic]
     fn set_slot(
         self,
         id: u32,
@@ -421,7 +415,6 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
         Ok(())
     }
 
-    #[no_dynamic]
     fn set_slot_no_coerce(self, id: u32, value: Value<'gc>, mc: &Mutation<'gc>) {
         let base = self.base();
 
@@ -441,7 +434,6 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
     }
 
     /// Indicates whether or not a property exists on an object.
-    #[no_dynamic]
     fn has_property(self, name: &Multiname<'gc>) -> bool {
         if self.has_own_property(name) {
             true
@@ -471,7 +463,6 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
     }
 
     /// Returns true if an object has one or more traits of a given name.
-    #[no_dynamic]
     fn has_trait(self, name: &Multiname<'gc>) -> bool {
         self.vtable().has_trait(name)
     }
@@ -481,7 +472,6 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
     /// The proto is another object used to resolve methods across a class of
     /// multiple objects. It should also be accessible as `__proto__` from
     /// `get`.
-    #[no_dynamic]
     fn proto(&self) -> Option<Object<'gc>> {
         let base = self.base();
 
@@ -493,7 +483,6 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
     /// This method primarily exists so that the global scope that player
     /// globals loads into can be created before its superclasses are. It
     /// should be used sparingly, if at all.
-    #[no_dynamic]
     fn set_proto(self, mc: &Mutation<'gc>, proto: Object<'gc>) {
         let base = self.base();
 
@@ -534,7 +523,7 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
     ) -> Result<Value<'gc>, Error<'gc>> {
         let base = self.base();
 
-        Ok(base.get_enumerant_name(index).unwrap_or(Value::Null))
+        Ok(base.get_enumerant_name(index).unwrap_or(Value::NULL))
     }
 
     /// Retrieve a given enumerable value by index.
@@ -576,7 +565,6 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
     }
 
     /// Install a bound method on an object.
-    #[no_dynamic]
     fn install_bound_method(
         &self,
         mc: &Mutation<'gc>,
@@ -639,7 +627,6 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
     /// This includes normal fields, const fields, and getter methods
     /// This is used for JSON serialization.
     // FIXME - the order doesn't currently match Flash Player
-    #[no_dynamic]
     fn public_vtable_properties(
         &self,
         activation: &mut Activation<'_, 'gc>,
@@ -653,7 +640,7 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
                     values.push((name, self.base().get_slot(slot_id)));
                 }
                 Property::Virtual { get: Some(get), .. } => {
-                    values.push((name, Value::from(*self).call_method(get, &[], activation)?))
+                    values.push((name, Value::from((*self).into()).call_method(get, &[], activation)?))
                 }
                 _ => {}
             }
@@ -670,13 +657,11 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
     ///
     /// The given object should be the class object for the given type we are
     /// checking against this object.
-    #[no_dynamic]
     fn is_of_type(&self, test_class: Class<'gc>) -> bool {
         self.instance_class().has_class_in_chain(test_class)
     }
 
     #[inline(always)]
-    #[no_dynamic]
     /// Get a raw pointer value for this object.
     fn as_ptr(&self) -> *const ObjectPtr {
         Gc::as_ptr(self.gc_base()).cast()
@@ -684,33 +669,28 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
 
     /// Get this object's vtable, if it has one.
     /// Every object with class should have a vtable
-    #[no_dynamic]
     fn vtable(&self) -> VTable<'gc> {
         let base = self.base();
         base.vtable()
     }
 
-    #[no_dynamic]
     fn get_bound_method(&self, id: u32) -> Option<FunctionObject<'gc>> {
         let base = self.base();
         base.get_bound_method(id)
     }
 
     /// Get this object's class's `Class`, if it has one.
-    #[no_dynamic]
     fn instance_class(&self) -> Class<'gc> {
         let base = self.base();
         base.instance_class()
     }
 
     /// Get this object's class's name, formatted for debug output.
-    #[no_dynamic]
     fn instance_of_class_name(&self, mc: &Mutation<'gc>) -> AvmString<'gc> {
         self.instance_class().name().to_qualified_name(mc)
     }
 
     // Sets a different vtable for object, without changing instance_of.
-    #[no_dynamic]
     fn set_vtable(&self, mc: &Mutation<'gc>, vtable: VTable<'gc>) {
         let base = self.base();
         base.set_vtable(mc, vtable);
@@ -727,6 +707,219 @@ pub trait TObject<'gc>: 'gc + Collect<'gc> + Debug + Into<Object<'gc>> + Clone +
 
 pub enum ObjectPtr {}
 
+// --- Thin Object wrapper (8 bytes) ---
+
+/// An AVM2 object. This is a thin wrapper around a GC pointer to
+/// `ScriptObjectData`, with the concrete type discriminant stored inside
+/// the `ScriptObjectData` itself (as `ObjectType`).
+///
+/// Use `obj.kind()` to pattern-match on the concrete type.
+#[derive(Clone, Copy, Collect)]
+#[collect(no_drop)]
+#[repr(transparent)]
+pub struct Object<'gc>(Gc<'gc, ScriptObjectData<'gc>>);
+
+const _: () = assert!(std::mem::size_of::<Object<'_>>() == 8);
+
+impl Debug for Object<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Object")
+            .field("ptr", &Gc::as_ptr(self.0))
+            .field("type", &self.0.object_type())
+            .finish()
+    }
+}
+
+/// Implement `From<ConcreteType> for Object` for all 45 concrete object types.
+macro_rules! impl_from_concrete_for_object {
+    ($($variant:ident),* $(,)?) => {
+        $(
+            impl<'gc> From<$variant<'gc>> for Object<'gc> {
+                #[inline(always)]
+                fn from(obj: $variant<'gc>) -> Self {
+                    Object(obj.gc_base())
+                }
+            }
+        )*
+    }
+}
+
+impl_from_concrete_for_object!(
+    ScriptObject, FunctionObject, NamespaceObject, ArrayObject,
+    StageObject, DomainObject, EventObject, DispatchObject,
+    XmlObject, XmlListObject, RegExpObject, ByteArrayObject,
+    LoaderInfoObject, ClassObject, VectorObject, SoundObject,
+    SoundChannelObject, BitmapDataObject, DateObject, DictionaryObject,
+    QNameObject, TextFormatObject, ProxyObject, ErrorObject,
+    Stage3DObject, Context3DObject, IndexBuffer3DObject, VertexBuffer3DObject,
+    TextureObject, Program3DObject, NetStreamObject, NetConnectionObject,
+    ResponderObject, ShaderDataObject, SocketObject, FileReferenceObject,
+    FontObject, LocalConnectionObject, SharedObjectObject, SoundTransformObject,
+    StyleSheetObject, WorkerObject, WorkerDomainObject, MessageChannelObject,
+    SecurityDomainObject,
+);
+
+impl<'gc> From<ObjectKind<'gc>> for Object<'gc> {
+    #[inline(always)]
+    fn from(kind: ObjectKind<'gc>) -> Self {
+        Object(kind.gc_base())
+    }
+}
+
+impl<'gc> Object<'gc> {
+    /// Expose the inner `Gc` pointer for NaN-box encoding.
+    #[inline(always)]
+    pub fn as_gc(self) -> Gc<'gc, ScriptObjectData<'gc>> {
+        self.0
+    }
+
+    /// Reconstruct an `Object` from a raw `Gc` pointer.
+    #[inline(always)]
+    pub unsafe fn from_gc(gc: Gc<'gc, ScriptObjectData<'gc>>) -> Self {
+        Object(gc)
+    }
+
+    /// Decode the `ObjectType` tag and return the concrete type wrapped
+    /// in the transient `ObjectKind` enum for pattern matching.
+    #[inline]
+    pub fn kind(self) -> ObjectKind<'gc> {
+        use script_object::ObjectType;
+        match self.0.object_type() {
+            ObjectType::ScriptObject => ObjectKind::ScriptObject(ScriptObject(self.0)),
+            ObjectType::FunctionObject => ObjectKind::FunctionObject(FunctionObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::NamespaceObject => ObjectKind::NamespaceObject(NamespaceObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::ArrayObject => ObjectKind::ArrayObject(ArrayObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::StageObject => ObjectKind::StageObject(StageObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::DomainObject => ObjectKind::DomainObject(DomainObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::EventObject => ObjectKind::EventObject(EventObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::DispatchObject => ObjectKind::DispatchObject(DispatchObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::XmlObject => ObjectKind::XmlObject(XmlObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::XmlListObject => ObjectKind::XmlListObject(XmlListObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::RegExpObject => ObjectKind::RegExpObject(RegExpObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::ByteArrayObject => ObjectKind::ByteArrayObject(ByteArrayObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::LoaderInfoObject => ObjectKind::LoaderInfoObject(LoaderInfoObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::ClassObject => ObjectKind::ClassObject(ClassObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::VectorObject => ObjectKind::VectorObject(VectorObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::SoundObject => ObjectKind::SoundObject(SoundObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::SoundChannelObject => ObjectKind::SoundChannelObject(SoundChannelObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::BitmapDataObject => ObjectKind::BitmapDataObject(BitmapDataObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::DateObject => ObjectKind::DateObject(DateObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::DictionaryObject => ObjectKind::DictionaryObject(DictionaryObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::QNameObject => ObjectKind::QNameObject(QNameObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::TextFormatObject => ObjectKind::TextFormatObject(TextFormatObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::ProxyObject => ObjectKind::ProxyObject(ProxyObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::ErrorObject => ObjectKind::ErrorObject(ErrorObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::Stage3DObject => ObjectKind::Stage3DObject(Stage3DObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::Context3DObject => ObjectKind::Context3DObject(Context3DObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::IndexBuffer3DObject => ObjectKind::IndexBuffer3DObject(IndexBuffer3DObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::VertexBuffer3DObject => ObjectKind::VertexBuffer3DObject(VertexBuffer3DObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::TextureObject => ObjectKind::TextureObject(TextureObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::Program3DObject => ObjectKind::Program3DObject(Program3DObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::NetStreamObject => ObjectKind::NetStreamObject(NetStreamObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::NetConnectionObject => ObjectKind::NetConnectionObject(NetConnectionObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::ResponderObject => ObjectKind::ResponderObject(ResponderObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::ShaderDataObject => ObjectKind::ShaderDataObject(ShaderDataObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::SocketObject => ObjectKind::SocketObject(SocketObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::FileReferenceObject => ObjectKind::FileReferenceObject(FileReferenceObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::FontObject => ObjectKind::FontObject(FontObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::LocalConnectionObject => ObjectKind::LocalConnectionObject(LocalConnectionObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::SharedObjectObject => ObjectKind::SharedObjectObject(SharedObjectObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::SoundTransformObject => ObjectKind::SoundTransformObject(SoundTransformObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::StyleSheetObject => ObjectKind::StyleSheetObject(StyleSheetObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::WorkerObject => ObjectKind::WorkerObject(WorkerObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::WorkerDomainObject => ObjectKind::WorkerDomainObject(WorkerDomainObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::MessageChannelObject => ObjectKind::MessageChannelObject(MessageChannelObject(unsafe { Gc::cast(self.0) })),
+            ObjectType::SecurityDomainObject => ObjectKind::SecurityDomainObject(SecurityDomainObject(unsafe { Gc::cast(self.0) })),
+        }
+    }
+}
+
+/// TObject implementation for the thin Object wrapper.
+/// Non-overridden methods use trait defaults (which call `gc_base()`).
+/// Dynamic-dispatch methods delegate through `kind()`.
+impl<'gc> TObject<'gc> for Object<'gc> {
+    fn gc_base(&self) -> Gc<'gc, ScriptObjectData<'gc>> {
+        self.0
+    }
+
+    fn get_property_local(self, name: &Multiname<'gc>, activation: &mut Activation<'_, 'gc>) -> Result<Value<'gc>, Error<'gc>> {
+        self.kind().get_property_local(name, activation)
+    }
+
+    fn get_index_property(self, index: usize) -> Option<Value<'gc>> {
+        self.kind().get_index_property(index)
+    }
+
+    fn set_property_local(self, name: &Multiname<'gc>, value: Value<'gc>, activation: &mut Activation<'_, 'gc>) -> Result<(), Error<'gc>> {
+        self.kind().set_property_local(name, value, activation)
+    }
+
+    fn set_index_property(self, activation: &mut Activation<'_, 'gc>, index: usize, value: Value<'gc>) -> Option<Result<(), Error<'gc>>> {
+        self.kind().set_index_property(activation, index, value)
+    }
+
+    fn init_property_local(self, name: &Multiname<'gc>, value: Value<'gc>, activation: &mut Activation<'_, 'gc>) -> Result<(), Error<'gc>> {
+        self.kind().init_property_local(name, value, activation)
+    }
+
+    fn call_property_local(self, multiname: &Multiname<'gc>, arguments: FunctionArgs<'_, 'gc>, activation: &mut Activation<'_, 'gc>) -> Result<Value<'gc>, Error<'gc>> {
+        self.kind().call_property_local(multiname, arguments, activation)
+    }
+
+    fn delete_property_local(self, activation: &mut Activation<'_, 'gc>, name: &Multiname<'gc>) -> Result<bool, Error<'gc>> {
+        self.kind().delete_property_local(activation, name)
+    }
+
+    fn has_property_via_in(self, activation: &mut Activation<'_, 'gc>, name: &Multiname<'gc>) -> Result<bool, Error<'gc>> {
+        self.kind().has_property_via_in(activation, name)
+    }
+
+    fn has_own_property(self, name: &Multiname<'gc>) -> bool {
+        self.kind().has_own_property(name)
+    }
+
+    fn has_own_property_string(self, name: AvmString<'gc>, activation: &mut Activation<'_, 'gc>) -> Result<bool, Error<'gc>> {
+        self.kind().has_own_property_string(name, activation)
+    }
+
+    fn get_next_enumerant(self, last_index: u32, activation: &mut Activation<'_, 'gc>) -> Result<u32, Error<'gc>> {
+        self.kind().get_next_enumerant(last_index, activation)
+    }
+
+    fn get_enumerant_name(self, index: u32, activation: &mut Activation<'_, 'gc>) -> Result<Value<'gc>, Error<'gc>> {
+        self.kind().get_enumerant_name(index, activation)
+    }
+
+    fn get_enumerant_value(self, index: u32, activation: &mut Activation<'_, 'gc>) -> Result<Value<'gc>, Error<'gc>> {
+        self.kind().get_enumerant_value(index, activation)
+    }
+
+    fn property_is_enumerable(&self, name: AvmString<'gc>) -> bool {
+        self.kind().property_is_enumerable(name)
+    }
+
+    fn set_local_property_is_enumerable(&self, mc: &Mutation<'gc>, name: AvmString<'gc>, is_enumerable: bool) {
+        self.kind().set_local_property_is_enumerable(mc, name, is_enumerable)
+    }
+
+    fn apply(&self, activation: &mut Activation<'_, 'gc>, params: &[Value<'gc>]) -> Result<ClassObject<'gc>, Error<'gc>> {
+        self.kind().apply(activation, params)
+    }
+
+    fn default_hint(&self) -> Hint {
+        self.kind().default_hint()
+    }
+
+    fn to_string(&self, mc: &Mutation<'gc>) -> AvmString<'gc> {
+        self.kind().to_string(mc)
+    }
+
+    fn xml_descendants(&self, activation: &mut Activation<'_, 'gc>, multiname: &Multiname<'gc>) -> Option<XmlListObject<'gc>> {
+        self.kind().xml_descendants(activation, multiname)
+    }
+}
+
+/// Downcast methods for Object — check the ObjectType tag and unsafe-cast.
 macro_rules! impl_downcast_methods {
     ($(
         $vis:vis fn $fn_name:ident for $variant:ident;
@@ -734,8 +927,8 @@ macro_rules! impl_downcast_methods {
         #[doc = concat!("Downcast this object as a `", stringify!($variant), "`.")]
         #[inline(always)]
         $vis fn $fn_name(self) -> Option<$variant<'gc>> {
-            if let Self::$variant(obj) = self {
-                Some(obj)
+            if self.0.object_type() == ObjectType::$variant {
+                Some($variant(unsafe { Gc::cast(self.0) }))
             } else {
                 None
             }
@@ -890,6 +1083,11 @@ impl<'gc> Object<'gc> {
     pub fn as_netstream(self) -> Option<NetStream<'gc>> {
         self.as_netstream_object().map(|o| o.netstream())
     }
+
+    /// Downgrade this Object to a WeakObject.
+    pub fn downgrade(self) -> WeakObject<'gc> {
+        self.kind().downgrade()
+    }
 }
 
 impl PartialEq for Object<'_> {
@@ -925,9 +1123,9 @@ macro_rules! define_weak_enum {
                 }
             }
 
-            $vis fn upgrade(self, mc: &Mutation<'gc>) -> Option<$strong_enum<'gc>> {
+            $vis fn upgrade(self, mc: &Mutation<'gc>) -> Option<Object<'gc>> {
                 match self {
-                    $( Self::$variant(o) => $strong_enum::$variant($variant(o.0.upgrade(mc)?)).into(), )*
+                    $( Self::$variant(o) => Some(Object($variant(o.0.upgrade(mc)?).gc_base())), )*
                 }
             }
         }
@@ -946,7 +1144,7 @@ define_weak_enum! {
     #[expect(clippy::enum_variant_names)]
     #[derive(Clone, Collect, Debug, Copy)]
     #[collect(no_drop)]
-    pub enum WeakObject<'gc> for Object<'gc> {
+    pub enum WeakObject<'gc> for ObjectKind<'gc> {
         ScriptObject(ScriptObjectWeak<'gc>),
         FunctionObject(FunctionObjectWeak<'gc>),
         NamespaceObject(NamespaceObjectWeak<'gc>),

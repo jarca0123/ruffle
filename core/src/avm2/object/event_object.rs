@@ -3,7 +3,7 @@
 use crate::avm2::Error;
 use crate::avm2::activation::Activation;
 use crate::avm2::events::Event;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, ScriptObject, TObject};
 use crate::avm2::value::Value;
 use crate::context::UpdateContext;
@@ -23,7 +23,7 @@ pub fn event_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::EventObject);
 
     Ok(EventObject(Gc::new(
         activation.gc(),
@@ -76,7 +76,7 @@ impl<'gc> EventObject<'gc> {
         cancelable: bool,
     ) -> EventObject<'gc> {
         let class = context.avm2.classes().event;
-        let base = ScriptObjectData::new(class);
+        let base = ScriptObjectData::new(class, ObjectType::EventObject);
 
         let event_type = AvmString::new_utf8(context.gc(), event_type);
 
@@ -138,7 +138,7 @@ impl<'gc> EventObject<'gc> {
                 // relatedObject
                 related_object
                     .map(|o| o.as_displayobject().object2_or_null())
-                    .unwrap_or(Value::Null),
+                    .unwrap_or(Value::NULL),
                 // ctrlKey
                 activation
                     .context
@@ -236,7 +236,7 @@ impl<'gc> EventObject<'gc> {
             let key = AvmString::new_utf8(activation.gc(), key);
             let value = AvmString::new_utf8(activation.gc(), value);
 
-            info_object.set_dynamic_property(key, Value::String(value), activation.gc());
+            info_object.set_dynamic_property(key, Value::from_string(value), activation.gc());
         }
 
         let event_name = istr!("netStatus");
@@ -303,7 +303,7 @@ impl<'gc> EventObject<'gc> {
                 cancelable.into(),
                 related_object
                     .map(|o| o.as_displayobject().object2_or_null())
-                    .unwrap_or(Value::Null),
+                    .unwrap_or(Value::NULL),
                 shift_key.into(),
                 key_code.into(),
                 none_string.into(), // TODO implement direction

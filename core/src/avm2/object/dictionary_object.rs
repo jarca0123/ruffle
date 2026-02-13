@@ -3,7 +3,7 @@
 use crate::avm2::Error;
 use crate::avm2::activation::Activation;
 use crate::avm2::dynamic_map::DynamicKey;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, TObject};
 use crate::avm2::value::Value;
 use crate::string::AvmString;
@@ -16,7 +16,7 @@ pub fn dictionary_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::DictionaryObject);
 
     Ok(DictionaryObject(Gc::new(activation.gc(), DictionaryObjectData { base })).into())
 }
@@ -59,7 +59,7 @@ impl<'gc> DictionaryObject<'gc> {
             .get(&DynamicKey::Object(name))
             .cloned()
             .map(|v| v.value)
-            .unwrap_or(Value::Undefined)
+            .unwrap_or(Value::UNDEFINED)
     }
 
     /// Set a value in the dictionary's object space.
@@ -107,6 +107,6 @@ impl<'gc> TObject<'gc> for DictionaryObject<'gc> {
             .base()
             .values()
             .value_at(index as usize)
-            .unwrap_or(&Value::Undefined))
+            .unwrap_or(&Value::UNDEFINED))
     }
 }

@@ -22,7 +22,7 @@ pub fn stop<'gc>(
         this.set_slot(slots::_TIMER_ID, (-1).into(), activation)?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Timer.start`
@@ -57,7 +57,7 @@ pub fn start<'gc>(
         );
         this.set_slot(slots::_TIMER_ID, id.into(), activation)?;
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Timer.updateDelay`
@@ -75,5 +75,5 @@ pub fn update_delay<'gc>(
     if id != -1 {
         activation.context.timers.set_delay(id, delay);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

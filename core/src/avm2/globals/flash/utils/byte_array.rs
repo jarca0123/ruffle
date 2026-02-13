@@ -43,7 +43,7 @@ pub fn set_default_object_encoding<'gc>(
     };
     activation.avm2().default_bytearray_encoding = encoding;
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Writes a single byte to the bytearray
@@ -61,7 +61,7 @@ pub fn write_byte<'gc>(
             .map_err(|e| e.to_avm(activation))?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Writes multiple bytes to the bytearray from another bytearray
@@ -113,7 +113,7 @@ pub fn write_bytes<'gc>(
             .map_err(|e| e.to_avm(activation))?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 // Reads the bytes from the current bytearray into another bytearray
@@ -161,7 +161,7 @@ pub fn read_bytes<'gc>(
             .map_err(|e| e.to_avm(activation))?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 pub fn write_utf<'gc>(
     activation: &mut Activation<'_, 'gc>,
@@ -182,7 +182,7 @@ pub fn write_utf<'gc>(
             .map_err(|e| e.to_avm(activation))?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_utf<'gc>(
@@ -200,7 +200,7 @@ pub fn read_utf<'gc>(
         .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn strip_bom<'gc>(activation: &mut Activation<'_, 'gc>, mut bytes: &[u8]) -> AvmString<'gc> {
@@ -237,7 +237,7 @@ pub fn to_string<'gc>(
         return Ok(strip_bom(activation, bytearray.bytes()).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn clear<'gc>(
@@ -252,7 +252,7 @@ pub fn clear<'gc>(
         bytearray.shrink_to_fit();
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_position<'gc>(
@@ -266,7 +266,7 @@ pub fn get_position<'gc>(
         return Ok(bytearray.position().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_position<'gc>(
@@ -281,7 +281,7 @@ pub fn set_position<'gc>(
         bytearray.set_position(num as usize);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_bytes_available<'gc>(
@@ -295,7 +295,7 @@ pub fn get_bytes_available<'gc>(
         return Ok(bytearray.bytes_available().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_length<'gc>(
@@ -309,7 +309,7 @@ pub fn get_length<'gc>(
         return Ok(bytearray.len().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_length<'gc>(
@@ -324,7 +324,7 @@ pub fn set_length<'gc>(
         bytearray.set_length(len);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_endian<'gc>(
@@ -341,7 +341,7 @@ pub fn get_endian<'gc>(
         });
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_endian<'gc>(
@@ -362,7 +362,7 @@ pub fn set_endian<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_short<'gc>(
@@ -379,7 +379,7 @@ pub fn read_short<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_unsigned_short<'gc>(
@@ -396,7 +396,7 @@ pub fn read_unsigned_short<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_double<'gc>(
@@ -413,7 +413,7 @@ pub fn read_double<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_float<'gc>(
@@ -430,7 +430,7 @@ pub fn read_float<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_int<'gc>(
@@ -447,7 +447,7 @@ pub fn read_int<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_unsigned_int<'gc>(
@@ -464,7 +464,7 @@ pub fn read_unsigned_int<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_boolean<'gc>(
@@ -481,7 +481,7 @@ pub fn read_boolean<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_byte<'gc>(
@@ -498,7 +498,7 @@ pub fn read_byte<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_utf_bytes<'gc>(
@@ -519,7 +519,7 @@ pub fn read_utf_bytes<'gc>(
         .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_unsigned_byte<'gc>(
@@ -536,7 +536,7 @@ pub fn read_unsigned_byte<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_float<'gc>(
@@ -553,7 +553,7 @@ pub fn write_float<'gc>(
             .map_err(|e| e.to_avm(activation))?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_double<'gc>(
@@ -570,7 +570,7 @@ pub fn write_double<'gc>(
             .map_err(|e| e.to_avm(activation))?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_boolean<'gc>(
@@ -587,7 +587,7 @@ pub fn write_boolean<'gc>(
             .map_err(|e| e.to_avm(activation))?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_int<'gc>(
@@ -602,7 +602,7 @@ pub fn write_int<'gc>(
         bytearray.write_int(num).map_err(|e| e.to_avm(activation))?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_unsigned_int<'gc>(
@@ -619,7 +619,7 @@ pub fn write_unsigned_int<'gc>(
             .map_err(|e| e.to_avm(activation))?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_short<'gc>(
@@ -636,7 +636,7 @@ pub fn write_short<'gc>(
             .map_err(|e| e.to_avm(activation))?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_multi_byte<'gc>(
@@ -658,7 +658,7 @@ pub fn write_multi_byte<'gc>(
             .map_err(|e| e.to_avm(activation))?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_multi_byte<'gc>(
@@ -687,7 +687,7 @@ pub fn read_multi_byte<'gc>(
         return Ok(AvmString::new_utf8(activation.gc(), decoded_str).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_utf_bytes<'gc>(
@@ -704,7 +704,7 @@ pub fn write_utf_bytes<'gc>(
             .map_err(|e| e.to_avm(activation))?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn compress<'gc>(
@@ -728,7 +728,7 @@ pub fn compress<'gc>(
         bytearray.set_position(bytearray.len());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn uncompress<'gc>(
@@ -755,7 +755,7 @@ pub fn uncompress<'gc>(
         bytearray.set_position(0);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_object<'gc>(
@@ -797,7 +797,7 @@ pub fn read_object<'gc>(
         return Ok(value);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_object<'gc>(
@@ -840,7 +840,7 @@ pub fn write_object<'gc>(
             .map_err(|e| e.to_avm(activation))?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_object_encoding<'gc>(
@@ -854,7 +854,7 @@ pub fn get_object_encoding<'gc>(
         return Ok((bytearray.object_encoding() as u8).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_object_encoding<'gc>(
@@ -873,5 +873,5 @@ pub fn set_object_encoding<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

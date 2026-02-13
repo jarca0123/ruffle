@@ -54,7 +54,7 @@ pub fn set_align<'gc>(
         .context
         .stage
         .set_align(activation.context, align);
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `browserZoomFactor`'s getter
@@ -78,7 +78,7 @@ pub fn get_browser_zoom_factor<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `color`'s getter
@@ -94,7 +94,7 @@ pub fn get_color<'gc>(
         return Ok(color.to_rgba().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `color`'s setter
@@ -110,7 +110,7 @@ pub fn set_color<'gc>(
         dobj.set_background_color(Some(color));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `contentsScaleFactor`'s getter
@@ -134,7 +134,7 @@ pub fn get_contents_scale_factor<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `displayState`'s getter
@@ -169,7 +169,7 @@ pub fn set_display_state<'gc>(
     } else {
         return Err(make_error_2008(activation, "displayState"));
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `focus`'s getter
@@ -184,7 +184,7 @@ pub fn get_focus<'gc>(
         .get()
         .map(|o| o.as_displayobject())
         .map(|focus_dobj| focus_dobj.object2_or_null())
-        .unwrap_or(Value::Null))
+        .unwrap_or(Value::NULL))
 }
 
 /// Implement `focus`'s setter
@@ -206,7 +206,7 @@ pub fn set_focus<'gc>(
         }
     };
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `frameRate`'s getter
@@ -234,7 +234,7 @@ pub fn set_frame_rate<'gc>(
         *activation.context.frame_rate = new_frame_rate;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_show_default_context_menu<'gc>(
@@ -255,7 +255,7 @@ pub fn set_show_default_context_menu<'gc>(
         .context
         .stage
         .set_show_menu(show_default_context_menu);
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `scaleMode`'s getter
@@ -285,7 +285,7 @@ pub fn set_scale_mode<'gc>(
     } else {
         return Err(make_error_2008(activation, "scaleMode"));
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `stageFocusRect`'s getter
@@ -300,7 +300,7 @@ pub fn get_stage_focus_rect<'gc>(
         return Ok(dobj.stage_focus_rect().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `stageFocusRect`'s setter
@@ -316,7 +316,7 @@ pub fn set_stage_focus_rect<'gc>(
         dobj.set_stage_focus_rect(rf);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `stageWidth`'s getter
@@ -331,7 +331,7 @@ pub fn get_stage_width<'gc>(
         return Ok(dobj.stage_size().0.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `stageWidth`'s setter
@@ -341,7 +341,7 @@ pub fn set_stage_width<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     // For some reason this value is settable but it does nothing.
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `stageHeight`'s getter
@@ -356,7 +356,7 @@ pub fn get_stage_height<'gc>(
         return Ok(dobj.stage_size().1.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `stageHeight`'s setter
@@ -366,7 +366,7 @@ pub fn set_stage_height<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     // For some reason this value is settable but it does nothing.
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `allowsFullScreen`'s getter
@@ -416,7 +416,7 @@ pub fn set_quality<'gc>(
             .stage
             .set_quality(activation.context, quality);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `stage3Ds`'s getter
@@ -432,7 +432,7 @@ pub fn get_stage3ds<'gc>(
             stage
                 .stage3ds()
                 .iter()
-                .map(|obj| Value::Object(*obj))
+                .map(|obj| Value::from_object(*obj))
                 .collect(),
             false,
             Some(activation.avm2().classes().stage3d.inner_class_definition()),
@@ -440,7 +440,7 @@ pub fn get_stage3ds<'gc>(
         let stage3ds = VectorObject::from_vector(storage, activation);
         return Ok(stage3ds.into());
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `invalidate`
@@ -454,7 +454,7 @@ pub fn invalidate<'gc>(
     if let Some(stage) = this.as_display_object().and_then(|this| this.as_stage()) {
         stage.set_invalidated(true);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Stage.fullScreenHeight's getter
@@ -498,5 +498,5 @@ pub fn set_tab_children<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

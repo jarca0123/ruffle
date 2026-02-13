@@ -4,7 +4,7 @@ use crate::avm2::globals::slots::flash_ui_context_menu as menu_slots;
 use crate::avm2::globals::slots::flash_ui_context_menu_built_in_items as builtins_slots;
 use crate::avm2::globals::slots::flash_ui_context_menu_item as item_slots;
 use crate::avm2::object::{Object, TObject as _};
-use crate::avm2::value::Value;
+use crate::avm2::value::ValueKind;
 use crate::context_menu;
 use crate::display_object::DisplayObject;
 
@@ -19,7 +19,7 @@ pub fn make_context_menu_state<'gc>(
 
     macro_rules! check_bool {
         ( $obj:expr, $slot:expr, $value:expr ) => {
-            matches!($obj.get_slot($slot), Value::Bool($value))
+            matches!($obj.get_slot($slot).kind(), ValueKind::Bool($value))
         };
     }
 
@@ -53,7 +53,7 @@ pub fn make_context_menu_state<'gc>(
     result.build_builtin_items(builtin_items, activation.context);
 
     if let Some(menu) = menu {
-        if let Value::Object(custom_items) = menu.get_slot(menu_slots::_CUSTOM_ITEMS) {
+        if let Some(custom_items) = menu.get_slot(menu_slots::_CUSTOM_ITEMS).as_object() {
             // note: this borrows the array, but it shouldn't be possible for
             // AS to get invoked here and cause BorrowMutError
             if let Some(array) = custom_items.as_array_storage() {
@@ -62,10 +62,10 @@ pub fn make_context_menu_state<'gc>(
                 for (i, item) in array.iter().enumerate() {
                     // TODO: Non-CustomMenuItem Object-s shouldn't count
 
-                    if let Some(Value::Object(item)) = item {
+                    if let Some(item) = item.and_then(|v| v.as_object()) {
                         if item.is_of_type(context_menu_item_class) {
                             let caption =
-                                if let Value::String(s) = item.get_slot(item_slots::_CAPTION) {
+                                if let Some(s) = item.get_slot(item_slots::_CAPTION).as_string() {
                                     s
                                 } else {
                                     continue;

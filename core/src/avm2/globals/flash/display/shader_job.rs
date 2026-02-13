@@ -351,7 +351,7 @@ pub fn start<'gc>(
             } else if let Some(mut vector) = target.as_vector_storage_mut(activation.gc()) {
                 let new_values = bytemuck::cast_slice::<u8, f32>(&pixels)
                     .iter()
-                    .map(|p| Value::from(*p as f64));
+                    .map(|p| Value::from_f64(*p as f64));
                 vector.replace_storage_with_iter(new_values);
             } else {
                 panic!("Unexpected target object {target:?}");
@@ -359,5 +359,5 @@ pub fn start<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

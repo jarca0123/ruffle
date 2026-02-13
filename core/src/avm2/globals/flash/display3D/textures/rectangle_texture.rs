@@ -17,7 +17,7 @@ pub fn upload_from_byte_array<'gc>(
     let byte_array_offset = args.get_u32(1);
 
     do_copy(activation, data, texture, byte_array_offset, 0, 0)?;
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn upload_from_bitmap_data<'gc>(
@@ -40,5 +40,5 @@ pub fn upload_from_bitmap_data<'gc>(
             unreachable!("Argument is BitmapData-typed");
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

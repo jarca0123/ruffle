@@ -12,7 +12,7 @@ use crate::avm2::globals::slots::flash_geom_point as point_slots;
 use crate::avm2::globals::slots::flash_geom_rectangle as rectangle_slots;
 use crate::avm2::object::{Object, TObject as _};
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueKind};
 use crate::avm2::{ArrayObject, ArrayStorage};
 use crate::avm2::{ClassObject, Error};
 use crate::context::UpdateContext;
@@ -66,7 +66,7 @@ pub fn get_alpha<'gc>(
         return Ok(dobj.alpha().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `alpha`'s setter.
@@ -82,7 +82,7 @@ pub fn set_alpha<'gc>(
         dobj.set_alpha(new_alpha);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `height`'s getter.
@@ -97,7 +97,7 @@ pub fn get_height<'gc>(
         return Ok(dobj.height().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `height`'s setter.
@@ -115,7 +115,7 @@ pub fn set_height<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `scale9Grid`'s getter.
@@ -132,11 +132,11 @@ pub fn get_scale9grid<'gc>(
         return if rect.is_valid() {
             new_rectangle(activation, rect)
         } else {
-            Ok(Value::Null)
+            Ok(Value::NULL)
         };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `scale9Grid`'s setter.
@@ -156,7 +156,7 @@ pub fn set_scale9grid<'gc>(
         dobj.set_scaling_grid(rect);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `scaleY`'s getter.
@@ -171,7 +171,7 @@ pub fn get_scale_y<'gc>(
         return Ok(dobj.scale_y().unit().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `scaleY`'s setter.
@@ -187,7 +187,7 @@ pub fn set_scale_y<'gc>(
         dobj.set_scale_y(Percent::from_unit(new_scale));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `width`'s getter.
@@ -202,7 +202,7 @@ pub fn get_width<'gc>(
         return Ok(dobj.width().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `width`'s setter.
@@ -220,7 +220,7 @@ pub fn set_width<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `scaleX`'s getter.
@@ -235,7 +235,7 @@ pub fn get_scale_x<'gc>(
         return Ok(dobj.scale_x().unit().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `scaleX`'s setter.
@@ -251,7 +251,7 @@ pub fn set_scale_x<'gc>(
         dobj.set_scale_x(Percent::from_unit(new_scale));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_filters<'gc>(
@@ -306,7 +306,7 @@ pub fn set_filters<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `x`'s getter.
@@ -321,7 +321,7 @@ pub fn get_x<'gc>(
         return Ok(dobj.x().to_pixels().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `x`'s setter.
@@ -337,7 +337,7 @@ pub fn set_x<'gc>(
         dobj.set_x(Twips::from_pixels(x));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `y`'s getter.
@@ -352,7 +352,7 @@ pub fn get_y<'gc>(
         return Ok(dobj.y().to_pixels().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `y`'s setter.
@@ -368,7 +368,7 @@ pub fn set_y<'gc>(
         dobj.set_y(Twips::from_pixels(y));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_z<'gc>(
@@ -386,7 +386,7 @@ pub fn set_z<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm2_stub_setter!(activation, "flash.display.DisplayObject", "z");
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_rotation_x<'gc>(
@@ -404,7 +404,7 @@ pub fn set_rotation_x<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm2_stub_setter!(activation, "flash.display.DisplayObject", "rotationX");
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_rotation_y<'gc>(
@@ -422,7 +422,7 @@ pub fn set_rotation_y<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm2_stub_setter!(activation, "flash.display.DisplayObject", "rotationY");
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_rotation_z<'gc>(
@@ -440,7 +440,7 @@ pub fn set_rotation_z<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm2_stub_setter!(activation, "flash.display.DisplayObject", "rotationZ");
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_scale_z<'gc>(
@@ -458,7 +458,7 @@ pub fn set_scale_z<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm2_stub_setter!(activation, "flash.display.DisplayObject", "scaleZ");
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `rotation`'s getter.
@@ -480,7 +480,7 @@ pub fn get_rotation<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `rotation`'s setter.
@@ -497,7 +497,7 @@ pub fn set_rotation<'gc>(
         dobj.set_rotation(Degrees::from(new_rotation));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `name`'s getter.
@@ -515,11 +515,11 @@ pub fn get_name<'gc>(
             // The `Stage` is the only DisplayObject that can be accessed in
             // AVM2 that has a `None` name
             assert!(matches!(dobj, DisplayObject::Stage(_)));
-            return Ok(Value::Null);
+            return Ok(Value::NULL);
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `name`'s setter.
@@ -540,7 +540,7 @@ pub fn set_name<'gc>(
         dobj.set_name(activation.gc(), new_name);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `parent`.
@@ -555,10 +555,10 @@ pub fn get_parent<'gc>(
         return Ok(dobj
             .avm2_parent()
             .map(|parent| parent.object2_or_null())
-            .unwrap_or(Value::Null));
+            .unwrap_or(Value::NULL));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `root`.
@@ -573,10 +573,10 @@ pub fn get_root<'gc>(
         return Ok(dobj
             .avm2_root()
             .map(|root| root.object2_or_null())
-            .unwrap_or(Value::Null));
+            .unwrap_or(Value::NULL));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `stage`.
@@ -591,10 +591,10 @@ pub fn get_stage<'gc>(
         return Ok(dobj
             .avm2_stage(activation.context)
             .map(|stage| stage.object2_or_null())
-            .unwrap_or(Value::Null));
+            .unwrap_or(Value::NULL));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `visible`'s getter.
@@ -609,7 +609,7 @@ pub fn get_visible<'gc>(
         return Ok(dobj.visible().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `visible`'s setter.
@@ -626,7 +626,7 @@ pub fn set_visible<'gc>(
         dobj.set_visible(activation.context, new_visible);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `metaData`'s getter.
@@ -639,10 +639,10 @@ pub fn get_meta_data<'gc>(
 
     avm2_stub_getter!(activation, "flash.display.DisplayObject", "metaData");
     if let Some(dobj) = this.as_display_object() {
-        return Ok(dobj.meta_data().map_or(Value::Null, Value::Object));
+        return Ok(dobj.meta_data().map_or(Value::NULL, Value::from_object));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `metaData`'s setter.
@@ -658,7 +658,7 @@ pub fn set_meta_data<'gc>(
         dobj.set_meta_data(activation.gc(), obj);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `mouseX`.
@@ -674,7 +674,7 @@ pub fn get_mouse_x<'gc>(
         return Ok(local_mouse.x.to_pixels().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `mouseY`.
@@ -690,7 +690,7 @@ pub fn get_mouse_y<'gc>(
         return Ok(local_mouse.y.to_pixels().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `hitTestPoint`.
@@ -740,7 +740,7 @@ pub fn hit_test_point<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `hitTestObject`.
@@ -757,7 +757,7 @@ pub fn hit_test_object<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `loaderInfo` getter
@@ -778,9 +778,9 @@ pub fn get_loader_info<'gc>(
         {
             return Ok(loader_info.into());
         }
-        return Ok(Value::Null);
+        return Ok(Value::NULL);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_transform<'gc>(
@@ -822,7 +822,7 @@ pub fn set_transform<'gc>(
         parent.invalidate_cached_bitmap();
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `DisplayObject.blendMode`'s getter.
@@ -837,7 +837,7 @@ pub fn get_blend_mode<'gc>(
         let mode = AvmString::new_utf8(activation.gc(), dobj.blend_mode().to_string());
         return Ok(mode.into());
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `DisplayObject.blendMode`'s setter.
@@ -858,7 +858,7 @@ pub fn set_blend_mode<'gc>(
             return Err(make_error_2008(activation, "blendMode"));
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 fn new_rectangle<'gc>(
@@ -888,10 +888,10 @@ pub fn get_scroll_rect<'gc>(
         if dobj.has_scroll_rect() {
             return new_rectangle(activation, dobj.next_scroll_rect());
         } else {
-            return Ok(Value::Null);
+            return Ok(Value::NULL);
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn object_to_rectangle<'gc>(
@@ -943,7 +943,7 @@ pub fn set_scroll_rect<'gc>(
             dobj.set_has_scroll_rect(false);
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn local_to_global<'gc>(
@@ -970,7 +970,7 @@ pub fn local_to_global<'gc>(
         );
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn global_to_local<'gc>(
@@ -997,7 +997,7 @@ pub fn global_to_local<'gc>(
         );
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_bounds<'gc>(
@@ -1031,7 +1031,7 @@ pub fn get_bounds<'gc>(
 
         return new_rectangle(activation, out_bounds);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_rect<'gc>(
@@ -1055,11 +1055,11 @@ pub fn get_mask<'gc>(
         let masker = this
             .masker()
             .map(|m| m.object2_or_null())
-            .unwrap_or(Value::Null);
+            .unwrap_or(Value::NULL);
 
         return Ok(masker);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_mask<'gc>(
@@ -1073,7 +1073,7 @@ pub fn set_mask<'gc>(
         let mask = args.try_get_object(0).and_then(|o| o.as_display_object());
         this.set_mask(mask, activation.gc());
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_cache_as_bitmap<'gc>(
@@ -1086,7 +1086,7 @@ pub fn get_cache_as_bitmap<'gc>(
     if let Some(this) = this.as_display_object() {
         return Ok(this.is_bitmap_cached().into());
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_cache_as_bitmap<'gc>(
@@ -1100,7 +1100,7 @@ pub fn set_cache_as_bitmap<'gc>(
         let cache = args.get_bool(0);
         this.set_bitmap_cached_preference(cache);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `opaqueBackground`'s getter.
@@ -1118,7 +1118,7 @@ pub fn get_opaque_background<'gc>(
         return Ok(color.to_rgb().into());
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 /// `opaqueBackground`'s setter.
@@ -1131,15 +1131,15 @@ pub fn set_opaque_background<'gc>(
 
     if let Some(dobj) = this.as_display_object() {
         let value = args.get_value(0);
-        let color = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(Color::from_rgb(value.coerce_to_u32(activation)?, 255)),
+        let color = match value.kind() {
+            ValueKind::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueKind::Null => None,
+            _ => Some(Color::from_rgb(value.coerce_to_u32(activation)?, 255)),
         };
         dobj.set_opaque_background(color);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_blend_shader<'gc>(
@@ -1166,5 +1166,5 @@ pub fn set_blend_shader<'gc>(
 
         dobj.set_blend_shader(Some(shader_handle));
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

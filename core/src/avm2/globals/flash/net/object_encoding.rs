@@ -13,7 +13,7 @@ pub fn get_dynamic_property_writer<'gc>(
         "flash.net.ObjectEncoding",
         "dynamicPropertyWriter"
     );
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_dynamic_property_writer<'gc>(
@@ -26,5 +26,5 @@ pub fn set_dynamic_property_writer<'gc>(
         "flash.net.ObjectEncoding",
         "dynamicPropertyWriter"
     );
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

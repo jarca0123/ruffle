@@ -5,7 +5,7 @@ use crate::avm2::Multiname;
 use crate::avm2::activation::Activation;
 use crate::avm2::function::FunctionArgs;
 use crate::avm2::globals::methods::flash_utils_proxy as proxy_methods;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, QNameObject, TObject};
 use crate::avm2::string::AvmString;
 use crate::avm2::value::Value;
@@ -19,7 +19,7 @@ pub fn proxy_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::ProxyObject);
 
     Ok(ProxyObject(Gc::new(activation.gc(), ProxyObjectData { base })).into())
 }

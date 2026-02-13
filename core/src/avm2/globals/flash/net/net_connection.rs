@@ -51,7 +51,7 @@ pub fn connect<'gc>(
         NetConnections::connect_to_local(activation.context, connection);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn close<'gc>(
@@ -68,7 +68,7 @@ pub fn close<'gc>(
         NetConnections::close(activation.context, previous_handle, true);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_connected<'gc>(
@@ -239,7 +239,7 @@ pub fn get_uri<'gc>(
         return Ok(AvmString::new_utf8(activation.gc(), result).into());
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 pub fn get_using_tls<'gc>(
@@ -304,7 +304,7 @@ pub fn call<'gc>(
             );
         }
 
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     }
 
     Err(make_error_2126(activation))
@@ -352,5 +352,5 @@ pub fn add_header<'gc>(
         );
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

@@ -334,21 +334,21 @@ fn default_value_for_type<'gc>(type_name: Option<Gc<'gc, Multiname<'gc>>>) -> Va
                 } else if &name == b"int" {
                     0.into()
                 } else if &name == b"String" {
-                    Value::Null
+                    Value::NULL
                 } else if &name == b"uint" {
                     0.into()
                 } else {
-                    Value::Null // Object type
+                    Value::NULL // Object type
                 }
             } else {
                 // No local name?
-                Value::Null
+                Value::NULL
             }
         } else {
             // Object type
-            Value::Null
+            Value::NULL
         }
     } else {
-        Value::Undefined
+        Value::UNDEFINED
     }
 }

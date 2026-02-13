@@ -31,7 +31,7 @@ pub fn upload_from_byte_array<'gc>(
             start_offset as usize,
         );
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn upload_from_vector<'gc>(
@@ -70,5 +70,5 @@ pub fn upload_from_vector<'gc>(
             start_offset as usize,
         );
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

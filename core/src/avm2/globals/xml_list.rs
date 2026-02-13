@@ -48,7 +48,7 @@ pub fn init<'gc>(
             // This logic does *not* go in `E4XNode::parse`, as it does not apply
             // to the `XML` constructor: `new XML(xmlObj) === xmlObj` is false.
             this.set_children(activation.gc(), vec![E4XOrXml::Xml(xml)]);
-            return Ok(Value::Undefined);
+            return Ok(Value::UNDEFINED);
         }
     }
 
@@ -72,7 +72,7 @@ pub fn init<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn call_handler<'gc>(
@@ -168,7 +168,7 @@ pub fn to_string<'gc>(
     if has_simple_content_inner(&children) {
         Ok(simple_content_to_string(children.iter().cloned(), activation).into())
     } else {
-        to_xml_string(activation, Value::Object(this), args)
+        to_xml_string(activation, Value::from_object(this), args)
     }
 }
 
@@ -361,7 +361,7 @@ pub fn descendants<'gc>(
     if let Some(descendants) = this.xml_descendants(activation, &multiname) {
         Ok(descendants.into())
     } else {
-        Ok(Value::Undefined)
+        Ok(Value::UNDEFINED)
     }
 }
 
@@ -427,7 +427,7 @@ pub fn parent<'gc>(
 
     // 1. If list.[[Length]] = 0, return undefined
     if list.length() == 0 {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     }
 
     // 2. Let parent = list[0].[[Parent]]
@@ -439,9 +439,9 @@ pub fn parent<'gc>(
 
         match (parent, other) {
             (Some(v1), Some(v2)) if !E4XNode::ptr_eq(v1, v2) => {
-                return Ok(Value::Undefined);
+                return Ok(Value::UNDEFINED);
             }
-            (None, Some(_)) | (Some(_), None) => return Ok(Value::Undefined),
+            (None, Some(_)) | (Some(_), None) => return Ok(Value::UNDEFINED),
             _ => {}
         }
     }
@@ -450,7 +450,7 @@ pub fn parent<'gc>(
     if let Some(parent) = parent {
         Ok(XmlObject::new(parent, activation).into())
     } else {
-        Ok(Value::Undefined)
+        Ok(Value::UNDEFINED)
     }
 }
 

@@ -2,7 +2,7 @@ use either::Either;
 use ruffle_render::pixel_bender::{PixelBenderType, PixelBenderTypeOpcode};
 
 use crate::avm2::error::{Error2004Type, make_error_2004};
-use crate::avm2::{Activation, ArrayObject, ArrayStorage, Error, Object, Value};
+use crate::avm2::{Activation, ArrayObject, ArrayStorage, Error, Value, ValueKind};
 use crate::context::UpdateContext;
 use crate::ecma_conversions::f64_to_wrapping_i32;
 use crate::string::AvmString;
@@ -44,14 +44,14 @@ impl PixelBenderTypeExt for PixelBenderType {
                 .ok_or_else(|| make_error_2004(activation, Error2004Type::ArgumentError))
         }
 
-        let array_storage = match value {
-            Value::Object(Object::ArrayObject(o)) => Some(o.storage()),
-            Value::Null => None,
+        let array_storage = match value.kind() {
+            ValueKind::Object(o) => Some(o.as_array_object().unwrap().storage()),
+            ValueKind::Null => None,
             _ => unreachable!("value should be an array"),
         };
 
         let mut vals = if let Some(ref array) = array_storage {
-            Either::Left(array.iter().map(|v| v.unwrap_or(Value::Integer(0))))
+            Either::Left(array.iter().map(|v: Option<Value<'gc>>| v.unwrap_or(Value::from_integer(0))))
         } else {
             Either::Right(std::iter::empty())
         };
@@ -121,8 +121,8 @@ impl PixelBenderTypeExt for PixelBenderType {
             )),
             PixelBenderTypeOpcode::TString => Ok(PixelBenderType::TString(
                 vals.next()
-                    .and_then(|v| v.coerce_to_string(activation).ok())
-                    .map(|s| s.to_string())
+                    .and_then(|v: Value<'gc>| v.coerce_to_string(activation).ok())
+                    .map(|s: AvmString<'gc>| s.to_string())
                     .unwrap_or_default(),
             )),
             PixelBenderTypeOpcode::TBool => Ok(PixelBenderType::TBool(next_val(

@@ -8,7 +8,7 @@ pub use crate::avm2::object::xml_allocator;
 use crate::avm2::object::{E4XOrXml, QNameObject, TObject, XmlListObject, XmlObject};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::string::AvmString;
-use crate::avm2::{Activation, ArrayObject, ArrayStorage, Error, Multiname, Object, Value};
+use crate::avm2::{Activation, ArrayObject, ArrayStorage, Error, Multiname, Value};
 use crate::avm2_stub_method;
 
 pub fn init<'gc>(
@@ -91,7 +91,7 @@ pub fn init<'gc>(
     };
     this.set_node(activation.gc(), node);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_ignore_comments<'gc>(
@@ -99,7 +99,7 @@ pub fn get_ignore_comments<'gc>(
     _this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    Ok(Value::Bool(activation.avm2().xml_settings.ignore_comments))
+    Ok(Value::from_bool(activation.avm2().xml_settings.ignore_comments))
 }
 
 pub fn set_ignore_comments<'gc>(
@@ -109,7 +109,7 @@ pub fn set_ignore_comments<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     activation.avm2().xml_settings.ignore_comments = args.get_bool(0);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_ignore_processing_instructions<'gc>(
@@ -117,7 +117,7 @@ pub fn get_ignore_processing_instructions<'gc>(
     _this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    Ok(Value::Bool(
+    Ok(Value::from_bool(
         activation
             .avm2()
             .xml_settings
@@ -135,7 +135,7 @@ pub fn set_ignore_processing_instructions<'gc>(
         .xml_settings
         .ignore_processing_instructions = args.get_bool(0);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_ignore_whitespace<'gc>(
@@ -143,7 +143,7 @@ pub fn get_ignore_whitespace<'gc>(
     _this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    Ok(Value::Bool(
+    Ok(Value::from_bool(
         activation.avm2().xml_settings.ignore_whitespace,
     ))
 }
@@ -155,7 +155,7 @@ pub fn set_ignore_whitespace<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     activation.avm2().xml_settings.ignore_whitespace = args.get_bool(0);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_pretty_printing<'gc>(
@@ -163,7 +163,7 @@ pub fn get_pretty_printing<'gc>(
     _this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    Ok(Value::Bool(activation.avm2().xml_settings.pretty_printing))
+    Ok(Value::from_bool(activation.avm2().xml_settings.pretty_printing))
 }
 
 pub fn set_pretty_printing<'gc>(
@@ -173,7 +173,7 @@ pub fn set_pretty_printing<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     activation.avm2().xml_settings.pretty_printing = args.get_bool(0);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_pretty_indent<'gc>(
@@ -181,7 +181,7 @@ pub fn get_pretty_indent<'gc>(
     _this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    Ok(Value::Integer(activation.avm2().xml_settings.pretty_indent))
+    Ok(Value::from_integer(activation.avm2().xml_settings.pretty_indent))
 }
 
 pub fn set_pretty_indent<'gc>(
@@ -191,7 +191,7 @@ pub fn set_pretty_indent<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     activation.avm2().xml_settings.pretty_indent = args.get_i32(0);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn normalize<'gc>(
@@ -221,7 +221,7 @@ pub fn name<'gc>(
         multiname.set_is_attribute(xml.node().is_attribute());
         Ok(QNameObject::from_name(activation, multiname).into())
     } else {
-        Ok(Value::Null)
+        Ok(Value::NULL)
     }
 }
 
@@ -238,16 +238,20 @@ pub fn set_name<'gc>(
 
     // 1. If x.[[Class]] ∈ {"text", "comment"}, return
     if node.is_text() || node.is_comment() {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     }
 
-    let name = match args.get_value(0) {
-        // 2. If (Type(name) is Object) and (name.[[Class]] == "QName") and (name.uri == null)
-        Value::Object(Object::QNameObject(qname)) if qname.is_any_namespace() => {
+    let name_arg = args.get_value(0);
+    let name = if let Some(o) = name_arg.as_object() {
+        if let Some(qname) = o.as_qname_object().filter(|q| q.is_any_namespace()) {
+            // 2. If (Type(name) is Object) and (name.[[Class]] == "QName") and (name.uri == null)
             // a. Let name = name.localName
             qname.local_name(activation.strings()).into()
+        } else {
+            name_arg
         }
-        value => value,
+    } else {
+        name_arg
     };
 
     // 3. Let n be a new QName created if by calling the constructor new QName(name)
@@ -302,7 +306,7 @@ pub fn set_name<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 // namespace_internal_impl(hasPrefix:Boolean, prefix:String = null):*
@@ -334,7 +338,7 @@ pub fn namespace_internal_impl<'gc>(
                 | E4XNodeKind::Comment(_)
                 | E4XNodeKind::ProcessingInstruction(_)
         ) {
-            return Ok(Value::Null);
+            return Ok(Value::NULL);
         }
 
         // b. Return the result of calling the [[GetNamespace]] method of x.[[Name]] with argument inScopeNS
@@ -349,7 +353,7 @@ pub fn namespace_internal_impl<'gc>(
             if let Some(ns) = in_scope_ns.iter().find(|ns| ns.prefix == Some(prefix)) {
                 ns.as_namespace_object(activation)?.into()
             } else {
-                Value::Undefined
+                Value::UNDEFINED
             },
         )
     }
@@ -410,7 +414,7 @@ pub fn set_namespace<'gc>(
             | E4XNodeKind::Comment(_)
             | E4XNodeKind::ProcessingInstruction(_)
     ) {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     }
 
     // 2. Let ns2 be a new Namespace created as if by calling the constructor new Namespace(ns)
@@ -448,7 +452,7 @@ pub fn set_namespace<'gc>(
         node.add_in_scope_namespace(activation.gc(), ns);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 // ECMA-357 13.4.4.31 XML.prototype.removeNamespace (namespace)
@@ -635,7 +639,7 @@ pub fn local_name<'gc>(
     let this = this.as_object().unwrap();
 
     let node = this.as_xml_object().unwrap();
-    Ok(node.local_name().map_or(Value::Null, Value::String))
+    Ok(node.local_name().map_or(Value::NULL, Value::from_string))
 }
 
 pub fn to_string<'gc>(
@@ -647,7 +651,7 @@ pub fn to_string<'gc>(
 
     let xml = this.as_xml_object().unwrap();
     let node = xml.node();
-    Ok(Value::String(node.xml_to_string(activation)))
+    Ok(Value::from_string(node.xml_to_string(activation)))
 }
 
 pub fn to_xml_string<'gc>(
@@ -687,8 +691,8 @@ pub fn child_index<'gc>(
 
     Ok(node
         .child_index()
-        .map(|x| Value::Number(x as f64))
-        .unwrap_or(Value::Number(-1.0)))
+        .map(|x| Value::from_f64(x as f64))
+        .unwrap_or(Value::from_f64(-1.0)))
 }
 
 pub fn children<'gc>(
@@ -752,7 +756,7 @@ pub fn parent<'gc>(
 
     let xml = this.as_xml_object().unwrap();
     let node = xml.node();
-    Ok(node.parent().map_or(Value::Undefined, |parent| {
+    Ok(node.parent().map_or(Value::UNDEFINED, |parent| {
         XmlObject::new(parent, activation).into()
     }))
 }
@@ -973,7 +977,7 @@ pub fn length<'gc>(
     _this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    Ok(Value::Integer(1))
+    Ok(Value::from_integer(1))
 }
 
 pub fn has_complex_content<'gc>(
@@ -1081,7 +1085,7 @@ pub fn insert_child_after<'gc>(
 
     // 1. If x.[[Class]] ∈ {"text", "comment", "processing-instruction", "attribute"}, return
     if !xml.node().is_element() {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     }
 
     // 3. Else if Type(child1) is XML
@@ -1113,7 +1117,7 @@ pub fn insert_child_after<'gc>(
             return Ok(xml.into());
         }
     // 2. If (child1 == null)
-    } else if matches!(child1, Value::Null) {
+    } else if child1.is_null() {
         // 2.a. Call the [[Insert]] method of x with arguments "0" and child2
         xml.node().insert(0, child2, activation)?;
         // 2.b. Return x
@@ -1121,7 +1125,7 @@ pub fn insert_child_after<'gc>(
     }
 
     // 4. Return
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 // ECMA-357 13.4.4.19 XML.prototype.insertChildBefore (child1, child2)
@@ -1139,7 +1143,7 @@ pub fn insert_child_before<'gc>(
 
     // 1. If x.[[Class]] ∈ {"text", "comment", "processing-instruction", "attribute"}, return
     if !xml.node().is_element() {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     }
 
     // 3. Else if Type(child1) is XML
@@ -1171,7 +1175,7 @@ pub fn insert_child_before<'gc>(
             return Ok(xml.into());
         }
     // 2. If (child1 == null)
-    } else if matches!(child1, Value::Null) {
+    } else if child1.is_null() {
         let length = if let E4XNodeKind::Element { children, .. } = &*xml.node().kind() {
             children.len()
         } else {
@@ -1185,7 +1189,7 @@ pub fn insert_child_before<'gc>(
     }
 
     // 4. Return
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 // ECMA-357 13.4.4.32 XML.prototype.replace (propertyName, value)
@@ -1292,7 +1296,7 @@ pub fn set_local_name<'gc>(
 
     // 1. If x.[[Class]] ∈ {"text", "comment"}, return
     if node.is_text() || node.is_comment() {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     }
 
     // 2. If (Type(name) is Object) and (name.[[Class]] == "QName")
@@ -1313,7 +1317,7 @@ pub fn set_local_name<'gc>(
     // 4. Let x.[[Name]].localName = name
     node.set_local_name(name, activation.gc());
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_notification<'gc>(
@@ -1328,7 +1332,7 @@ pub fn set_notification<'gc>(
     let node = xml.node();
     let func = args.try_get_function(0);
     node.set_notification(func, activation.gc());
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn notification<'gc>(
@@ -1340,5 +1344,5 @@ pub fn notification<'gc>(
 
     let xml = this.as_xml_object().unwrap();
     let node = xml.node();
-    Ok(node.notification().map_or(Value::Null, |fun| fun.into()))
+    Ok(node.notification().map_or(Value::NULL, |fun| fun.into()))
 }

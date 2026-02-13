@@ -1,5 +1,6 @@
 use crate::avm2::error::make_error_2007;
 use crate::avm2::object::{FunctionObject, Object};
+use crate::avm2::value::ValueKind;
 use crate::avm2::{Activation, Error, Value};
 use crate::string::AvmString;
 
@@ -54,10 +55,13 @@ pub trait ParametersExt<'gc> {
     ///
     /// If the value is null, None is returned.
     fn try_get_object(&self, index: usize) -> Option<Object<'gc>> {
-        match self.get_value(index) {
-            Value::Null => None,
-            Value::Object(o) => Some(o),
-            _ => panic!("Expected Object or null as parameter"),
+        let val = self.get_value(index);
+        if val.is_null() {
+            None
+        } else if let Some(o) = val.as_object() {
+            Some(o)
+        } else {
+            panic!("Expected Object or null as parameter")
         }
     }
 
@@ -80,10 +84,13 @@ pub trait ParametersExt<'gc> {
     ///
     /// If the value is null, None is returned.
     fn try_get_function(&self, index: usize) -> Option<FunctionObject<'gc>> {
-        match self.get_value(index) {
-            Value::Null => None,
-            Value::Object(Object::FunctionObject(f)) => Some(f),
-            _ => panic!("Expected FunctionObject or null as parameter"),
+        let val = self.get_value(index);
+        if val.is_null() {
+            None
+        } else if let Some(o) = val.as_object() {
+            o.as_function_object()
+        } else {
+            panic!("Expected FunctionObject or null as parameter")
         }
     }
 
@@ -108,8 +115,8 @@ pub trait ParametersExt<'gc> {
     /// Gets the Boolean-typed value at the given index. It is expected that the
     /// value is of the Boolean type.
     fn get_bool(&self, index: usize) -> bool {
-        match self.get_value(index) {
-            Value::Bool(b) => b,
+        match self.get_value(index).kind() {
+            ValueKind::Bool(b) => b,
             _ => unreachable!("Expected Boolean-typed parameter"),
         }
     }
@@ -119,10 +126,13 @@ pub trait ParametersExt<'gc> {
     ///
     /// If the value is null, None is returned.
     fn try_get_string(&self, index: usize) -> Option<AvmString<'gc>> {
-        match self.get_value(index) {
-            Value::Null => None,
-            Value::String(s) => Some(s),
-            _ => unreachable!("Expected String-typed parameter"),
+        let val = self.get_value(index);
+        if val.is_null() {
+            None
+        } else if let Some(s) = val.as_string() {
+            Some(s)
+        } else {
+            unreachable!("Expected String-typed parameter")
         }
     }
 

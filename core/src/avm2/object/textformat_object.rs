@@ -2,7 +2,7 @@
 
 use crate::avm2::Error;
 use crate::avm2::activation::Activation;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, TObject};
 use crate::html::{TextDisplay, TextFormat};
 use core::fmt;
@@ -18,7 +18,7 @@ pub fn textformat_allocator<'gc>(
     Ok(TextFormatObject(Gc::new(
         activation.gc(),
         TextFormatObjectData {
-            base: ScriptObjectData::new(class),
+            base: ScriptObjectData::new(class, ObjectType::TextFormatObject),
             text_format: RefCell::new(TextFormat {
                 display: Some(TextDisplay::Block),
                 ..Default::default()
@@ -64,7 +64,7 @@ impl<'gc> TextFormatObject<'gc> {
         let this: Object<'gc> = Self(Gc::new(
             activation.gc(),
             TextFormatObjectData {
-                base: ScriptObjectData::new(class),
+                base: ScriptObjectData::new(class, ObjectType::TextFormatObject),
                 text_format: RefCell::new(text_format),
             },
         ))

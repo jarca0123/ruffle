@@ -8,7 +8,7 @@ use crate::avm2::function::FunctionArgs;
 use crate::avm2::globals::array::ArrayIter;
 use crate::avm2::object::{ArrayObject, FunctionObject, Object, ScriptObject, TObject};
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueKind};
 use crate::ecma_conversions::f64_to_wrapping_i32;
 use crate::string::{AvmString, Units};
 use ruffle_macros::istr;
@@ -23,7 +23,7 @@ fn deserialize_json_inner<'gc>(
     reviver: Option<FunctionObject<'gc>>,
 ) -> Result<Value<'gc>, Error<'gc>> {
     Ok(match json {
-        JsonValue::Null => Value::Null,
+        JsonValue::Null => Value::NULL,
         JsonValue::String(s) => AvmString::new_utf8(activation.gc(), s).into(),
         JsonValue::Bool(b) => b.into(),
         JsonValue::Number(number) => {
@@ -44,11 +44,11 @@ fn deserialize_json_inner<'gc>(
                 let mapped_val = match reviver {
                     None => val,
                     Some(reviver) => {
-                        reviver.call(activation, Value::Null, FunctionArgs::from_slice(args))?
+                        reviver.call(activation, Value::NULL, FunctionArgs::from_slice(args))?
                     }
                 };
 
-                if matches!(mapped_val, Value::Undefined) {
+                if mapped_val.is_undefined() {
                     obj.delete_dynamic_property(key, activation.gc());
                 } else {
                     obj.set_dynamic_property(key, mapped_val, activation.gc());
@@ -67,7 +67,7 @@ fn deserialize_json_inner<'gc>(
                     match reviver {
                         None => Ok(val),
                         Some(reviver) => {
-                            reviver.call(activation, Value::Null, FunctionArgs::from_slice(args))
+                            reviver.call(activation, Value::NULL, FunctionArgs::from_slice(args))
                         }
                     }
                 })
@@ -89,7 +89,7 @@ fn deserialize_json<'gc>(
         None => Ok(val),
         Some(reviver) => {
             let args = &[istr!("").into(), val];
-            reviver.call(activation, Value::Null, FunctionArgs::from_slice(args))
+            reviver.call(activation, Value::NULL, FunctionArgs::from_slice(args))
         }
     }
 }
@@ -151,7 +151,7 @@ impl<'gc> AvmSerializer<'gc> {
 
         if let Some(Replacer::Function(replacer)) = self.replacer {
             let args = &[eval_key.unwrap_or_else(key).into(), value];
-            replacer.call(activation, Value::Null, FunctionArgs::from_slice(args))
+            replacer.call(activation, Value::NULL, FunctionArgs::from_slice(args))
         } else {
             Ok(value)
         }
@@ -170,7 +170,7 @@ impl<'gc> AvmSerializer<'gc> {
                 let key = item.coerce_to_string(activation)?;
                 let value = Value::from(obj).get_public_property(key, activation)?;
                 let mapped = self.map_value(activation, || key, value)?;
-                if !matches!(mapped, Value::Undefined) {
+                if !mapped.is_undefined() {
                     js_obj.insert(
                         key.to_utf8_lossy().into_owned(),
                         self.serialize_value(activation, mapped)?,
@@ -180,7 +180,7 @@ impl<'gc> AvmSerializer<'gc> {
         } else {
             for (name, val) in obj.public_vtable_properties(activation)? {
                 let mapped = self.map_value(activation, || name, val)?;
-                if !matches!(mapped, Value::Undefined) {
+                if !mapped.is_undefined() {
                     js_obj.insert(
                         name.to_utf8_lossy().into_owned(),
                         self.serialize_value(activation, mapped)?,
@@ -188,19 +188,18 @@ impl<'gc> AvmSerializer<'gc> {
                 }
             }
             for i in 1.. {
-                match obj.get_enumerant_name(i, activation)? {
-                    Value::Null => break,
-                    name_val => {
-                        let name = name_val.coerce_to_string(activation)?;
-                        let value = obj.get_enumerant_value(i, activation)?;
-                        let mapped = self.map_value(activation, || name, value)?;
-                        if !matches!(mapped, Value::Undefined) {
-                            js_obj.insert(
-                                name.to_utf8_lossy().into_owned(),
-                                self.serialize_value(activation, mapped)?,
-                            );
-                        }
-                    }
+                let name_val = obj.get_enumerant_name(i, activation)?;
+                if name_val.is_null() {
+                    break;
+                }
+                let name = name_val.coerce_to_string(activation)?;
+                let value = obj.get_enumerant_value(i, activation)?;
+                let mapped = self.map_value(activation, || name, value)?;
+                if !mapped.is_undefined() {
+                    js_obj.insert(
+                        name.to_utf8_lossy().into_owned(),
+                        self.serialize_value(activation, mapped)?,
+                    );
                 }
             }
         }
@@ -230,14 +229,14 @@ impl<'gc> AvmSerializer<'gc> {
         activation: &mut Activation<'_, 'gc>,
         value: Value<'gc>,
     ) -> Result<JsonValue, Error<'gc>> {
-        Ok(match value.normalize() {
-            Value::Null => JsonValue::Null,
-            Value::Undefined => JsonValue::Null,
-            Value::Integer(i) => JsonValue::from(i),
-            Value::Number(n) => JsonValue::from(n),
-            Value::Bool(b) => JsonValue::from(b),
-            Value::String(s) => JsonValue::from(s.to_utf8_lossy().deref()),
-            Value::Object(obj) => {
+        Ok(match value.normalize().kind() {
+            ValueKind::Null => JsonValue::Null,
+            ValueKind::Undefined => JsonValue::Null,
+            ValueKind::Integer(i) => JsonValue::from(i),
+            ValueKind::Number(n) => JsonValue::from(n),
+            ValueKind::Bool(b) => JsonValue::from(b),
+            ValueKind::String(s) => JsonValue::from(s.to_utf8_lossy().deref()),
+            ValueKind::Object(obj) => {
                 if self.obj_stack.contains(&obj) {
                     return Err(make_error_1129(activation));
                 }
@@ -299,7 +298,7 @@ pub fn stringify<'gc>(
     let spaces = args.get_value(2);
 
     // If the replacer is None, that means it was either undefined or null.
-    if replacer.is_none() && !matches!(args.get_value(1), Value::Null) {
+    if replacer.is_none() && !args.get_value(1).is_null() {
         return Err(make_error_1131(activation));
     }
 
@@ -316,7 +315,8 @@ pub fn stringify<'gc>(
         .transpose()?;
 
     // NOTE: We do not coerce to a string or to a number, the value must already be a string or number.
-    let indent = if let Value::String(s) = &spaces {
+    let indent = if let Some(s) = spaces.as_string() {
+        let s = s.as_wstr();
         if s.is_empty() {
             None
         } else {

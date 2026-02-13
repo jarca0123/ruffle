@@ -15,7 +15,7 @@ pub fn get_bytes_loaded<'gc>(
         return Ok(ns.bytes_loaded().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_bytes_total<'gc>(
@@ -29,7 +29,7 @@ pub fn get_bytes_total<'gc>(
         return Ok(ns.bytes_total().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn play<'gc>(
@@ -42,14 +42,14 @@ pub fn play<'gc>(
     if let Some(ns) = this.as_netstream() {
         let name = args
             .get_optional(0)
-            .filter(|v| !matches!(v, Value::Null))
+            .filter(|v| !v.is_null())
             .map(|v| v.coerce_to_string(activation))
             .transpose()?;
 
         ns.play(activation.context, name);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn pause<'gc>(
@@ -63,7 +63,7 @@ pub fn pause<'gc>(
         ns.pause(activation.context, true);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn resume<'gc>(
@@ -77,7 +77,7 @@ pub fn resume<'gc>(
         ns.resume(activation.context);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn toggle_pause<'gc>(
@@ -91,7 +91,7 @@ pub fn toggle_pause<'gc>(
         ns.toggle_paused(activation.context);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_client<'gc>(
@@ -105,7 +105,7 @@ pub fn get_client<'gc>(
         return Ok(ns.client().expect("NetStream client should be set").into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_client<'gc>(
@@ -125,7 +125,7 @@ pub fn set_client<'gc>(
         return Err(make_error_2004(activation, Error2004Type::TypeError));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn seek<'gc>(
@@ -140,7 +140,7 @@ pub fn seek<'gc>(
         ns.seek(activation.context, offset * 1000.0, true);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_time<'gc>(
@@ -154,5 +154,5 @@ pub fn get_time<'gc>(
         return Ok((ns.time() / 1000.0).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

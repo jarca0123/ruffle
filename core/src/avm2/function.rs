@@ -62,7 +62,7 @@ impl<'gc> BoundMethod<'gc> {
     ) -> Result<Value<'gc>, Error<'gc>> {
         let receiver = if let Some(receiver) = self.bound_receiver {
             receiver
-        } else if matches!(unbound_receiver, Value::Null | Value::Undefined) {
+        } else if unbound_receiver.is_null_or_undefined() {
             self.scope
                 .get(0)
                 .expect("No global scope for function call")

@@ -24,5 +24,5 @@ pub fn set_clipboard<'gc>(
         .ui
         .set_clipboard_content(new_content.to_string());
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

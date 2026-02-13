@@ -7,7 +7,7 @@ use crate::avm2::error::{make_error_1005, make_error_1125};
 use crate::avm2::function::FunctionArgs;
 use crate::avm2::object::{ArrayObject, Object, TObject};
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueKind};
 use crate::string::AvmString;
 use bitflags::bitflags;
 use ruffle_macros::istr;
@@ -28,7 +28,7 @@ pub fn init_custom_prototype<'gc>(
 
     this.link_prototype(activation.context, prototype_array_object);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Array`'s instance initializer.
@@ -48,7 +48,7 @@ pub fn array_initializer<'gc>(
 
                 array.set_length(expected_len as usize);
 
-                return Ok(Value::Undefined);
+                return Ok(Value::UNDEFINED);
             }
         }
 
@@ -57,7 +57,7 @@ pub fn array_initializer<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Array.length`'s getter
@@ -72,7 +72,7 @@ pub fn get_length<'gc>(
         return Ok(array.length().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Array.length`'s setter
@@ -88,7 +88,7 @@ pub fn set_length<'gc>(
         array.set_length(size as usize);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Bundle an already-constructed `ArrayStorage` in an `Object`.
@@ -146,7 +146,7 @@ pub fn resolve_array_hole<'gc>(
             activation,
         )
     } else {
-        Ok(Value::Undefined)
+        Ok(Value::UNDEFINED)
     }
 }
 
@@ -161,7 +161,7 @@ pub fn join<'gc>(
     let separator = args.get_value(0);
 
     if let Some(array) = this.as_array_storage() {
-        let string_separator = if matches!(separator, Value::Undefined) {
+        let string_separator = if separator.is_undefined() {
             istr!(",")
         } else {
             separator.coerce_to_string(activation)?
@@ -172,7 +172,7 @@ pub fn join<'gc>(
         for (i, item) in array.iter().enumerate() {
             let item = resolve_array_hole(activation, this, i, item)?;
 
-            if matches!(item, Value::Undefined) || matches!(item, Value::Null) {
+            if item.is_null_or_undefined() {
                 accum.push(istr!(""));
             } else {
                 accum.push(item.coerce_to_string(activation)?);
@@ -186,7 +186,7 @@ pub fn join<'gc>(
         .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// An iterator that allows iterating over the contents of an array whilst also
@@ -295,7 +295,7 @@ impl<'gc> ArrayIter<'gc> {
                 // an element that was removed
                 val.ok_or_else(|| make_error_1125(activation, i as f64, storage.length()))?
             } else {
-                val.unwrap_or(Value::Undefined)
+                val.unwrap_or(Value::UNDEFINED)
             };
 
             Ok(Some((i, val)))
@@ -315,7 +315,7 @@ pub fn for_each<'gc>(
     let this = this.as_object().unwrap();
 
     let callback = match args.try_get_function(0) {
-        None => return Ok(Value::Undefined),
+        None => return Ok(Value::UNDEFINED),
         Some(callback) => callback,
     };
     let receiver = args.get_value(1);
@@ -326,7 +326,7 @@ pub fn for_each<'gc>(
         callback.call(activation, receiver, FunctionArgs::from_slice(args))?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Array.map`
@@ -465,7 +465,7 @@ pub fn _index_of<'gc>(
         return Ok((-1).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Array.lastIndexOf`
@@ -496,7 +496,7 @@ pub fn _last_index_of<'gc>(
         return Ok((-1).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Array.pop`
@@ -511,7 +511,7 @@ pub fn pop<'gc>(
         return Ok(array.pop());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Array.push`
@@ -529,7 +529,7 @@ pub fn push<'gc>(
         return Ok(array.length().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn reverse<'gc>(
@@ -565,7 +565,7 @@ pub fn reverse<'gc>(
         return Ok(this.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Array.shift`
@@ -580,7 +580,7 @@ pub fn shift<'gc>(
         return Ok(array.shift());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Array.unshift`
@@ -598,7 +598,7 @@ pub fn unshift<'gc>(
         return Ok(array.length().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Resolve a possibly-negative array index to something guaranteed to be positive.
@@ -647,7 +647,7 @@ pub fn slice<'gc>(
         return Ok(build_array(activation, new_array));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Array.splice`
@@ -659,11 +659,11 @@ pub fn splice<'gc>(
     let this = this.as_object().unwrap();
 
     let Some(mut array_storage) = this.as_array_storage_mut(activation.gc()) else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
     let array_length = array_storage.length();
     let Some(start) = args.get_optional(0) else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     let actual_start = resolve_index(activation, start, array_length)?;
@@ -759,12 +759,12 @@ where
         let unresolved_a = *a;
         let unresolved_b = *b;
 
-        if matches!(unresolved_a, Value::Undefined) && matches!(unresolved_b, Value::Undefined) {
+        if unresolved_a.is_undefined() && unresolved_b.is_undefined() {
             unique_sort_satisfied = false;
             return Ok(Ordering::Equal);
-        } else if matches!(unresolved_a, Value::Undefined) {
+        } else if unresolved_a.is_undefined() {
             return Ok(Ordering::Greater);
-        } else if matches!(unresolved_b, Value::Undefined) {
+        } else if unresolved_b.is_undefined() {
             return Ok(Ordering::Less);
         }
 
@@ -926,7 +926,7 @@ pub fn compare_numeric<'gc, const COMPAT: bool>(
     if COMPAT {
         // See <https://bugzilla.mozilla.org/show_bug.cgi?id=524122>
         // See <https://github.com/adobe/avmplus/blob/858d034a3bd3a54d9b70909386435cf4aec81d21/core/ArrayClass.cpp#L498>
-        if let (Value::Integer(a), Value::Integer(b)) = (a.normalize(), b.normalize()) {
+        if let (ValueKind::Integer(a), ValueKind::Integer(b)) = (a.normalize().kind(), b.normalize().kind()) {
             // The following expression corresponds to atomFromIntptrValue,
             // see <https://github.com/adobe-flash/avmplus/blob/master/core/atom-inlines.h#L82>
             let a = (a << 3) | 6;
@@ -972,7 +972,7 @@ fn sort_postprocess<'gc>(
                     .map(|(src, v)| {
                         if let Some(old_value) = old_array.get(*src) {
                             Some(old_value)
-                        } else if !matches!(v, Value::Undefined) {
+                        } else if !v.is_undefined() {
                             Some(*v)
                         } else {
                             None
@@ -1153,7 +1153,7 @@ fn extract_field_names<'gc>(
             out.push(value.coerce_to_string(activation)?);
         }
         Ok(out)
-    } else if let Value::String(s) = value {
+    } else if let Some(s) = value.as_string() {
         Ok(vec![s])
     } else {
         Ok(vec![])
@@ -1265,8 +1265,8 @@ pub fn remove_at<'gc>(
     if let Some(mut array) = this.as_array_storage_mut(activation.gc()) {
         let index = args.get_i32(0);
 
-        return Ok(array.remove(index).unwrap_or(Value::Undefined));
+        return Ok(array.remove(index).unwrap_or(Value::UNDEFINED));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

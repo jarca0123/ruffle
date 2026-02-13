@@ -68,8 +68,8 @@ impl<'gc> FlvValueAvm2Ext<'gc> for FlvValue<'_> {
             } => avm2_date_from_flv_date(context, unix_time, local_offset),
             FlvValue::Number(value) => value.into(),
             FlvValue::Boolean(value) => value.into(),
-            FlvValue::Null => Avm2Value::Null,
-            FlvValue::Undefined => Avm2Value::Undefined,
+            FlvValue::Null => Avm2Value::NULL,
+            FlvValue::Undefined => Avm2Value::UNDEFINED,
             _ => {
                 unimplemented!(
                     "FLV data to AVM2 data conversion unimplemented for {:?}",

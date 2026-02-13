@@ -35,7 +35,7 @@ pub fn connect<'gc>(
 
     let socket = match this.as_socket() {
         Some(socket) => socket,
-        None => return Ok(Value::Undefined),
+        None => return Ok(Value::UNDEFINED),
     };
 
     let host = args.get_string(activation, 0);
@@ -48,7 +48,7 @@ pub fn connect<'gc>(
 
     sockets.connect_avm2(*navigator, socket, host.to_utf8_lossy().into_owned(), port);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_timeout<'gc>(
@@ -62,7 +62,7 @@ pub fn get_timeout<'gc>(
         return Ok(socket.timeout().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_timeout<'gc>(
@@ -77,7 +77,7 @@ pub fn set_timeout<'gc>(
         socket.set_timeout(new_timeout)
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn close<'gc>(
@@ -100,7 +100,7 @@ pub fn close<'gc>(
         sockets.close(handle)
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_bytes_available<'gc>(
@@ -114,7 +114,7 @@ pub fn get_bytes_available<'gc>(
         return Ok(socket.read_buffer().len().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_endian<'gc>(
@@ -131,7 +131,7 @@ pub fn get_endian<'gc>(
         });
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_endian<'gc>(
@@ -152,7 +152,7 @@ pub fn set_endian<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_connected<'gc>(
@@ -164,17 +164,17 @@ pub fn get_connected<'gc>(
 
     let socket = match this.as_socket() {
         Some(socket) => socket,
-        None => return Ok(Value::Undefined),
+        None => return Ok(Value::UNDEFINED),
     };
 
     let UpdateContext { sockets, .. } = activation.context;
 
     let handle = match socket.handle() {
         Some(handle) => handle,
-        None => return Ok(Value::Bool(false)),
+        None => return Ok(Value::from_bool(false)),
     };
 
-    Ok(Value::Bool(sockets.is_connected(handle)))
+    Ok(Value::from_bool(sockets.is_connected(handle)))
 }
 
 pub fn get_object_encoding<'gc>(
@@ -188,7 +188,7 @@ pub fn get_object_encoding<'gc>(
         return Ok((socket.object_encoding() as u8).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_object_encoding<'gc>(
@@ -207,7 +207,7 @@ pub fn set_object_encoding<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn flush<'gc>(
@@ -232,7 +232,7 @@ pub fn flush<'gc>(
         sockets.send(handle, data)
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_boolean<'gc>(
@@ -251,7 +251,7 @@ pub fn read_boolean<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_byte<'gc>(
@@ -267,7 +267,7 @@ pub fn read_byte<'gc>(
         return Ok(socket.read_byte().map_err(|e| e.to_avm(activation))?.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_bytes<'gc>(
@@ -301,7 +301,7 @@ pub fn read_bytes<'gc>(
             .map_err(|e| e.to_avm(activation))?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_double<'gc>(
@@ -320,7 +320,7 @@ pub fn read_double<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_float<'gc>(
@@ -339,7 +339,7 @@ pub fn read_float<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_int<'gc>(
@@ -355,7 +355,7 @@ pub fn read_int<'gc>(
         return Ok(socket.read_int().map_err(|e| e.to_avm(activation))?.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_multi_byte<'gc>(
@@ -386,7 +386,7 @@ pub fn read_multi_byte<'gc>(
         return Ok(AvmString::new_utf8(activation.gc(), decoded_str).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_object<'gc>(
@@ -432,7 +432,7 @@ pub fn read_object<'gc>(
         return Ok(value);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_short<'gc>(
@@ -451,7 +451,7 @@ pub fn read_short<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_unsigned_byte<'gc>(
@@ -470,7 +470,7 @@ pub fn read_unsigned_byte<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_unsigned_int<'gc>(
@@ -489,7 +489,7 @@ pub fn read_unsigned_int<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_unsigned_short<'gc>(
@@ -508,7 +508,7 @@ pub fn read_unsigned_short<'gc>(
             .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_utf<'gc>(
@@ -528,7 +528,7 @@ pub fn read_utf<'gc>(
         .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn read_utf_bytes<'gc>(
@@ -552,7 +552,7 @@ pub fn read_utf_bytes<'gc>(
         .into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_boolean<'gc>(
@@ -569,7 +569,7 @@ pub fn write_boolean<'gc>(
         socket.write_boolean(byte);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_byte<'gc>(
@@ -586,7 +586,7 @@ pub fn write_byte<'gc>(
         socket.write_bytes(&[byte as u8]);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_bytes<'gc>(
@@ -622,7 +622,7 @@ pub fn write_bytes<'gc>(
         socket.write_bytes(to_write);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_double<'gc>(
@@ -639,7 +639,7 @@ pub fn write_double<'gc>(
         socket.write_double(num);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_float<'gc>(
@@ -656,7 +656,7 @@ pub fn write_float<'gc>(
         socket.write_float(num as f32);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_int<'gc>(
@@ -673,7 +673,7 @@ pub fn write_int<'gc>(
         socket.write_int(num);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_multi_byte<'gc>(
@@ -696,7 +696,7 @@ pub fn write_multi_byte<'gc>(
         socket.write_bytes(&encoded_bytes);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_object<'gc>(
@@ -738,7 +738,7 @@ pub fn write_object<'gc>(
         );
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_short<'gc>(
@@ -755,7 +755,7 @@ pub fn write_short<'gc>(
         socket.write_short(num as i16);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_unsigned_int<'gc>(
@@ -772,7 +772,7 @@ pub fn write_unsigned_int<'gc>(
         socket.write_unsigned_int(num);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_utf<'gc>(
@@ -790,7 +790,7 @@ pub fn write_utf<'gc>(
         socket.write_utf(activation, &string.to_utf8_lossy())?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn write_utf_bytes<'gc>(
@@ -808,5 +808,5 @@ pub fn write_utf_bytes<'gc>(
         socket.write_bytes(string.to_utf8_lossy().as_bytes());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

@@ -22,20 +22,20 @@ pub fn inner_parse_css<'gc>(
             for (key, value) in properties.into_iter() {
                 object.set_dynamic_property(
                     AvmString::new(activation.gc(), transform_dashes_to_camel_case(key)),
-                    Value::String(AvmString::new(activation.gc(), value)),
+                    Value::from_string(AvmString::new(activation.gc(), value)),
                     activation.gc(),
                 );
             }
 
             result.set_dynamic_property(
                 AvmString::new(activation.gc(), selector),
-                Value::Object(object),
+                Value::from_object(object),
                 activation.gc(),
             );
         }
     }
 
-    Ok(Value::Object(result))
+    Ok(Value::from_object(result))
 }
 
 pub fn inner_parse_color<'gc>(
@@ -64,7 +64,7 @@ pub fn inner_parse_font_family<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let input = args.get_string(activation, 0);
     let parsed_font_list = crate::html::parse_font_list(input.as_wstr());
-    Ok(Value::String(AvmString::new(
+    Ok(Value::from_string(AvmString::new(
         activation.gc(),
         parsed_font_list,
     )))
@@ -78,12 +78,12 @@ pub fn clear_internal<'gc>(
     let this = this.as_object().unwrap();
 
     let Some(this) = this.as_style_sheet() else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     this.clear();
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_style_internal<'gc>(
@@ -94,11 +94,11 @@ pub fn set_style_internal<'gc>(
     let this = this.as_object().unwrap();
 
     let Some(this) = this.as_style_sheet() else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     let Some(selector) = args.try_get_string(0) else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
     let text_format = args
         .try_get_object(1)
@@ -110,5 +110,5 @@ pub fn set_style_internal<'gc>(
         this.remove_style(selector.as_wstr());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

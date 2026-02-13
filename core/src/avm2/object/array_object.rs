@@ -4,7 +4,7 @@ use crate::avm2::Error;
 use crate::avm2::Multiname;
 use crate::avm2::activation::Activation;
 use crate::avm2::array::ArrayStorage;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, TObject};
 use crate::avm2::value::Value;
 use crate::context::UpdateContext;
@@ -20,7 +20,7 @@ pub fn array_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::ArrayObject);
 
     Ok(ArrayObject(Gc::new(
         activation.gc(),
@@ -74,7 +74,7 @@ impl<'gc> ArrayObject<'gc> {
         array: ArrayStorage<'gc>,
     ) -> ArrayObject<'gc> {
         let class = context.avm2.classes().array;
-        let base = ScriptObjectData::new(class);
+        let base = ScriptObjectData::new(class, ObjectType::ArrayObject);
 
         ArrayObject(Gc::new(
             context.gc(),
@@ -94,6 +94,7 @@ impl<'gc> ArrayObject<'gc> {
             array_class.inner_class_definition(),
             Some(object_class.prototype()),
             array_class.instance_vtable(),
+            ObjectType::ArrayObject,
         );
 
         ArrayObject(Gc::new(
@@ -285,12 +286,12 @@ impl<'gc> TObject<'gc> for ArrayObject<'gc> {
             Ok(index
                 .checked_sub(1)
                 .map(|index| index.into())
-                .unwrap_or(Value::Null))
+                .unwrap_or(Value::NULL))
         } else {
             Ok(self
                 .base()
                 .get_enumerant_name(index - arr_len)
-                .unwrap_or(Value::Null))
+                .unwrap_or(Value::NULL))
         }
     }
 

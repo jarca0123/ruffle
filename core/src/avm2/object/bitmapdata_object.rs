@@ -2,7 +2,7 @@
 
 use crate::avm2::Error;
 use crate::avm2::activation::Activation;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, TObject};
 use crate::bitmap::bitmap_data::BitmapData;
 use crate::context::UpdateContext;
@@ -16,7 +16,7 @@ pub fn bitmap_data_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::BitmapDataObject);
 
     Ok(BitmapDataObject(Gc::new(
         activation.gc(),
@@ -75,7 +75,7 @@ impl<'gc> BitmapDataObject<'gc> {
         let instance = Self(Gc::new(
             mc,
             BitmapDataObjectData {
-                base: ScriptObjectData::new(class),
+                base: ScriptObjectData::new(class, ObjectType::BitmapDataObject),
                 bitmap_data: Lock::new(bitmap_data),
             },
         ));

@@ -109,7 +109,7 @@ impl Default for InteractiveObjectBase<'_> {
         Self {
             base: Default::default(),
             flags: Cell::new(InteractiveObjectFlags::MOUSE_ENABLED),
-            context_menu: Lock::new(Avm2Value::Null),
+            context_menu: Lock::new(Avm2Value::NULL),
             tab_enabled: Cell::new(None),
             tab_index: Cell::new(None),
             focus_rect: Cell::new(None),

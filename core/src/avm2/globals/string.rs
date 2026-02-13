@@ -42,11 +42,11 @@ pub fn get_length<'gc>(
     this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    if let Value::String(s) = this {
+    if let Some(s) = this.as_string() {
         return Ok(s.len().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `String.charAt`
@@ -55,7 +55,7 @@ pub fn char_at<'gc>(
     this: Value<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    if let Value::String(s) = this {
+    if let Some(s) = this.as_string() {
         // This function takes Number, so if we use get_i32 instead of get_f64, the value may overflow.
         let n = args.get_f64(0);
 
@@ -72,7 +72,7 @@ pub fn char_at<'gc>(
         return Ok(ret.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `String.charCodeAt`
@@ -81,7 +81,7 @@ pub fn char_code_at<'gc>(
     this: Value<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    if let Value::String(s) = this {
+    if let Some(s) = this.as_string() {
         // This function takes Number, so if we use coerce_to_i32 instead of coerce_to_number, the value may overflow.
         let n = args.get_f64(0);
 
@@ -94,7 +94,7 @@ pub fn char_code_at<'gc>(
         return Ok(ret.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `String.concat`
@@ -184,16 +184,13 @@ pub fn locale_compare<'gc>(
     let other_value = args.get_value(0);
 
     if activation.caller_movie_or_root().version() < 11 {
-        match other_value {
-            Value::Null | Value::Undefined => {
-                if this.is_empty() {
-                    return Ok(Value::Integer(1));
-                } else {
-                    return Ok(Value::Integer(0));
-                }
+        if other_value.is_null_or_undefined() {
+            if this.is_empty() {
+                return Ok(Value::from_integer(1));
+            } else {
+                return Ok(Value::from_integer(0));
             }
-            _ => {}
-        };
+        }
     }
 
     let other = other_value.coerce_to_string(activation)?;
@@ -201,19 +198,19 @@ pub fn locale_compare<'gc>(
     for (tc, oc) in this.iter().zip(other.iter()) {
         let res = (tc as i32) - (oc as i32);
         if res != 0 {
-            return Ok(Value::Integer(res));
+            return Ok(Value::from_integer(res));
         }
     }
 
     if this.len() < other.len() {
-        return Ok(Value::Integer(-1));
+        return Ok(Value::from_integer(-1));
     }
 
     if this.len() > other.len() {
-        return Ok(Value::Integer(1));
+        return Ok(Value::from_integer(1));
     }
 
-    Ok(Value::Integer(0))
+    Ok(Value::from_integer(0))
 }
 
 /// Implements `String.match`. This function can't be named `match` because it's a Rust keyword.
@@ -231,7 +228,7 @@ pub fn match_internal<'gc>(
         pattern
     } else {
         let string = pattern.coerce_to_string(activation)?;
-        regexp_class.construct(activation, &[Value::String(string)])?
+        regexp_class.construct(activation, &[Value::from_string(string)])?
     };
 
     let pattern = pattern.as_object().unwrap();
@@ -262,7 +259,7 @@ pub fn match_internal<'gc>(
                 let storage = result
                     .groups()
                     .map(|range| {
-                        range.map_or(Value::Undefined, |range| {
+                        range.map_or(Value::UNDEFINED, |range| {
                             activation.strings().substring(this, range).into()
                         })
                     })
@@ -280,12 +277,12 @@ pub fn match_internal<'gc>(
                 regexp.set_last_index(old);
                 // If the pattern parameter is a String or a non-global regular expression
                 // and no match is found, the method returns null
-                return Ok(Value::Null);
+                return Ok(Value::NULL);
             }
         };
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 /// Implements `String.replace`
@@ -319,7 +316,7 @@ pub fn replace<'gc>(
         // Replacement is either a function or treatable as string.
         if let Some(f) = replacement.as_object().and_then(|o| o.as_function_object()) {
             let args = &[pattern.into(), position.into(), this.into()];
-            let v = f.call(activation, Value::Null, FunctionArgs::from_slice(args))?;
+            let v = f.call(activation, Value::NULL, FunctionArgs::from_slice(args))?;
             ret.push_str(v.coerce_to_string(activation)?.as_wstr());
         } else {
             let replacement = replacement.coerce_to_string(activation)?;
@@ -348,7 +345,7 @@ pub fn search<'gc>(
         pattern
     } else {
         let string = pattern.coerce_to_string(activation)?;
-        regexp_class.construct(activation, &[Value::String(string)])?
+        regexp_class.construct(activation, &[Value::from_string(string)])?
     };
 
     let pattern = pattern.as_object().unwrap();
@@ -359,16 +356,16 @@ pub fn search<'gc>(
             let found_index = result.groups().flatten().next().unwrap_or_default().start as i32;
 
             regexp.set_last_index(old);
-            return Ok(Value::Integer(found_index));
+            return Ok(Value::from_integer(found_index));
         } else {
             regexp.set_last_index(old);
             // If the pattern parameter is a String or a non-global regular expression
             // and no match is found, the method returns -1
-            return Ok(Value::Integer(-1));
+            return Ok(Value::from_integer(-1));
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `String.slice`
@@ -405,9 +402,11 @@ pub fn split<'gc>(
 
     let delimiter = args.get_value(0);
 
-    let limit = match args.get_value(1) {
-        Value::Undefined => usize::MAX,
-        limit => limit.coerce_to_u32(activation)? as usize,
+    let limit_val = args.get_value(1);
+    let limit = if limit_val.is_undefined() {
+        usize::MAX
+    } else {
+        limit_val.coerce_to_u32(activation)? as usize
     };
 
     let Some(limit) = NonZero::new(limit) else {

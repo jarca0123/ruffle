@@ -1,6 +1,6 @@
 use crate::avm2::Error;
 use crate::avm2::activation::Activation;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, TObject};
 use crate::avm2::value::Hint;
 use crate::context::UpdateContext;
@@ -18,7 +18,7 @@ pub fn date_allocator<'gc>(
     Ok(DateObject(Gc::new(
         activation.gc(),
         DateObjectData {
-            base: ScriptObjectData::new(class),
+            base: ScriptObjectData::new(class, ObjectType::DateObject),
             date_time: Cell::new(None),
         },
     ))
@@ -46,7 +46,7 @@ impl<'gc> DateObject<'gc> {
         date_time: DateTime<Utc>,
     ) -> Object<'gc> {
         let class = context.avm2.classes().date;
-        let base = ScriptObjectData::new(class);
+        let base = ScriptObjectData::new(class, ObjectType::DateObject);
 
         DateObject(Gc::new(
             context.gc(),
@@ -67,6 +67,7 @@ impl<'gc> DateObject<'gc> {
             date_class.inner_class_definition(),
             Some(object_class.prototype()),
             date_class.instance_vtable(),
+            ObjectType::DateObject,
         );
 
         let instance: Object<'gc> = DateObject(Gc::new(

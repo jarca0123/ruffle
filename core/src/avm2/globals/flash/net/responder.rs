@@ -20,5 +20,5 @@ pub fn init<'gc>(
         status.and_then(|o| o.as_function_object()),
     );
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

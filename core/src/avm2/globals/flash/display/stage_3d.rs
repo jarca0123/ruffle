@@ -43,7 +43,7 @@ pub fn request_context3d_internal<'gc>(
             profiles
                 .iter()
                 .any(|p| {
-                    if let Value::String(p) = p {
+                    if let Some(p) = p.as_string() {
                         &*p == *profile
                     } else {
                         unreachable!()
@@ -67,7 +67,7 @@ pub fn request_context3d_internal<'gc>(
         )?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_context_3d<'gc>(
@@ -78,9 +78,9 @@ pub fn get_context_3d<'gc>(
     let this = this.as_object().unwrap();
 
     if let Some(this) = this.as_stage_3d() {
-        return Ok(this.context3d().map_or(Value::Null, |obj| obj.into()));
+        return Ok(this.context3d().map_or(Value::NULL, |obj| obj.into()));
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_visible<'gc>(
@@ -93,7 +93,7 @@ pub fn get_visible<'gc>(
     if let Some(this) = this.as_stage_3d() {
         return Ok(this.visible().into());
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_visible<'gc>(
@@ -106,5 +106,5 @@ pub fn set_visible<'gc>(
     if let Some(this) = this.as_stage_3d() {
         this.set_visible(args.get_bool(0));
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

@@ -31,7 +31,7 @@ pub fn trace<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn is_finite<'gc>(
@@ -87,7 +87,7 @@ pub fn is_xml_name<'gc>(
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     let name = args.get_value(0);
-    if matches!(name, Value::Undefined | Value::Null) {
+    if name.is_null_or_undefined() {
         return Ok(false.into());
     }
 

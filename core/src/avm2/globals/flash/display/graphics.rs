@@ -51,7 +51,7 @@ pub fn begin_fill<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.beginBitmapFill`.
@@ -99,7 +99,7 @@ pub fn begin_bitmap_fill<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.beginGradientFill`.
@@ -166,7 +166,7 @@ pub fn begin_gradient_fill<'gc>(
             }
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 fn build_gradient_records<'gc>(
@@ -266,7 +266,7 @@ pub fn clear<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.curveTo`.
@@ -291,7 +291,7 @@ pub fn curve_to<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.endFill`.
@@ -308,7 +308,7 @@ pub fn end_fill<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 fn caps_to_cap_style(caps: Option<AvmString>) -> LineCapStyle {
@@ -397,7 +397,7 @@ pub fn line_style<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.lineTo`.
@@ -417,7 +417,7 @@ pub fn line_to<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.moveTo`.
@@ -437,7 +437,7 @@ pub fn move_to<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.drawRect`.
@@ -463,7 +463,7 @@ pub fn draw_rect<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 // /// Length between two points on a unit circle that are 45 degrees apart from
@@ -767,7 +767,7 @@ pub fn draw_round_rect<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.drawRoundRectComplex`
@@ -807,7 +807,7 @@ pub fn draw_round_rect_complex<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.drawCircle`.
@@ -842,7 +842,7 @@ pub fn draw_circle<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.drawEllipse`.
@@ -878,7 +878,7 @@ pub fn draw_ellipse<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.lineGradientStyle`
@@ -944,7 +944,7 @@ pub fn line_gradient_style<'gc>(
             }
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.cubicCurveTo`
@@ -972,7 +972,7 @@ pub fn cubic_curve_to<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.copyFrom`
@@ -997,7 +997,7 @@ pub fn copy_from<'gc>(
 
         target_drawing.clone_from(&source);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.drawPath`
@@ -1038,7 +1038,7 @@ pub fn draw_path<'gc>(
 
     process_commands(activation, &mut drawing, &commands, &data, fill_rule)?;
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.drawTriangles`
@@ -1074,7 +1074,7 @@ pub fn draw_triangles<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1293,7 +1293,7 @@ pub fn draw_graphics_data<'gc>(
         };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.lineBitmapStyle`
@@ -1341,7 +1341,7 @@ pub fn line_bitmap_style<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Graphics.readGraphicsData`

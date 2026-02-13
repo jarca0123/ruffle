@@ -108,7 +108,7 @@ pub fn init<'gc>(
         unreachable!();
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Bitmap.bitmapData`'s getter.
@@ -124,12 +124,12 @@ pub fn get_bitmap_data<'gc>(
             .bitmap_data()
             .object2()
             .map(|o| o.into())
-            .unwrap_or(Value::Null);
+            .unwrap_or(Value::NULL);
 
         return Ok(value);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Bitmap.bitmapData`'s setter.
@@ -153,7 +153,7 @@ pub fn set_bitmap_data<'gc>(
         bitmap.set_bitmap_data(activation.context, bitmap_data);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Stub `Bitmap.pixelSnapping`'s getter
@@ -173,7 +173,7 @@ pub fn get_pixel_snapping<'gc>(
 
         return Ok(pixel_snapping.into());
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Stub `Bitmap.pixelSnapping`'s setter
@@ -199,7 +199,7 @@ pub fn set_pixel_snapping<'gc>(
 
         bitmap.set_pixel_snapping(pixel_snapping);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `Bitmap.smoothing`'s getter
@@ -214,7 +214,7 @@ pub fn get_smoothing<'gc>(
         return Ok(bitmap.smoothing().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `Bitmap.smoothing`'s setter
@@ -230,5 +230,5 @@ pub fn set_smoothing<'gc>(
         bitmap.set_smoothing(smoothing);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

@@ -2,7 +2,7 @@
 
 use crate::avm2::Error;
 use crate::avm2::activation::Activation;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, TObject};
 use crate::net_connection::NetConnectionHandle;
 use gc_arena::{Collect, Gc, GcWeak};
@@ -15,7 +15,7 @@ pub fn net_connection_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::NetConnectionObject);
     let this: Object<'gc> = NetConnectionObject(Gc::new(
         activation.gc(),
         NetConnectionObjectData {

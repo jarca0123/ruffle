@@ -19,7 +19,7 @@ pub fn get_domain<'gc>(
     let movie = &activation.context.root_swf;
     let domain = LocalConnections::get_domain(movie.url());
 
-    Ok(Value::String(AvmString::new_utf8(activation.gc(), domain)))
+    Ok(Value::from_string(AvmString::new_utf8(activation.gc(), domain)))
 }
 
 /// Implements `LocalConnection.send`
@@ -67,7 +67,7 @@ pub fn send<'gc>(
         );
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `LocalConnection.connect`
@@ -94,7 +94,7 @@ pub fn connect<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `LocalConnection.close`
@@ -113,7 +113,7 @@ pub fn close<'gc>(
         local_connection.disconnect(activation);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_client<'gc>(
@@ -126,7 +126,7 @@ pub fn get_client<'gc>(
     if let Some(local_connection) = this.as_local_connection_object() {
         Ok(local_connection.client().into())
     } else {
-        Ok(Value::Undefined)
+        Ok(Value::UNDEFINED)
     }
 }
 
@@ -147,5 +147,5 @@ pub fn set_client<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

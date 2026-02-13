@@ -31,7 +31,7 @@ struct StackData<'gc> {
 impl<'gc> Stack<'gc> {
     pub fn new(mc: &Mutation<'gc>) -> Self {
         let stack = (0..PREALLOCATED_STACK_SIZE)
-            .map(|_| Cell::new(Value::Undefined))
+            .map(|_| Cell::new(Value::UNDEFINED))
             .collect::<Box<[_]>>();
 
         Stack(Gc::new(
@@ -65,7 +65,7 @@ impl<'gc> Stack<'gc> {
         // old values on it, as these may contain Gc pointers that have already
         // been collected.
         for value in subslice {
-            value.set(Value::Undefined);
+            value.set(Value::UNDEFINED);
         }
 
         StackFrame::for_data(subslice)

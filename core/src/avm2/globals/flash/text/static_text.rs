@@ -15,9 +15,9 @@ pub fn get_text<'gc>(
         return if let Some(text) = this.text(activation.context) {
             Ok(AvmString::new(activation.gc(), text).into())
         } else {
-            Ok(Value::Null)
+            Ok(Value::NULL)
         };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

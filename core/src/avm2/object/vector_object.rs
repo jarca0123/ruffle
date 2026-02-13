@@ -3,9 +3,9 @@
 use crate::avm2::Multiname;
 use crate::avm2::activation::Activation;
 use crate::avm2::error::{Error, ReferenceErrorCode, make_error_1125, make_reference_error};
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, TObject};
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueKind};
 use crate::avm2::vector::VectorStorage;
 use crate::string::WStr;
 use core::fmt;
@@ -19,7 +19,7 @@ pub fn vector_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::VectorObject);
 
     let param_type = class
         .inner_class_definition()
@@ -78,7 +78,7 @@ impl<'gc> VectorObject<'gc> {
         VectorObject(Gc::new(
             activation.gc(),
             VectorObjectData {
-                base: ScriptObjectData::new(applied_class),
+                base: ScriptObjectData::new(applied_class, ObjectType::VectorObject),
                 vector: RefLock::new(vector),
             },
         ))
@@ -151,10 +151,11 @@ impl<'gc> VectorObject<'gc> {
         let mc = activation.gc();
 
         let type_of = self.0.vector.borrow().value_type_for_coercion(activation);
-        let value = match value.coerce_to_type(activation, type_of)? {
-            Value::Undefined => self.0.vector.borrow().default(),
-            Value::Null => self.0.vector.borrow().default(),
-            v => v,
+        let coerced = value.coerce_to_type(activation, type_of)?;
+        let value = match coerced.kind() {
+            ValueKind::Undefined => self.0.vector.borrow().default(),
+            ValueKind::Null => self.0.vector.borrow().default(),
+            _ => coerced,
         };
 
         unlock!(Gc::write(mc, self.0), VectorObjectData, vector)
@@ -343,9 +344,9 @@ impl<'gc> TObject<'gc> for VectorObject<'gc> {
             Ok(index
                 .checked_sub(1)
                 .map(|index| index.into())
-                .unwrap_or(Value::Null))
+                .unwrap_or(Value::NULL))
         } else {
-            Ok(Value::Null)
+            Ok(Value::NULL)
         }
     }
 }

@@ -371,7 +371,7 @@ fn avm2_to_convolution_filter<'gc>(
             for value in array.iter() {
                 matrix.push(
                     value
-                        .unwrap_or(Value::Undefined)
+                        .unwrap_or(Value::UNDEFINED)
                         .coerce_to_number(activation)? as f32,
                 );
             }
@@ -463,7 +463,7 @@ fn avm2_to_displacement_map_filter<'gc>(
         .get_slot(displacement_map_filter_slots::COMPONENT_Y)
         .coerce_to_u32(activation)?;
     let map_point =
-        if let Value::Object(point) = object.get_slot(displacement_map_filter_slots::MAP_POINT) {
+        if let Some(point) = object.get_slot(displacement_map_filter_slots::MAP_POINT).as_object() {
             (
                 point.get_slot(point_slots::X).coerce_to_i32(activation)?,
                 point.get_slot(point_slots::Y).coerce_to_i32(activation)?,
@@ -471,7 +471,7 @@ fn avm2_to_displacement_map_filter<'gc>(
         } else {
             (0, 0)
         };
-    let mode = if let Value::String(mode) = object.get_slot(displacement_map_filter_slots::MODE) {
+    let mode = if let Some(mode) = object.get_slot(displacement_map_filter_slots::MODE).as_string() {
         if &mode == b"clamp" {
             DisplacementMapFilterMode::Clamp
         } else if &mode == b"ignore" {
@@ -493,7 +493,7 @@ fn avm2_to_displacement_map_filter<'gc>(
         .get_slot(displacement_map_filter_slots::SCALE_Y)
         .coerce_to_number(activation)?;
     let map_bitmap =
-        if let Value::Object(bitmap) = object.get_slot(displacement_map_filter_slots::MAP_BITMAP) {
+        if let Some(bitmap) = object.get_slot(displacement_map_filter_slots::MAP_BITMAP).as_object() {
             Some(
                 bitmap
                     .as_bitmap_data()
@@ -535,7 +535,7 @@ fn displacement_map_filter_to_avm2<'gc>(
     activation.avm2().classes().displacementmapfilter.construct(
         activation,
         &[
-            Value::Null, // TODO: This should be a BitmapData...
+            Value::NULL, // TODO: This should be a BitmapData...
             map_point,
             filter.component_x.into(),
             filter.component_y.into(),

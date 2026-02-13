@@ -26,5 +26,5 @@ pub fn upload<'gc>(
         this.context3d()
             .upload_shaders(this, vertex_agal, fragment_agal);
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

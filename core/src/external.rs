@@ -5,10 +5,10 @@ use crate::avm1::{ArrayBuilder as Avm1ArrayBuilder, Error as Avm1Error, Object a
 use crate::avm2::activation::Activation as Avm2Activation;
 use crate::avm2::error::Error as Avm2Error;
 use crate::avm2::object::{
-    ArrayObject as Avm2ArrayObject, FunctionObject as Avm2FunctionObject, Object as Avm2Object,
+    ArrayObject as Avm2ArrayObject, FunctionObject as Avm2FunctionObject,
     ScriptObject as Avm2ScriptObject, TObject as _,
 };
-use crate::avm2::{Avm2, FunctionArgs, Value as Avm2Value};
+use crate::avm2::{Avm2, FunctionArgs, Value as Avm2Value, ValueKind};
 use crate::context::UpdateContext;
 use crate::string::AvmString;
 use gc_arena::Collect;
@@ -193,25 +193,25 @@ impl Value {
         activation: &mut Avm2Activation<'_, 'gc>,
         value: Avm2Value<'gc>,
     ) -> Result<Value, Avm2Error<'gc>> {
-        Ok(match value {
-            Avm2Value::Undefined => Value::Undefined,
-            Avm2Value::Null => Value::Null,
-            Avm2Value::Bool(value) => value.into(),
-            Avm2Value::Number(value) => value.into(),
-            Avm2Value::Integer(value) => value.into(),
-            Avm2Value::String(value) => Value::String(value.to_string()),
-            Avm2Value::Object(obj) => {
+        Ok(match value.kind() {
+            ValueKind::Undefined => Value::Undefined,
+            ValueKind::Null => Value::Null,
+            ValueKind::Bool(value) => value.into(),
+            ValueKind::Number(value) => value.into(),
+            ValueKind::Integer(value) => value.into(),
+            ValueKind::String(value) => Value::String(value.to_string()),
+            ValueKind::Object(obj) => {
                 if let Some(array) = obj.as_array_storage() {
                     let length = array.length();
                     let values = (0..length)
                         .map(|i| {
                             // FIXME - is this right?
-                            let element = array.get(i).unwrap_or(Avm2Value::Null);
+                            let element = array.get(i).unwrap_or(Avm2Value::NULL);
                             Value::from_avm2(activation, element)
                         })
                         .collect::<Result<Vec<Value>, Avm2Error>>()?;
                     Value::List(values)
-                } else if matches!(obj, Avm2Object::ScriptObject(_)) {
+                } else if obj.as_script_object().is_some() {
                     let mut values = BTreeMap::new();
 
                     let mut last_index = obj.get_next_enumerant(0, activation)?;
@@ -237,11 +237,11 @@ impl Value {
 
     pub fn into_avm2<'gc>(self, context: &mut UpdateContext<'gc>) -> Avm2Value<'gc> {
         match self {
-            Value::Undefined => Avm2Value::Undefined,
-            Value::Null => Avm2Value::Null,
-            Value::Bool(value) => Avm2Value::Bool(value),
-            Value::Number(value) => Avm2Value::Number(value),
-            Value::String(value) => Avm2Value::String(AvmString::new_utf8(context.gc(), value)),
+            Value::Undefined => Avm2Value::UNDEFINED,
+            Value::Null => Avm2Value::NULL,
+            Value::Bool(value) => Avm2Value::from_bool(value),
+            Value::Number(value) => Avm2Value::from_f64(value),
+            Value::String(value) => Avm2Value::from_string(AvmString::new_utf8(context.gc(), value)),
             Value::Object(values) => {
                 let obj = Avm2ScriptObject::new_object(context);
 
@@ -250,7 +250,7 @@ impl Value {
                     let value = value.into_avm2(context);
                     obj.set_dynamic_property(key, value, context.gc());
                 }
-                Avm2Value::Object(obj)
+                Avm2Value::from_object(obj)
             }
             Value::List(values) => {
                 let storage = values
@@ -319,7 +319,7 @@ impl<'gc> Callback<'gc> {
 
                 let result = method.call(
                     &mut activation,
-                    Avm2Value::Null,
+                    Avm2Value::NULL,
                     FunctionArgs::from_slice(&args),
                 );
                 match result.and_then(|value| Value::from_avm2(&mut activation, value)) {

@@ -1,7 +1,7 @@
 //! Object representation for IndexBuffer3D objects
 
 use crate::avm2::activation::Activation;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{Object, TObject};
 use gc_arena::{Collect, Gc, GcWeak};
 use ruffle_common::utils::HasPrefixField;
@@ -29,7 +29,7 @@ impl<'gc> IndexBuffer3DObject<'gc> {
         IndexBuffer3DObject(Gc::new(
             activation.gc(),
             IndexBuffer3DObjectData {
-                base: ScriptObjectData::new(class),
+                base: ScriptObjectData::new(class, ObjectType::IndexBuffer3DObject),
                 context3d,
                 handle: RefCell::new(handle),
                 count: Cell::new(0),

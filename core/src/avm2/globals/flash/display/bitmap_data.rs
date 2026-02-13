@@ -142,7 +142,7 @@ pub fn init<'gc>(
     new_bitmap_data.init_object2(activation.gc(), bitmap_data_obj);
     bitmap_data_obj.init_bitmap_data(activation.gc(), new_bitmap_data);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `BitmapData.width`'s getter.
@@ -158,7 +158,7 @@ pub fn get_width<'gc>(
         return Ok((bitmap_data.width() as i32).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `BitmapData.height`'s getter.
@@ -174,7 +174,7 @@ pub fn get_height<'gc>(
         return Ok((bitmap_data.height() as i32).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `BitmapData.transparent`'s getter.
@@ -190,7 +190,7 @@ pub fn get_transparent<'gc>(
         return Ok(bitmap_data.transparency().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `BitmapData.scroll`.
@@ -215,7 +215,7 @@ pub fn scroll<'gc>(
         );
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `BitmapData.copyPixels`.
@@ -293,7 +293,7 @@ pub fn copy_pixels<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `BitmapData.getPixels`.
@@ -324,7 +324,7 @@ pub fn get_pixels<'gc>(
         return Ok(bytearray.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `BitmapData.copyPixelsToByteArray`.
@@ -352,7 +352,7 @@ pub fn copy_pixels_to_byte_array<'gc>(
         )?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_vector<'gc>(
@@ -382,7 +382,7 @@ pub fn get_vector<'gc>(
         return Ok(VectorObject::from_vector(new_storage, activation).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `BitmapData.getPixel`.
@@ -401,7 +401,7 @@ pub fn get_pixel<'gc>(
         return Ok(col.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `BitmapData.getPixel32`.
@@ -420,7 +420,7 @@ pub fn get_pixel32<'gc>(
         return Ok(pixel.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `BitmapData.setPixel`.
@@ -445,7 +445,7 @@ pub fn set_pixel<'gc>(
         );
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `BitmapData.setPixel32`.
@@ -473,7 +473,7 @@ pub fn set_pixel32<'gc>(
         );
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `BitmapData.setPixels`.
@@ -507,7 +507,7 @@ pub fn set_pixels<'gc>(
         .map_err(|e| e.to_avm(activation))?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `BitmapData.setVector`.
@@ -563,7 +563,7 @@ pub fn set_vector<'gc>(
         )?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `BitmapData.copyChannel`.
@@ -610,7 +610,7 @@ pub fn copy_channel<'gc>(
             );
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn flood_fill<'gc>(
@@ -637,7 +637,7 @@ pub fn flood_fill<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn noise<'gc>(
@@ -668,7 +668,7 @@ pub fn noise<'gc>(
             gray_scale,
         );
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn color_transform<'gc>(
@@ -709,7 +709,7 @@ pub fn color_transform<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_color_bounds_rect<'gc>(
@@ -744,7 +744,7 @@ pub fn get_color_bounds_rect<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn lock<'gc>(
@@ -763,7 +763,7 @@ pub fn lock<'gc>(
     // ("Show Redraw Regions" in Flash Player debugger context menu).
     //
     // Ruffle has no concept of a player dirty region for now, so this has no effect.
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn unlock<'gc>(
@@ -772,7 +772,7 @@ pub fn unlock<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     // No effect (see comments for `lock`).
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn hit_test<'gc>(
@@ -802,7 +802,7 @@ pub fn hit_test<'gc>(
                 .rectangle
                 .inner_class_definition();
 
-            let Value::Object(compare_object) = compare_object else {
+            let Some(compare_object) = compare_object.as_object() else {
                 // This is the error message Flash Player produces. Even though it's misleading.
                 return Err(make_error_2005(activation, 0, "BitmapData"));
             };
@@ -818,7 +818,7 @@ pub fn hit_test<'gc>(
                         .coerce_to_i32(activation)?
                         - top_left.1,
                 );
-                return Ok(Value::Bool(operations::hit_test_point(
+                return Ok(Value::from_bool(operations::hit_test_point(
                     activation.context.renderer,
                     bitmap_data,
                     source_threshold,
@@ -843,7 +843,7 @@ pub fn hit_test<'gc>(
                         .get_slot(rectangle_slots::HEIGHT)
                         .coerce_to_i32(activation)?,
                 );
-                return Ok(Value::Bool(operations::hit_test_rectangle(
+                return Ok(Value::from_bool(operations::hit_test_rectangle(
                     activation.context.renderer,
                     bitmap_data,
                     source_threshold,
@@ -872,7 +872,7 @@ pub fn hit_test<'gc>(
                     second_point,
                     second_threshold,
                 );
-                return Ok(Value::Bool(result));
+                return Ok(Value::from_bool(result));
             } else if let Some(bitmap) = compare_object
                 .as_display_object()
                 .and_then(|dobj| dobj.as_bitmap())
@@ -890,7 +890,7 @@ pub fn hit_test<'gc>(
                 );
                 let second_threshold = args.get_u32(4).clamp(0, u8::MAX.into()) as u8;
 
-                return Ok(Value::Bool(operations::hit_test_bitmapdata(
+                return Ok(Value::from_bool(operations::hit_test_bitmapdata(
                     activation.context.renderer,
                     bitmap_data,
                     top_left,
@@ -987,7 +987,7 @@ pub fn draw<'gc>(
             }
         };
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `BitmapData.drawWithQuality`
@@ -1071,7 +1071,7 @@ pub fn draw_with_quality<'gc>(
             }
         };
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `BitmapData.fillRect`
@@ -1101,7 +1101,7 @@ pub fn fill_rect<'gc>(
             color,
         );
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `BitmapData.dispose`
@@ -1117,7 +1117,7 @@ pub fn dispose<'gc>(
         // multiple times
         bitmap_data.dispose(activation.gc());
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `BitmapData.rect`
@@ -1139,7 +1139,7 @@ pub fn get_rect<'gc>(
             ],
         );
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `BitmapData.applyFilter`
@@ -1218,7 +1218,7 @@ pub fn apply_filter<'gc>(
             filter,
         );
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `BitmapData.clone`
@@ -1240,7 +1240,7 @@ pub fn clone<'gc>(
             return Ok(new_bitmap_data_object.into());
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `BitmapData.paletteMap`
@@ -1310,7 +1310,7 @@ pub fn palette_map<'gc>(
         );
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `BitmapData.perlinNoise`
@@ -1339,7 +1339,7 @@ pub fn perlin_noise<'gc>(
                 .map(|i| {
                     if let Some(offsets) = offsets {
                         if let Some(offsets) = offsets.as_array_storage() {
-                            if let Some(Value::Object(point)) = offsets.get(i) {
+                            if let Some(point) = offsets.get(i).and_then(|v| v.as_object()) {
                                 if point.is_of_type(point_class) {
                                     let x = point
                                         .get_slot(point_slots::X)
@@ -1380,7 +1380,7 @@ pub fn perlin_noise<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `BitmapData.threshold`
@@ -1441,7 +1441,7 @@ pub fn threshold<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implement `BitmapData.compare`
@@ -1566,7 +1566,7 @@ pub fn pixel_dissolve<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 // Implements `BitmapData.merge`.
@@ -1621,5 +1621,5 @@ pub fn merge<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

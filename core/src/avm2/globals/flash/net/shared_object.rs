@@ -48,14 +48,14 @@ pub fn get_local<'gc>(
     const INVALID_CHARS: &str = "~%&\\;:\"',<>?# ";
     if name.contains(|c| INVALID_CHARS.contains(c)) {
         tracing::error!("SharedObject::get_local: Invalid character in name");
-        return Ok(Value::Null);
+        return Ok(Value::NULL);
     }
 
     let mut movie_url = if let Ok(url) = url::Url::parse(activation.context.root_swf.url()) {
         url
     } else {
         tracing::error!("SharedObject::get_local: Unable to parse movie URL");
-        return Ok(Value::Null);
+        return Ok(Value::NULL);
     };
     movie_url.set_query(None);
     movie_url.set_fragment(None);
@@ -67,7 +67,7 @@ pub fn get_local<'gc>(
         tracing::warn!(
             "SharedObject.get_local: Tried to load a secure shared object from non-HTTPS origin"
         );
-        return Ok(Value::Null);
+        return Ok(Value::NULL);
     }
 
     // Shared objects are sandboxed per-domain.
@@ -91,7 +91,7 @@ pub fn get_local<'gc>(
     let local_path = if let Some(local_path) = local_path {
         // Empty local path always fails.
         if local_path.is_empty() {
-            return Ok(Value::Null);
+            return Ok(Value::NULL);
         }
 
         // Remove leading/trailing slashes.
@@ -122,7 +122,7 @@ pub fn get_local<'gc>(
             local_path
         } else {
             tracing::warn!("SharedObject.get_local: localPath parameter does not match SWF path");
-            return Ok(Value::Null);
+            return Ok(Value::NULL);
         }
     } else {
         Cow::Borrowed(movie_path)
@@ -138,7 +138,7 @@ pub fn get_local<'gc>(
     // so let's disallow them altogether.
     if full_name.split('/').any(|s| s.starts_with('.')) {
         tracing::error!("SharedObject.get_local: Invalid path with .. segments");
-        return Ok(Value::Null);
+        return Ok(Value::NULL);
     }
 
     // Check if this is referencing an existing shared object
@@ -250,7 +250,7 @@ pub fn close<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm2_stub_method!(activation, "flash.net.SharedObject", "close");
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn clear<'gc>(
@@ -269,7 +269,7 @@ pub fn clear<'gc>(
     let name = shared_object.name();
     activation.context.storage.remove_key(name);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_object_encoding<'gc>(
@@ -287,5 +287,5 @@ pub fn set_object_encoding<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm2_stub_setter!(activation, "flash.net.SharedObject", "objectEncoding");
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

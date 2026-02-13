@@ -1,6 +1,6 @@
 use crate::avm2::activation::Activation;
 use crate::avm2::object::TObject;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use core::fmt;
 use gc_arena::{Collect, Gc, GcWeak};
 use ruffle_common::utils::HasPrefixField;
@@ -38,7 +38,7 @@ impl<'gc> TObject<'gc> for WorkerDomainObject<'gc> {
 impl<'gc> WorkerDomainObject<'gc> {
     pub fn new(activation: &mut Activation<'_, 'gc>) -> Self {
         let class = activation.avm2().classes().workerdomain;
-        let base = ScriptObjectData::new(class);
+        let base = ScriptObjectData::new(class, ObjectType::WorkerDomainObject);
         WorkerDomainObject(Gc::new(activation.gc(), WorkerDomainObjectData { base }))
     }
 }

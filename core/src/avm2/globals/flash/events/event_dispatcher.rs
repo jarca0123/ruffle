@@ -5,7 +5,7 @@ use crate::avm2::events;
 use crate::avm2::globals::slots::flash_events_event_dispatcher as slots;
 use crate::avm2::object::{DispatchObject, Object, TObject as _};
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueKind};
 use crate::avm2::{Avm2, Error};
 
 /// Get an object's dispatch list, lazily initializing it if necessary.
@@ -13,8 +13,8 @@ fn dispatch_list<'gc>(
     activation: &mut Activation<'_, 'gc>,
     this: Object<'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    match this.get_slot(slots::DISPATCH_LIST) {
-        Value::Object(o) => Ok(o),
+    match this.get_slot(slots::DISPATCH_LIST).kind() {
+        ValueKind::Object(o) => Ok(o),
         _ => {
             let dispatch_list = DispatchObject::empty_list(activation);
             this.set_slot(slots::DISPATCH_LIST, dispatch_list.into(), activation)?;
@@ -46,7 +46,7 @@ pub fn add_event_listener<'gc>(
 
     Avm2::register_broadcast_listener(activation.context, this, event_type);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `EventDispatcher.removeEventListener`.
@@ -67,7 +67,7 @@ pub fn remove_event_listener<'gc>(
         .expect("Internal properties should have what I put in them")
         .remove_event_listener(event_type, listener, use_capture);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `EventDispatcher.hasEventListener`.
@@ -112,7 +112,7 @@ pub fn will_trigger<'gc>(
     let target = this.get_slot(slots::TARGET).as_object().unwrap_or(this);
 
     if let Some(parent) = events::parent_of(target) {
-        return will_trigger(activation, Value::Object(parent), args);
+        return will_trigger(activation, Value::from_object(parent), args);
     }
 
     Ok(false.into())

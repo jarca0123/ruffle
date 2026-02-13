@@ -34,7 +34,7 @@ pub fn update_after_event<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     *activation.context.needs_render = true;
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub(super) fn local_to_stage_x<'gc>(
@@ -48,19 +48,19 @@ pub(super) fn local_to_stage_x<'gc>(
         let local_y = this.get_slot(slot_y).coerce_to_number(activation)?;
 
         if local_x.is_nan() || local_y.is_nan() {
-            return Ok(Value::Number(local_x));
+            return Ok(Value::from_f64(local_x));
         } else if let Some(target) = evt.target().and_then(|t| t.as_display_object()) {
             let local = Point::from_pixels(local_x, local_y);
             // `local_to_global` does a matrix multiplication, which in general
             // depends on both the x and y coordinates.
             let global = target.local_to_global(local);
-            return Ok(Value::Number(global.x.to_pixels()));
+            return Ok(Value::from_f64(global.x.to_pixels()));
         } else {
-            return Ok(Value::Number(local_x * 0.0));
+            return Ok(Value::from_f64(local_x * 0.0));
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub(super) fn local_to_stage_y<'gc>(
@@ -74,17 +74,17 @@ pub(super) fn local_to_stage_y<'gc>(
         let local_y = this.get_slot(slot_y).coerce_to_number(activation)?;
 
         if local_x.is_nan() || local_y.is_nan() {
-            return Ok(Value::Number(local_y));
+            return Ok(Value::from_f64(local_y));
         } else if let Some(target) = evt.target().and_then(|t| t.as_display_object()) {
             let local = Point::from_pixels(local_x, local_y);
             // `local_to_global` does a matrix multiplication, which in general
             // depends on both the x and y coordinates.
             let global = target.local_to_global(local);
-            return Ok(Value::Number(global.y.to_pixels()));
+            return Ok(Value::from_f64(global.y.to_pixels()));
         } else {
-            return Ok(Value::Number(local_y * 0.0));
+            return Ok(Value::from_f64(local_y * 0.0));
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

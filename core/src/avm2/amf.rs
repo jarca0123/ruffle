@@ -8,6 +8,7 @@ use crate::avm2::bytearray::ByteArrayStorage;
 use crate::avm2::class::Class;
 use crate::avm2::object::{ByteArrayObject, ClassObject, ScriptObject, TObject, VectorObject};
 use crate::avm2::vector::VectorStorage;
+use crate::avm2::value::ValueKind;
 use crate::avm2::{Activation, Error, Object, Value};
 use crate::avm2_stub_method;
 use crate::string::AvmString;
@@ -25,17 +26,17 @@ pub fn serialize_value<'gc>(
     amf_version: AMFVersion,
     object_table: &mut ObjectTable<'gc>,
 ) -> Option<AmfValue> {
-    match elem.normalize() {
-        Value::Undefined => Some(AmfValue::Undefined),
-        Value::Null => Some(AmfValue::Null),
-        Value::Bool(b) => Some(AmfValue::Bool(b)),
-        Value::Number(f) => Some(AmfValue::Number(f)),
+    match elem.normalize().kind() {
+        ValueKind::Undefined => Some(AmfValue::Undefined),
+        ValueKind::Null => Some(AmfValue::Null),
+        ValueKind::Bool(b) => Some(AmfValue::Bool(b)),
+        ValueKind::Number(f) => Some(AmfValue::Number(f)),
         // Integers are unsupported in AMF0, and must be converted to Number regardless of whether
         // it can be represented as an integer.
-        Value::Integer(i) if amf_version == AMFVersion::AMF0 => Some(AmfValue::Number(i as f64)),
-        Value::Integer(i) => Some(AmfValue::Integer(i)),
-        Value::String(s) => Some(AmfValue::String(s.to_string())),
-        Value::Object(o) => {
+        ValueKind::Integer(i) if amf_version == AMFVersion::AMF0 => Some(AmfValue::Number(i as f64)),
+        ValueKind::Integer(i) => Some(AmfValue::Integer(i)),
+        ValueKind::String(s) => Some(AmfValue::String(s.to_string())),
+        ValueKind::Object(o) => {
             // TODO: Find a more general rule for which object types should be skipped,
             // and which turn into undefined.
             if o.as_function_object().is_some() {
@@ -325,11 +326,11 @@ pub fn deserialize_value_impl<'gc>(
     object_map: &mut BTreeMap<ObjectId, Object<'gc>>,
 ) -> Result<Value<'gc>, Error<'gc>> {
     Ok(match val {
-        AmfValue::Null => Value::Null,
-        AmfValue::Undefined => Value::Undefined,
+        AmfValue::Null => Value::NULL,
+        AmfValue::Undefined => Value::UNDEFINED,
         AmfValue::Number(f) => (*f).into(),
         AmfValue::Integer(num) => (*num).into(),
-        AmfValue::String(s) => Value::String(AvmString::new_utf8(activation.gc(), s)),
+        AmfValue::String(s) => Value::from_string(AvmString::new_utf8(activation.gc(), s)),
         AmfValue::Bool(b) => (*b).into(),
         AmfValue::ByteArray(bytes) => {
             let storage = ByteArrayStorage::from_vec(activation.context, bytes.clone());
@@ -426,7 +427,7 @@ pub fn deserialize_value_impl<'gc>(
             .construct(activation, &[(*time).into()])?,
         AmfValue::XML(content, _) => activation.avm2().classes().xml.construct(
             activation,
-            &[Value::String(AvmString::new_utf8(activation.gc(), content))],
+            &[Value::from_string(AvmString::new_utf8(activation.gc(), content))],
         )?,
         AmfValue::VectorDouble(vec, is_fixed) => {
             let storage = VectorStorage::from_values(
@@ -468,8 +469,8 @@ pub fn deserialize_value_impl<'gc>(
                     deserialize_value_impl(activation, v, object_map).map(|value| {
                         // There's no Vector.<void>: convert any
                         // Undefined items in the Vector to Null.
-                        if matches!(value, Value::Undefined) {
-                            Value::Null
+                        if value.is_undefined() {
+                            Value::NULL
                         } else {
                             value
                         }
@@ -500,7 +501,7 @@ pub fn deserialize_value_impl<'gc>(
                 let key = deserialize_value_impl(activation, key, object_map)?;
                 let value = deserialize_value_impl(activation, value, object_map)?;
 
-                if let Value::Object(key) = key {
+                if let Some(key) = key.as_object() {
                     dict_obj.set_property_by_object(key, value, activation.gc());
                 } else {
                     let key_string = key.coerce_to_string(activation)?;
@@ -511,17 +512,17 @@ pub fn deserialize_value_impl<'gc>(
         }
         AmfValue::Custom(..) => {
             tracing::error!("Deserialization not yet implemented for Custom: {:?}", val);
-            Value::Undefined
+            Value::UNDEFINED
         }
         AmfValue::Reference(_) => {
             tracing::error!(
                 "Deserialization not yet implemented for Reference: {:?}",
                 val
             );
-            Value::Undefined
+            Value::UNDEFINED
         }
         AmfValue::AMF3(val) => deserialize_value_impl(activation, val, object_map)?,
-        AmfValue::Unsupported => Value::Undefined,
+        AmfValue::Unsupported => Value::UNDEFINED,
         AmfValue::Amf3ObjectReference(r) => {
             if let Some(o) = object_map.get(r) {
                 (*o).into()
@@ -529,7 +530,7 @@ pub fn deserialize_value_impl<'gc>(
                 tracing::error!(
                     "AMF3 deserializer got an object reference {r:?} to an object we've not seen yet"
                 );
-                Value::Undefined
+                Value::UNDEFINED
             }
         }
     })

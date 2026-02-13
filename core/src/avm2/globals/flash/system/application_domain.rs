@@ -30,7 +30,7 @@ pub fn init<'gc>(
     let fresh_domain = Domain::movie_domain(activation.context, parent_domain);
     target_domain.init_domain(activation.gc(), fresh_domain);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `currentDomain` static property.
@@ -57,13 +57,13 @@ pub fn get_parent_domain<'gc>(
     if let Some(appdomain) = this.as_application_domain() {
         if let Some(parent_domain) = appdomain.parent_domain() {
             if parent_domain.is_playerglobals_domain(activation.avm2()) {
-                return Ok(Value::Null);
+                return Ok(Value::NULL);
             }
             return Ok(DomainObject::from_domain(activation, parent_domain).into());
         }
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 /// `getDefinition` method
@@ -80,7 +80,7 @@ pub fn get_definition<'gc>(
         return appdomain.get_defined_value_handling_vector(activation, name);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `hasDefinition` method
@@ -101,7 +101,7 @@ pub fn has_definition<'gc>(
         return Ok(result.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// 'getQualifiedDefinitionNames' method.
@@ -126,7 +126,7 @@ pub fn get_qualified_definition_names<'gc>(
                 .get_defined_names()
                 .iter()
                 .filter(|name| !name.namespace().is_private())
-                .map(|name| Value::String(name.to_qualified_name(activation.gc())))
+                .map(|name| Value::from_string(name.to_qualified_name(activation.gc())))
                 .collect(),
             false,
             Some(activation.avm2().class_defs().string),
@@ -137,7 +137,7 @@ pub fn get_qualified_definition_names<'gc>(
         return Ok(name_vector.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `domainMemory` property setter
@@ -157,7 +157,7 @@ pub fn set_domain_memory<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `domainMemory` property getter
@@ -170,12 +170,12 @@ pub fn get_domain_memory<'gc>(
 
     if let Some(appdomain) = this.as_application_domain() {
         if appdomain.is_default_domain_memory() {
-            return Ok(Value::Null);
+            return Ok(Value::NULL);
         } else {
             let bytearray_object: Object<'gc> = appdomain.domain_memory().into();
             return Ok(bytearray_object.into());
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

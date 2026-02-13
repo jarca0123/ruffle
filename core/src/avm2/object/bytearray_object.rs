@@ -2,7 +2,7 @@ use crate::avm2::Error;
 use crate::avm2::Multiname;
 use crate::avm2::activation::Activation;
 use crate::avm2::bytearray::ByteArrayStorage;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{ArrayObject, ClassObject, Object, TObject};
 use crate::avm2::value::Value;
 use crate::character::Character;
@@ -43,7 +43,7 @@ pub fn byte_array_allocator<'gc>(
         unreachable!("A ByteArray subclass should have ByteArray in superclass chain")
     });
 
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::ByteArrayObject);
 
     Ok(ByteArrayObject(Gc::new(
         activation.gc(),
@@ -84,7 +84,7 @@ pub struct ByteArrayObjectData<'gc> {
 impl<'gc> ByteArrayObject<'gc> {
     pub fn from_storage(context: &mut UpdateContext<'gc>, bytes: ByteArrayStorage) -> Self {
         let class = context.avm2.classes().bytearray;
-        let base = ScriptObjectData::new(class);
+        let base = ScriptObjectData::new(class, ObjectType::ByteArrayObject);
 
         ByteArrayObject(Gc::new(
             context.gc(),
@@ -146,7 +146,7 @@ impl<'gc> TObject<'gc> for ByteArrayObject<'gc> {
                 .storage
                 .borrow()
                 .get(index)
-                .map_or(Value::Undefined, |val| Value::Integer(val as i32)),
+                .map_or(Value::UNDEFINED, |val| Value::from_integer(val as i32)),
         )
     }
 

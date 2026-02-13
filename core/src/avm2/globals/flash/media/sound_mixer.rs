@@ -39,7 +39,7 @@ pub fn set_sound_transform<'gc>(
 
     activation.context.set_global_sound_transform(dobj_st);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `SoundMixer.stopAll`
@@ -50,7 +50,7 @@ pub fn stop_all<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     activation.context.stop_all_sounds();
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `bufferTime`'s getter
@@ -75,7 +75,7 @@ pub fn set_buffer_time<'gc>(
         .audio_manager
         .set_stream_buffer_time(buffer_time);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `SoundMixer.areSoundsInaccessible`
@@ -189,5 +189,5 @@ pub fn compute_spectrum<'gc>(
     }
     // The read head has to be rewound for AS.
     bytearray.set_position(0);
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

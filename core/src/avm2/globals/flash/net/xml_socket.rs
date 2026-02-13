@@ -23,8 +23,8 @@ pub fn get_domain<'gc>(
         }
     } else {
         tracing::error!("XMLSocket::connect: Unable to parse movie URL");
-        return Ok(Value::Null);
+        return Ok(Value::NULL);
     };
 
-    Ok(Value::String(domain))
+    Ok(Value::from_string(domain))
 }

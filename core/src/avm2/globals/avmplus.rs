@@ -5,6 +5,7 @@ use crate::avm2::method::Method;
 use crate::avm2::object::{ArrayObject, ScriptObject, TObject as _};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::property::Property;
+use crate::avm2::value::ValueKind;
 use crate::avm2::{Activation, Error, Multiname, Namespace, Object, Value};
 use crate::context::UpdateContext;
 use crate::string::{AvmString, StringContext};
@@ -31,7 +32,7 @@ pub fn describe_type_json<'gc>(
         if let Some(i_class) = used_class_def.i_class() {
             used_class_def = i_class;
         } else {
-            return Ok(Value::Null);
+            return Ok(Value::NULL);
         }
     }
 
@@ -65,7 +66,7 @@ pub fn describe_type_json<'gc>(
     if flags.contains(DescribeTypeFlags::INCLUDE_TRAITS) {
         object.set_dynamic_property(istr!("traits"), traits.into(), activation.gc());
     } else {
-        object.set_dynamic_property(istr!("traits"), Value::Null, activation.gc());
+        object.set_dynamic_property(istr!("traits"), Value::NULL, activation.gc());
     }
 
     Ok(object.into())
@@ -106,31 +107,31 @@ fn describe_internal_body<'gc>(
     if flags.contains(DescribeTypeFlags::INCLUDE_BASES) {
         traits.set_dynamic_property(istr!(context, "bases"), bases.into(), mc);
     } else {
-        traits.set_dynamic_property(istr!(context, "bases"), Value::Null, mc);
+        traits.set_dynamic_property(istr!(context, "bases"), Value::NULL, mc);
     }
 
     if flags.contains(DescribeTypeFlags::INCLUDE_INTERFACES) {
         traits.set_dynamic_property(istr!(context, "interfaces"), interfaces.into(), mc);
     } else {
-        traits.set_dynamic_property(istr!(context, "interfaces"), Value::Null, mc);
+        traits.set_dynamic_property(istr!(context, "interfaces"), Value::NULL, mc);
     }
 
     if flags.contains(DescribeTypeFlags::INCLUDE_VARIABLES) {
         traits.set_dynamic_property(istr!(context, "variables"), variables.into(), mc);
     } else {
-        traits.set_dynamic_property(istr!(context, "variables"), Value::Null, mc);
+        traits.set_dynamic_property(istr!(context, "variables"), Value::NULL, mc);
     }
 
     if flags.contains(DescribeTypeFlags::INCLUDE_ACCESSORS) {
         traits.set_dynamic_property(istr!(context, "accessors"), accessors.into(), mc);
     } else {
-        traits.set_dynamic_property(istr!(context, "accessors"), Value::Null, mc);
+        traits.set_dynamic_property(istr!(context, "accessors"), Value::NULL, mc);
     }
 
     if flags.contains(DescribeTypeFlags::INCLUDE_METHODS) {
         traits.set_dynamic_property(istr!(context, "methods"), methods.into(), mc);
     } else {
-        traits.set_dynamic_property(istr!(context, "methods"), Value::Null, mc);
+        traits.set_dynamic_property(istr!(context, "methods"), Value::NULL, mc);
     }
 
     let mut bases_array = bases.storage_mut(mc);
@@ -220,11 +221,11 @@ fn describe_internal_body<'gc>(
                 variable.set_dynamic_property(istr!(context, "access"), access.into(), mc);
                 variable.set_dynamic_property(
                     istr!(context, "uri"),
-                    uri.map_or(Value::Null, |u| u.into()),
+                    uri.map_or(Value::NULL, |u| u.into()),
                     mc,
                 );
 
-                variable.set_dynamic_property(istr!(context, "metadata"), Value::Null, mc);
+                variable.set_dynamic_property(istr!(context, "metadata"), Value::NULL, mc);
 
                 if flags.contains(DescribeTypeFlags::INCLUDE_METADATA) {
                     let metadata_object = ArrayObject::empty(context);
@@ -289,14 +290,14 @@ fn describe_internal_body<'gc>(
 
                 method_obj.set_dynamic_property(
                     istr!(context, "uri"),
-                    uri.map_or(Value::Null, |u| u.into()),
+                    uri.map_or(Value::NULL, |u| u.into()),
                     mc,
                 );
 
                 let params = write_params(method, context);
                 method_obj.set_dynamic_property(istr!(context, "parameters"), params.into(), mc);
 
-                method_obj.set_dynamic_property(istr!(context, "metadata"), Value::Null, mc);
+                method_obj.set_dynamic_property(istr!(context, "metadata"), Value::NULL, mc);
 
                 if flags.contains(DescribeTypeFlags::INCLUDE_METADATA) {
                     let metadata_object = ArrayObject::empty(context);
@@ -370,7 +371,7 @@ fn describe_internal_body<'gc>(
                 );
                 accessor_obj.set_dynamic_property(
                     istr!(context, "uri"),
-                    uri.map_or(Value::Null, |u| u.into()),
+                    uri.map_or(Value::NULL, |u| u.into()),
                     mc,
                 );
 
@@ -397,7 +398,7 @@ fn describe_internal_body<'gc>(
                         mc,
                     );
                 } else {
-                    accessor_obj.set_dynamic_property(istr!(context, "metadata"), Value::Null, mc);
+                    accessor_obj.set_dynamic_property(istr!(context, "metadata"), Value::NULL, mc);
                 }
 
                 accessors_array.push(accessor_obj.into());
@@ -414,7 +415,7 @@ fn describe_internal_body<'gc>(
         traits.set_dynamic_property(istr!(context, "constructor"), params.into(), mc);
     } else {
         // This is needed to override the normal 'constructor' property
-        traits.set_dynamic_property(istr!(context, "constructor"), Value::Null, mc);
+        traits.set_dynamic_property(istr!(context, "constructor"), Value::NULL, mc);
     }
 
     if flags.contains(DescribeTypeFlags::INCLUDE_METADATA) {
@@ -428,7 +429,7 @@ fn describe_internal_body<'gc>(
         let metadata_object = ArrayObject::empty(context);
         traits.set_dynamic_property(istr!(context, "metadata"), metadata_object.into(), mc);
     } else {
-        traits.set_dynamic_property(istr!(context, "metadata"), Value::Null, mc);
+        traits.set_dynamic_property(istr!(context, "metadata"), Value::NULL, mc);
     }
 
     traits
@@ -473,8 +474,8 @@ fn write_metadata<'gc>(
     }
 }
 
-/// Like `Value::instance_class`, but supports Value::Null and Value::Undefined,
-/// and returns `int` for Value::Integer instead of `Number`.
+/// Like `Value::instance_class`, but supports null and undefined Values,
+/// and returns `int` for integer Values instead of `Number`.
 ///
 /// Used for `describeType`, `getQualifiedClassName`, and `getQualifiedSuperClassName`.
 pub fn instance_class_describe_type<'gc>(
@@ -483,10 +484,10 @@ pub fn instance_class_describe_type<'gc>(
 ) -> Class<'gc> {
     let class_defs = activation.avm2().class_defs();
 
-    match value.normalize() {
-        Value::Null => class_defs.null,
-        Value::Undefined => class_defs.void,
-        Value::Integer(_) => class_defs.int,
-        value => value.instance_class(activation),
+    match value.normalize().kind() {
+        ValueKind::Null => class_defs.null,
+        ValueKind::Undefined => class_defs.void,
+        ValueKind::Integer(_) => class_defs.int,
+        _ => value.instance_class(activation),
     }
 }

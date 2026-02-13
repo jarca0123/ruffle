@@ -13,7 +13,7 @@ pub fn number_constructor<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let number_value = args
         .get_optional(0)
-        .unwrap_or(Value::Integer(0))
+        .unwrap_or(Value::from_integer(0))
         .coerce_to_number(activation)?;
 
     Ok(number_value.into())
@@ -45,7 +45,7 @@ pub fn call_handler<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     Ok(args
         .get_optional(0)
-        .unwrap_or(Value::Number(0.0))
+        .unwrap_or(Value::from_f64(0.0))
         .coerce_to_number(activation)?
         .into())
 }

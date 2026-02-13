@@ -6,7 +6,7 @@ use crate::avm2::Error;
 use crate::avm2::Namespace;
 use crate::avm2::activation::Activation;
 use crate::avm2::api_version::ApiVersion;
-use crate::avm2::object::{Object, QNameObject};
+use crate::avm2::object::QNameObject;
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
 
@@ -43,31 +43,35 @@ pub fn q_name_constructor<'gc>(
         let ns_arg = args.get_value(0);
         let mut local_arg = args.get_value(1);
 
-        if matches!(local_arg, Value::Undefined) {
+        if local_arg.is_undefined() {
             local_arg = istr!("").into();
         }
 
         let api_version = activation.avm2().root_api_version;
 
-        let namespace = match ns_arg {
-            Value::Object(Object::NamespaceObject(ns)) => Some(ns.namespace()),
-            Value::Object(Object::QNameObject(qname)) => qname
+        let namespace = if let Some(ns) = ns_arg.as_object().and_then(|o| o.as_namespace_object()) {
+            Some(ns.namespace())
+        } else if let Some(qname) = ns_arg.as_object().and_then(|o| o.as_qname_object()) {
+            qname
                 .uri(activation.strings())
-                .map(|uri| Namespace::package(uri, ApiVersion::AllVersions, activation.strings())),
-            Value::Null => None,
-            Value::Undefined => Some(Namespace::package(
+                .map(|uri| Namespace::package(uri, ApiVersion::AllVersions, activation.strings()))
+        } else if ns_arg.is_null() {
+            None
+        } else if ns_arg.is_undefined() {
+            Some(Namespace::package(
                 istr!(""),
                 api_version,
                 activation.strings(),
-            )),
-            v => Some(Namespace::package(
-                v.coerce_to_string(activation)?,
+            ))
+        } else {
+            Some(Namespace::package(
+                ns_arg.coerce_to_string(activation)?,
                 api_version,
                 activation.strings(),
-            )),
+            ))
         };
 
-        if let Value::Object(Object::QNameObject(qname)) = local_arg {
+        if let Some(qname) = local_arg.as_object().and_then(|o| o.as_qname_object()) {
             this.set_local_name(activation.gc(), qname.local_name(activation.strings()));
         } else {
             this.set_local_name(activation.gc(), local_arg.coerce_to_string(activation)?);
@@ -75,13 +79,13 @@ pub fn q_name_constructor<'gc>(
 
         namespace
     } else {
-        let qname_arg = args.get_optional(0).unwrap_or(Value::Undefined);
-        if let Value::Object(Object::QNameObject(qname_obj)) = qname_arg {
+        let qname_arg = args.get_optional(0).unwrap_or(Value::UNDEFINED);
+        if let Some(qname_obj) = qname_arg.as_object().and_then(|o| o.as_qname_object()) {
             this.init_name(activation.gc(), qname_obj.name().clone());
             return Ok(this.into());
         }
 
-        let local = if qname_arg == Value::Undefined {
+        let local = if qname_arg == Value::UNDEFINED {
             istr!("")
         } else {
             qname_arg.coerce_to_string(activation)?
@@ -115,7 +119,7 @@ pub fn get_local_name<'gc>(
         return Ok(this.local_name(activation.strings()).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `QName.uri`'s getter
@@ -129,10 +133,10 @@ pub fn get_uri<'gc>(
     if let Some(this) = this.as_qname_object() {
         return Ok(this
             .uri(activation.strings())
-            .map_or_else(|| Value::Null, Value::from));
+            .map_or_else(|| Value::NULL, Value::from));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `QName.AS3::toString` and `QName.prototype.toString`
@@ -147,5 +151,5 @@ pub fn to_string<'gc>(
         return Ok(this.name().as_uri(activation.strings()).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

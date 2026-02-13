@@ -31,5 +31,5 @@ pub fn fscommand<'gc>(
         tracing::warn!("Unknown FSCommand: {}", command);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

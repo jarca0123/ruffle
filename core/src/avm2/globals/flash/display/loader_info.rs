@@ -34,7 +34,7 @@ pub fn get_action_script_version<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `applicationDomain` getter
@@ -57,7 +57,7 @@ pub fn get_application_domain<'gc>(
                 if let Some(domain) = domain {
                     return Ok(DomainObject::from_domain(activation, domain).into());
                 } else {
-                    return Ok(Value::Null);
+                    return Ok(Value::NULL);
                 }
             }
 
@@ -73,7 +73,7 @@ pub fn get_application_domain<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `bytesTotal` getter
@@ -93,7 +93,7 @@ pub fn get_bytes_total<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `bytesLoaded` getter
@@ -136,7 +136,7 @@ pub fn get_content<'gc>(
 
     let loader_info = this.as_loader_info_object().unwrap();
     if !loader_info.expose_content() {
-        return Ok(Value::Null);
+        return Ok(Value::NULL);
     }
 
     let loader_stream = loader_info.loader_stream();
@@ -144,7 +144,7 @@ pub fn get_content<'gc>(
         LoaderStream::Swf(_, root) | LoaderStream::NotYetLoaded(_, Some(root), _) => {
             Ok(root.object2_or_null())
         }
-        _ => Ok(Value::Null),
+        _ => Ok(Value::NULL),
     }
 }
 
@@ -162,13 +162,13 @@ pub fn get_content_type<'gc>(
             ContentType::Jpeg => "image/jpeg",
             ContentType::Png => "image/png",
             ContentType::Gif => "image/gif",
-            ContentType::Unknown => return Ok(Value::Null),
+            ContentType::Unknown => return Ok(Value::NULL),
         };
 
         return Ok(AvmString::new_utf8(activation.gc(), content_type).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `frameRate` getter
@@ -190,7 +190,7 @@ pub fn get_frame_rate<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `height` getter
@@ -212,7 +212,7 @@ pub fn get_height<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `isURLInaccessible` getter
@@ -245,7 +245,7 @@ pub fn get_same_domain<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `childAllowsParent` getter
@@ -348,7 +348,7 @@ pub fn get_swf_version<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `url` getter
@@ -361,7 +361,7 @@ pub fn get_url<'gc>(
 
     if let Some(loader_info) = this.as_loader_info_object() {
         if !loader_info.expose_content() {
-            return Ok(Value::Null);
+            return Ok(Value::NULL);
         }
 
         let loader_stream = loader_info.loader_stream();
@@ -371,7 +371,7 @@ pub fn get_url<'gc>(
         return Ok(AvmString::new_utf8(activation.gc(), root.url()).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `width` getter
@@ -393,7 +393,7 @@ pub fn get_width<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `bytes` getter
@@ -418,7 +418,7 @@ pub fn get_bytes<'gc>(
             // If we haven't even started loading yet (we have no root clip),
             // then return null. FIXME - we should probably store the ByteArray
             // in a field, and initialize it when we start loading.
-            return Ok(Value::Null);
+            return Ok(Value::NULL);
         }
         LoaderStream::NotYetLoaded(swf, Some(dobj), _) => (swf, dobj),
         LoaderStream::Swf(root, dobj) => (root, dobj),
@@ -489,9 +489,9 @@ pub fn get_loader<'gc>(
     let this = this.as_object().unwrap();
 
     if let Some(loader_info) = this.as_loader_info_object() {
-        Ok(loader_info.loader().map_or(Value::Null, |v| v.into()))
+        Ok(loader_info.loader().map_or(Value::NULL, |v| v.into()))
     } else {
-        Ok(Value::Undefined)
+        Ok(Value::UNDEFINED)
     }
 }
 
@@ -513,7 +513,7 @@ pub fn get_loader_url<'gc>(
         return Ok(AvmString::new_utf8(activation.gc(), loader_url).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `parameters` getter
@@ -542,7 +542,7 @@ pub fn get_parameters<'gc>(
         return Ok(params_obj.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `sharedEvents` getter
@@ -556,7 +556,7 @@ pub fn get_shared_events<'gc>(
     if let Some(loader_info) = this.as_loader_info_object() {
         return Ok(loader_info.shared_events().into());
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `uncaughtErrorEvents` getter
@@ -570,5 +570,5 @@ pub fn get_uncaught_error_events<'gc>(
     if let Some(loader_info) = this.as_loader_info_object() {
         return Ok(loader_info.uncaught_error_events().into());
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

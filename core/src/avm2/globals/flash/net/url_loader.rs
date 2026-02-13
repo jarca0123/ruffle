@@ -32,5 +32,5 @@ fn spawn_fetch<'gc>(
         request,
     );
     activation.context.navigator.spawn_future(future);
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

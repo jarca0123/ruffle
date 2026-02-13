@@ -6,7 +6,7 @@ use crate::avm2::e4x::{
 };
 use crate::avm2::error::make_error_1089;
 use crate::avm2::function::FunctionArgs;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2::{Error, Multiname, Namespace};
@@ -29,7 +29,7 @@ pub fn xml_list_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::XmlListObject);
 
     Ok(XmlListObject(Gc::new(
         activation.gc(),
@@ -77,7 +77,7 @@ impl<'gc> XmlListObject<'gc> {
         target_object: Option<XmlOrXmlListObject<'gc>>,
         target_property: Option<Multiname<'gc>>,
     ) -> XmlListObject<'gc> {
-        let base = ScriptObjectData::new(activation.context.avm2.classes().xml_list);
+        let base = ScriptObjectData::new(activation.context.avm2.classes().xml_list, ObjectType::XmlListObject);
         XmlListObject(Gc::new(
             activation.gc(),
             XmlListObjectData {
@@ -316,11 +316,11 @@ impl<'gc> XmlListObject<'gc> {
         other: &Value<'gc>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<bool, Error<'gc>> {
-        if *other == Value::Undefined && self.length() == 0 {
+        if other.is_undefined() && self.length() == 0 {
             return Ok(true);
         }
 
-        if let Value::Object(obj) = other {
+        if let Some(obj) = other.as_object() {
             if let Some(xml_list_obj) = obj.as_xml_list_object() {
                 if self.length() != xml_list_obj.length() {
                     return Ok(false);
@@ -433,8 +433,8 @@ impl<'gc> XmlOrXmlListObject<'gc> {
 
     pub fn as_object(&self) -> Object<'gc> {
         match self {
-            XmlOrXmlListObject::Xml(x) => Object::XmlObject(*x),
-            XmlOrXmlListObject::XmlList(x) => Object::XmlListObject(*x),
+            XmlOrXmlListObject::Xml(x) => (*x).into(),
+            XmlOrXmlListObject::XmlList(x) => (*x).into(),
         }
     }
 
@@ -453,7 +453,7 @@ impl<'gc> XmlOrXmlListObject<'gc> {
             return Ok(Some(XmlOrXmlListObject::XmlList(list)));
         }
 
-        if matches!(value, Value::Null | Value::Undefined) {
+        if value.is_null_or_undefined() {
             return Ok(None);
         }
 
@@ -517,9 +517,9 @@ impl<'gc> TObject<'gc> for XmlListObject<'gc> {
             if let Some(local_name) = name.local_name() {
                 if let Ok(index) = local_name.parse::<usize>() {
                     if let Some(child) = children.get_mut(index) {
-                        return Ok(Value::Object(child.get_or_create_xml(activation).into()));
+                        return Ok(Value::from_object(child.get_or_create_xml(activation).into()));
                     } else {
-                        return Ok(Value::Undefined);
+                        return Ok(Value::UNDEFINED);
                     }
                 }
             }
@@ -589,7 +589,7 @@ impl<'gc> TObject<'gc> for XmlListObject<'gc> {
         //
         // Nevertheless, there may be some weird edge case where this actually matters.
         // To be safe, we'll just perform exactly the same check that avmplus does.
-        if matches!(method, Value::Undefined) {
+        if method.is_undefined() {
             let prop = self.get_property_local(multiname, activation)?;
             if let Some(list) = prop.as_object().and_then(|obj| obj.as_xml_list_object()) {
                 if list.length() == 0 && self.length() == 1 {
@@ -826,7 +826,7 @@ impl<'gc> TObject<'gc> for XmlListObject<'gc> {
                                 *xml.node().kind(),
                                 E4XNodeKind::Attribute(_) | E4XNodeKind::Text(_)
                             ) {
-                                value = Value::Object(xml.into())
+                                value = Value::from_object(xml.into())
                                     .coerce_to_string(activation)?
                                     .into();
                             }
@@ -1045,9 +1045,9 @@ impl<'gc> TObject<'gc> for XmlListObject<'gc> {
                         .get_or_create_xml(activation)
                         .into()
                 })
-                .unwrap_or(Value::Undefined))
+                .unwrap_or(Value::UNDEFINED))
         } else {
-            Ok(Value::Undefined)
+            Ok(Value::UNDEFINED)
         }
     }
 
@@ -1061,12 +1061,12 @@ impl<'gc> TObject<'gc> for XmlListObject<'gc> {
             Ok(index
                 .checked_sub(1)
                 .map(|index| index.into())
-                .unwrap_or(Value::Null))
+                .unwrap_or(Value::NULL))
         } else {
             Ok(self
                 .base()
                 .get_enumerant_name(index - children_len)
-                .unwrap_or(Value::Null))
+                .unwrap_or(Value::NULL))
         }
     }
 

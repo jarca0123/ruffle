@@ -2,6 +2,7 @@ use crate::avm2::object::StyleSheetObject;
 use crate::avm2::property::Property;
 use crate::avm2::{
     Activation, ArrayStorage, ClassObject, Error, Namespace, Object, TObject as _, Value,
+    ValueKind,
 };
 use crate::context::UpdateContext;
 use crate::debug_ui::display_object::open_display_object_button;
@@ -433,14 +434,14 @@ enum ValueWidget {
 
 impl ValueWidget {
     fn new<'gc>(context: &mut UpdateContext<'gc>, value: Value<'gc>) -> Self {
-        match value.normalize() {
-            Value::Undefined => ValueWidget::Other(Cow::Borrowed("Undefined")),
-            Value::Null => ValueWidget::Other(Cow::Borrowed("Null")),
-            Value::Bool(value) => ValueWidget::Other(Cow::Owned(value.to_string())),
-            Value::Number(value) => ValueWidget::Other(Cow::Owned(value.to_string())),
-            Value::Integer(value) => ValueWidget::Other(Cow::Owned(value.to_string())),
-            Value::String(value) => ValueWidget::String(value.to_string()),
-            Value::Object(value) => ValueWidget::Object(
+        match value.normalize().kind() {
+            ValueKind::Undefined => ValueWidget::Other(Cow::Borrowed("Undefined")),
+            ValueKind::Null => ValueWidget::Other(Cow::Borrowed("Null")),
+            ValueKind::Bool(value) => ValueWidget::Other(Cow::Owned(value.to_string())),
+            ValueKind::Number(value) => ValueWidget::Other(Cow::Owned(value.to_string())),
+            ValueKind::Integer(value) => ValueWidget::Other(Cow::Owned(value.to_string())),
+            ValueKind::String(value) => ValueWidget::String(value.to_string()),
+            ValueKind::Object(value) => ValueWidget::Object(
                 AVM2ObjectHandle::new(context, value),
                 object_name(context.gc(), value),
             ),

@@ -744,22 +744,21 @@ impl<'gc> E4XNode<'gc> {
         ignore_processing_instructions: bool,
         ignore_white: bool,
     ) -> Result<Vec<Self>, Error<'gc>> {
-        let string = match &value {
+        let string = if value.is_null_or_undefined() {
             // The docs claim that this throws a TypeError, but it actually doesn't
-            Value::Null | Value::Undefined => istr!(""),
+            istr!("")
+        } else {
             // The docs claim that only String, Number or Boolean are accepted, but that's also a lie
-            val => {
-                if let Some(obj) = val.as_object() {
-                    if obj.as_xml_object().is_some() || obj.as_xml_list_object().is_some() {
-                        value = val.call_public_property(
-                            istr!("toXMLString"),
-                            FunctionArgs::empty(),
-                            activation,
-                        )?;
-                    }
+            if let Some(obj) = value.as_object() {
+                if obj.as_xml_object().is_some() || obj.as_xml_list_object().is_some() {
+                    value = value.call_public_property(
+                        istr!("toXMLString"),
+                        FunctionArgs::empty(),
+                        activation,
+                    )?;
                 }
-                value.coerce_to_string(activation)?
             }
+            value.coerce_to_string(activation)?
         };
 
         let data_utf8 = string.to_utf8_lossy();
@@ -1695,11 +1694,11 @@ pub fn name_to_multiname<'gc>(
     name: Value<'gc>,
     force_attribute: bool,
 ) -> Result<Multiname<'gc>, Error<'gc>> {
-    if matches!(name, Value::Undefined | Value::Null) {
+    if name.is_null_or_undefined() {
         return Err(make_error_1010(activation, None));
     }
 
-    if let Value::Object(o) = name {
+    if let Some(o) = name.as_object() {
         if let Some(qname) = o.as_qname_object() {
             let mut name = qname.name().clone();
             if force_attribute {

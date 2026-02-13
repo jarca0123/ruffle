@@ -31,7 +31,7 @@ pub fn set_left_to_left<'gc>(
     let value = args.get_f64(0);
     this.set_left_to_left(value);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_left_to_right<'gc>(
@@ -58,7 +58,7 @@ pub fn set_left_to_right<'gc>(
     let value = args.get_f64(0);
     this.set_left_to_right(value);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_right_to_left<'gc>(
@@ -85,7 +85,7 @@ pub fn set_right_to_left<'gc>(
     let value = args.get_f64(0);
     this.set_right_to_left(value);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_right_to_right<'gc>(
@@ -112,7 +112,7 @@ pub fn set_right_to_right<'gc>(
     let value = args.get_f64(0);
     this.set_right_to_right(value);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_volume<'gc>(
@@ -139,7 +139,7 @@ pub fn set_volume<'gc>(
     let value = args.get_f64(0);
     this.set_volume(value);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `SoundTransform.pan`'s getter.
@@ -181,5 +181,5 @@ pub fn set_pan<'gc>(
     this.set_left_to_right(0.0);
     this.set_right_to_left(0.0);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

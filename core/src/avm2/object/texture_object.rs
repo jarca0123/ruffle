@@ -1,7 +1,7 @@
 //! Object representation for Texture3D objects
 
 use crate::avm2::activation::Activation;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{Object, TObject};
 use gc_arena::{Collect, Gc, GcWeak};
 use ruffle_common::utils::HasPrefixField;
@@ -29,7 +29,7 @@ impl<'gc> TextureObject<'gc> {
         TextureObject(Gc::new(
             activation.gc(),
             TextureObjectData {
-                base: ScriptObjectData::new(class),
+                base: ScriptObjectData::new(class, ObjectType::TextureObject),
                 context3d,
                 original_format,
                 handle,

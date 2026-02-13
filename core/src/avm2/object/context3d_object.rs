@@ -2,7 +2,7 @@
 
 use crate::avm2::Error;
 use crate::avm2::activation::Activation;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{Object, TObject};
 use crate::avm2::value::Value;
 use crate::avm2_stub_method;
@@ -43,7 +43,7 @@ impl<'gc> Context3DObject<'gc> {
         Context3DObject(Gc::new(
             activation.gc(),
             Context3DData {
-                base: ScriptObjectData::new(class),
+                base: ScriptObjectData::new(class, ObjectType::Context3DObject),
                 render_context: Cell::new(Some(context)),
                 stage3d,
             },
@@ -93,7 +93,7 @@ impl<'gc> Context3DObject<'gc> {
         let index_buffer = self
             .with_context_3d(|ctx| ctx.create_index_buffer(BufferUsage::StaticDraw, num_indices));
 
-        Value::Object(IndexBuffer3DObject::from_handle(
+        Value::from_object(IndexBuffer3DObject::from_handle(
             activation,
             self,
             index_buffer,
@@ -122,7 +122,7 @@ impl<'gc> Context3DObject<'gc> {
             )
         })?;
 
-        Ok(Value::Object(TextureObject::from_handle(
+        Ok(Value::from_object(TextureObject::from_handle(
             activation, self, texture, format, class,
         )))
     }
@@ -138,7 +138,7 @@ impl<'gc> Context3DObject<'gc> {
             ctx.create_vertex_buffer(usage, num_vertices, data_32_per_vertex)
         });
 
-        Value::Object(VertexBuffer3DObject::from_handle(
+        Value::from_object(VertexBuffer3DObject::from_handle(
             activation,
             self,
             handle,
@@ -195,7 +195,7 @@ impl<'gc> Context3DObject<'gc> {
     }
 
     pub fn create_program(self, activation: &mut Activation<'_, 'gc>) -> Value<'gc> {
-        Value::Object(Program3DObject::from_context(activation, self))
+        Value::from_object(Program3DObject::from_context(activation, self))
     }
 
     pub fn upload_shaders(
@@ -432,7 +432,7 @@ impl<'gc> Context3DObject<'gc> {
 
         let class = activation.avm2().classes().cubetexture;
 
-        Ok(Value::Object(TextureObject::from_handle(
+        Ok(Value::from_object(TextureObject::from_handle(
             activation, self, texture, format, class,
         )))
     }

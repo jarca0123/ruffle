@@ -6,7 +6,7 @@ use crate::avm2::Multiname;
 use crate::avm2::Namespace;
 use crate::avm2::activation::Activation;
 use crate::avm2::object::TObject;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::value::Value;
 use crate::string::StringContext;
 use core::fmt;
@@ -46,7 +46,7 @@ pub struct QNameObjectData<'gc> {
 
 impl<'gc> QNameObject<'gc> {
     pub fn new_empty(activation: &mut Activation<'_, 'gc>) -> Self {
-        let base = ScriptObjectData::new(activation.avm2().classes().qname);
+        let base = ScriptObjectData::new(activation.avm2().classes().qname, ObjectType::QNameObject);
 
         QNameObject(Gc::new(
             activation.gc(),
@@ -60,7 +60,7 @@ impl<'gc> QNameObject<'gc> {
     /// Box a Multiname into an object.
     pub fn from_name(activation: &mut Activation<'_, 'gc>, name: Multiname<'gc>) -> Self {
         let class = activation.avm2().classes().qname;
-        let base = ScriptObjectData::new(class);
+        let base = ScriptObjectData::new(class, ObjectType::QNameObject);
 
         QNameObject(Gc::new(
             activation.gc(),
@@ -150,7 +150,7 @@ impl<'gc> TObject<'gc> for QNameObject<'gc> {
                 .uri(activation.strings())
                 .unwrap_or_else(|| istr!(""))
                 .into(),
-            _ => Value::Undefined,
+            _ => Value::UNDEFINED,
         })
     }
 
@@ -163,7 +163,7 @@ impl<'gc> TObject<'gc> for QNameObject<'gc> {
         Ok(match index {
             1 => istr!("uri").into(),
             2 => istr!("localName").into(),
-            _ => Value::Null,
+            _ => Value::NULL,
         })
     }
 }

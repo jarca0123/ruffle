@@ -36,7 +36,7 @@ pub fn get_always_show_selection<'gc>(
         .as_display_object()
         .and_then(|this| this.as_edit_text())
     else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     Ok(this.always_show_selection().into())
@@ -53,13 +53,13 @@ pub fn set_always_show_selection<'gc>(
         .as_display_object()
         .and_then(|this| this.as_edit_text())
     else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     let value = args.get_bool(0);
     this.set_always_show_selection(value);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_auto_size<'gc>(
@@ -83,7 +83,7 @@ pub fn get_auto_size<'gc>(
         return Ok(autosize.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_auto_size<'gc>(
@@ -114,7 +114,7 @@ pub fn set_auto_size<'gc>(
         );
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_background<'gc>(
@@ -131,7 +131,7 @@ pub fn get_background<'gc>(
         return Ok((this.has_background()).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_background<'gc>(
@@ -149,7 +149,7 @@ pub fn set_background<'gc>(
         this.set_has_background(has_background);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_background_color<'gc>(
@@ -166,7 +166,7 @@ pub fn get_background_color<'gc>(
         return Ok(this.background_color().to_rgb().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_background_color<'gc>(
@@ -185,7 +185,7 @@ pub fn set_background_color<'gc>(
         this.set_background_color(color);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_border<'gc>(
@@ -202,7 +202,7 @@ pub fn get_border<'gc>(
         return Ok(this.has_border().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_border<'gc>(
@@ -220,7 +220,7 @@ pub fn set_border<'gc>(
         this.set_has_border(border);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_border_color<'gc>(
@@ -237,7 +237,7 @@ pub fn get_border_color<'gc>(
         return Ok(this.border_color().to_rgb().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_border_color<'gc>(
@@ -256,7 +256,7 @@ pub fn set_border_color<'gc>(
         this.set_border_color(color);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_condense_white<'gc>(
@@ -273,7 +273,7 @@ pub fn get_condense_white<'gc>(
         return Ok(this.condense_white().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_condense_white<'gc>(
@@ -291,7 +291,7 @@ pub fn set_condense_white<'gc>(
         this.set_condense_white(value);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_default_text_format<'gc>(
@@ -308,7 +308,7 @@ pub fn get_default_text_format<'gc>(
         return Ok(TextFormatObject::from_text_format(activation, this.new_text_format())?.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_default_text_format<'gc>(
@@ -331,7 +331,7 @@ pub fn set_default_text_format<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_display_as_password<'gc>(
@@ -348,7 +348,7 @@ pub fn get_display_as_password<'gc>(
         return Ok(this.is_password().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_display_as_password<'gc>(
@@ -367,7 +367,7 @@ pub fn set_display_as_password<'gc>(
         this.set_password(is_password, activation.context);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_embed_fonts<'gc>(
@@ -384,7 +384,7 @@ pub fn get_embed_fonts<'gc>(
         return Ok((!this.is_device_font()).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_embed_fonts<'gc>(
@@ -403,7 +403,7 @@ pub fn set_embed_fonts<'gc>(
         this.set_is_device_font(activation.context, !is_embed_fonts);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_html_text<'gc>(
@@ -420,7 +420,7 @@ pub fn get_html_text<'gc>(
         return Ok(AvmString::new(activation.gc(), this.html_text()).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_html_text<'gc>(
@@ -440,7 +440,7 @@ pub fn set_html_text<'gc>(
         this.set_html_text(&html_text, activation.context);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_length<'gc>(
@@ -457,7 +457,7 @@ pub fn get_length<'gc>(
         return Ok(this.text_length().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_multiline<'gc>(
@@ -474,7 +474,7 @@ pub fn get_multiline<'gc>(
         return Ok(this.is_multiline().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_multiline<'gc>(
@@ -493,7 +493,7 @@ pub fn set_multiline<'gc>(
         this.set_multiline(is_multiline, activation.context);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_selectable<'gc>(
@@ -510,7 +510,7 @@ pub fn get_selectable<'gc>(
         return Ok(this.is_selectable().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_selectable<'gc>(
@@ -529,7 +529,7 @@ pub fn set_selectable<'gc>(
         this.set_selectable(is_selectable);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_text<'gc>(
@@ -546,7 +546,7 @@ pub fn get_text<'gc>(
         return Ok(AvmString::new(activation.gc(), this.text()).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_text<'gc>(
@@ -565,7 +565,7 @@ pub fn set_text<'gc>(
         this.set_text(&text, activation.context);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_text_color<'gc>(
@@ -586,7 +586,7 @@ pub fn get_text_color<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_text_color<'gc>(
@@ -615,7 +615,7 @@ pub fn set_text_color<'gc>(
         this.set_new_text_format(desired_format);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_text_height<'gc>(
@@ -633,7 +633,7 @@ pub fn get_text_height<'gc>(
         return Ok(metrics.1.to_pixels().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_text_width<'gc>(
@@ -651,7 +651,7 @@ pub fn get_text_width<'gc>(
         return Ok(metrics.0.to_pixels().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_type<'gc>(
@@ -673,7 +673,7 @@ pub fn get_type<'gc>(
         return Ok(type_.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_type<'gc>(
@@ -698,7 +698,7 @@ pub fn set_type<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_word_wrap<'gc>(
@@ -715,7 +715,7 @@ pub fn get_word_wrap<'gc>(
         return Ok(this.is_word_wrap().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_word_wrap<'gc>(
@@ -734,7 +734,7 @@ pub fn set_word_wrap<'gc>(
         this.set_word_wrap(is_word_wrap, activation.context);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn append_text<'gc>(
@@ -759,7 +759,7 @@ pub fn append_text<'gc>(
         );
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_text_format<'gc>(
@@ -792,7 +792,7 @@ pub fn get_text_format<'gc>(
         return Ok(TextFormatObject::from_text_format(activation, tf)?.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn replace_selected_text<'gc>(
@@ -819,7 +819,7 @@ pub fn replace_selected_text<'gc>(
         );
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn replace_text<'gc>(
@@ -846,7 +846,7 @@ pub fn replace_text<'gc>(
         );
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_caret_index<'gc>(
@@ -867,7 +867,7 @@ pub fn get_caret_index<'gc>(
         };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_selection_begin_index<'gc>(
@@ -888,7 +888,7 @@ pub fn get_selection_begin_index<'gc>(
         };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_selection_end_index<'gc>(
@@ -909,7 +909,7 @@ pub fn get_selection_end_index<'gc>(
         };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_selection<'gc>(
@@ -933,7 +933,7 @@ pub fn set_selection<'gc>(
         )));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_text_format<'gc>(
@@ -979,7 +979,7 @@ pub fn set_text_format<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_anti_alias_type<'gc>(
@@ -1002,7 +1002,7 @@ pub fn get_anti_alias_type<'gc>(
         return Ok(anti_alias_type.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_anti_alias_type<'gc>(
@@ -1025,7 +1025,7 @@ pub fn set_anti_alias_type<'gc>(
             this.set_render_settings(old_settings.with_normal_rendering());
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_grid_fit_type<'gc>(
@@ -1048,7 +1048,7 @@ pub fn get_grid_fit_type<'gc>(
         return Ok(grid_fit_type.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_grid_fit_type<'gc>(
@@ -1074,7 +1074,7 @@ pub fn set_grid_fit_type<'gc>(
             this.set_render_settings(old_settings.with_grid_fit(swf::TextGridFit::None));
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_thickness<'gc>(
@@ -1114,7 +1114,7 @@ pub fn set_thickness<'gc>(
         this.set_render_settings(old_settings.with_thickness(new_thickness as f32));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_sharpness<'gc>(
@@ -1154,7 +1154,7 @@ pub fn set_sharpness<'gc>(
         this.set_render_settings(old_settings.with_sharpness(new_sharpness as f32));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_num_lines<'gc>(
@@ -1171,7 +1171,7 @@ pub fn get_num_lines<'gc>(
         return Ok(this.layout_lines().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_line_metrics<'gc>(
@@ -1185,7 +1185,7 @@ pub fn get_line_metrics<'gc>(
         .as_display_object()
         .and_then(|this| this.as_edit_text())
     else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     let line_num = args.get_i32(0);
@@ -1224,7 +1224,7 @@ pub fn get_line_length<'gc>(
         .as_display_object()
         .and_then(|this| this.as_edit_text())
     else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     let line_num = args.get_i32(0);
@@ -1258,7 +1258,7 @@ pub fn get_line_text<'gc>(
         };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_line_offset<'gc>(
@@ -1272,7 +1272,7 @@ pub fn get_line_offset<'gc>(
         .as_display_object()
         .and_then(|this| this.as_edit_text())
     else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     let line_num = args.get_i32(0);
@@ -1301,7 +1301,7 @@ pub fn get_bottom_scroll_v<'gc>(
         return Ok(this.bottom_scroll().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_max_scroll_v<'gc>(
@@ -1318,7 +1318,7 @@ pub fn get_max_scroll_v<'gc>(
         return Ok(this.maxscroll().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_max_scroll_h<'gc>(
@@ -1335,7 +1335,7 @@ pub fn get_max_scroll_h<'gc>(
         return Ok(this.maxhscroll().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_scroll_v<'gc>(
@@ -1352,7 +1352,7 @@ pub fn get_scroll_v<'gc>(
         return Ok(this.scroll().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_scroll_v<'gc>(
@@ -1370,7 +1370,7 @@ pub fn set_scroll_v<'gc>(
         this.set_scroll(input as f64);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_scroll_h<'gc>(
@@ -1387,7 +1387,7 @@ pub fn get_scroll_h<'gc>(
         return Ok(this.hscroll().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_scroll_h<'gc>(
@@ -1409,7 +1409,7 @@ pub fn set_scroll_h<'gc>(
         this.set_hscroll(clamped as f64);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_max_chars<'gc>(
@@ -1426,7 +1426,7 @@ pub fn get_max_chars<'gc>(
         return Ok(this.max_chars().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_max_chars<'gc>(
@@ -1444,7 +1444,7 @@ pub fn set_max_chars<'gc>(
         this.set_max_chars(input);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_mouse_wheel_enabled<'gc>(
@@ -1462,7 +1462,7 @@ pub fn set_mouse_wheel_enabled<'gc>(
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     avm2_stub_setter!(activation, "flash.text.TextField", "mouseWheelEnabled");
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_restrict<'gc>(
@@ -1478,11 +1478,11 @@ pub fn get_restrict<'gc>(
     {
         return match this.restrict() {
             Some(value) => Ok(AvmString::new(activation.gc(), value).into()),
-            None => Ok(Value::Null),
+            None => Ok(Value::NULL),
         };
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_restrict<'gc>(
@@ -1498,7 +1498,7 @@ pub fn set_restrict<'gc>(
     {
         this.set_restrict(args.try_get_string(0).as_deref());
     }
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_selected_text<'gc>(
@@ -1537,7 +1537,7 @@ pub fn get_text_runs<'gc>(
         .as_display_object()
         .and_then(|this| this.as_edit_text())
     else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     let textrun_class = activation.avm2().classes().textrun;
@@ -1569,19 +1569,19 @@ pub fn get_line_index_of_char<'gc>(
         .as_display_object()
         .and_then(|this| this.as_edit_text())
     else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     let index = args.get_i32(0);
     if index < 0 {
         // Docs say "throw RangeError", reality says "return -1".
-        return Ok(Value::Number(-1f64));
+        return Ok(Value::from_f64(-1f64));
     }
 
     if let Some(line) = this.line_index_of_char(index as usize) {
         Ok(line.into())
     } else {
-        Ok(Value::Number(-1f64))
+        Ok(Value::from_f64(-1f64))
     }
 }
 
@@ -1596,7 +1596,7 @@ pub fn get_char_index_at_point<'gc>(
         .as_display_object()
         .and_then(|this| this.as_edit_text())
     else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     // No idea why FP does this weird 1px translation...
@@ -1606,7 +1606,7 @@ pub fn get_char_index_at_point<'gc>(
     if let Some(index) = this.char_index_at_point(Point::from_pixels(x, y)) {
         Ok(index.into())
     } else {
-        Ok(Value::Number(-1f64))
+        Ok(Value::from_f64(-1f64))
     }
 }
 
@@ -1621,7 +1621,7 @@ pub fn get_line_index_at_point<'gc>(
         .as_display_object()
         .and_then(|this| this.as_edit_text())
     else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     // No idea why FP does this weird 1px translation...
@@ -1631,7 +1631,7 @@ pub fn get_line_index_at_point<'gc>(
     if let Some(index) = this.line_index_at_point(Point::from_pixels(x, y)) {
         Ok(index.into())
     } else {
-        Ok(Value::Number(-1f64))
+        Ok(Value::from_f64(-1f64))
     }
 }
 
@@ -1646,7 +1646,7 @@ pub fn get_first_char_in_paragraph<'gc>(
         .as_display_object()
         .and_then(|this| this.as_edit_text())
     else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     let char_index = args.get_i32(0);
@@ -1672,7 +1672,7 @@ pub fn get_paragraph_length<'gc>(
         .as_display_object()
         .and_then(|this| this.as_edit_text())
     else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     let char_index = args.get_i32(0);
@@ -1698,20 +1698,20 @@ pub fn get_char_boundaries<'gc>(
         .as_display_object()
         .and_then(|this| this.as_edit_text())
     else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     let char_index = args.get_i32(0);
     if char_index < 0 {
-        return Ok(Value::Null);
+        return Ok(Value::NULL);
     }
 
     let Some(bounds) = this.char_bounds(char_index as usize) else {
-        return Ok(Value::Null);
+        return Ok(Value::NULL);
     };
 
     if bounds.width() == swf::Twips::ZERO {
-        return Ok(Value::Null);
+        return Ok(Value::NULL);
     }
 
     let rect = activation.avm2().classes().rectangle.construct(
@@ -1738,12 +1738,12 @@ pub fn get_style_sheet<'gc>(
         .as_display_object()
         .and_then(|this| this.as_edit_text())
     else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     Ok(match this.style_sheet_avm2() {
-        Some(style_sheet) => Value::Object(Object::StyleSheetObject(style_sheet)),
-        None => Value::Null,
+        Some(style_sheet) => Value::from_object(style_sheet.into()),
+        None => Value::NULL,
     })
 }
 
@@ -1758,12 +1758,12 @@ pub fn set_style_sheet<'gc>(
         .as_display_object()
         .and_then(|this| this.as_edit_text())
     else {
-        return Ok(Value::Undefined);
+        return Ok(Value::UNDEFINED);
     };
 
     let style_sheet = args.try_get_object(0).and_then(|o| o.as_style_sheet());
 
     this.set_style_sheet_avm2(activation.context, style_sheet);
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

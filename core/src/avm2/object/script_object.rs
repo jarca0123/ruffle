@@ -23,7 +23,7 @@ pub fn scriptobject_allocator<'gc>(
     class: ClassObject<'gc>,
     activation: &mut Activation<'_, 'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    let base = ScriptObjectData::new(class);
+    let base = ScriptObjectData::new(class, ObjectType::ScriptObject);
 
     Ok(ScriptObject(Gc::new(activation.gc(), base)).into())
 }
@@ -48,6 +48,60 @@ impl ScriptObjectHandle {
     pub fn fetch<'gc>(&self, context: &UpdateContext<'gc>) -> ScriptObject<'gc> {
         ScriptObject(context.dynamic_root.fetch(&self.0))
     }
+}
+
+/// Discriminant tag stored inside `ScriptObjectData` to identify the concrete
+/// object type. This replaces the role of the `Object` enum discriminant once
+/// `Object` is made into a thin pointer wrapper.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Collect)]
+#[collect(require_static)]
+#[repr(u8)]
+pub enum ObjectType {
+    ScriptObject,
+    FunctionObject,
+    NamespaceObject,
+    ArrayObject,
+    StageObject,
+    DomainObject,
+    EventObject,
+    DispatchObject,
+    XmlObject,
+    XmlListObject,
+    RegExpObject,
+    ByteArrayObject,
+    LoaderInfoObject,
+    ClassObject,
+    VectorObject,
+    SoundObject,
+    SoundChannelObject,
+    BitmapDataObject,
+    DateObject,
+    DictionaryObject,
+    QNameObject,
+    TextFormatObject,
+    ProxyObject,
+    ErrorObject,
+    Stage3DObject,
+    Context3DObject,
+    IndexBuffer3DObject,
+    VertexBuffer3DObject,
+    TextureObject,
+    Program3DObject,
+    NetStreamObject,
+    NetConnectionObject,
+    ResponderObject,
+    ShaderDataObject,
+    SocketObject,
+    FileReferenceObject,
+    FontObject,
+    LocalConnectionObject,
+    SharedObjectObject,
+    SoundTransformObject,
+    StyleSheetObject,
+    WorkerObject,
+    WorkerDomainObject,
+    MessageChannelObject,
+    SecurityDomainObject,
 }
 
 /// Base data common to all `TObject` implementations.
@@ -76,6 +130,9 @@ pub struct ScriptObjectData<'gc> {
 
     /// The table used for non-dynamic property lookups.
     vtable: Lock<VTable<'gc>>,
+
+    /// The concrete object type discriminant.
+    object_type: ObjectType,
 }
 
 impl<'gc> TObject<'gc> for ScriptObject<'gc> {
@@ -101,7 +158,7 @@ impl<'gc> ScriptObject<'gc> {
     pub fn new_object(context: &mut UpdateContext<'gc>) -> Object<'gc> {
         let object_class = context.avm2.classes().object;
 
-        ScriptObject(Gc::new(context.gc(), ScriptObjectData::new(object_class))).into()
+        ScriptObject(Gc::new(context.gc(), ScriptObjectData::new(object_class, ObjectType::ScriptObject))).into()
     }
 
     /// Construct an instance with a possibly-none class and proto chain.
@@ -123,7 +180,7 @@ impl<'gc> ScriptObject<'gc> {
     ) -> Object<'gc> {
         ScriptObject(Gc::new(
             mc,
-            ScriptObjectData::custom_new(class, proto, vtable),
+            ScriptObjectData::custom_new(class, proto, vtable, ObjectType::ScriptObject),
         ))
         .into()
     }
@@ -132,11 +189,12 @@ impl<'gc> ScriptObject<'gc> {
 impl<'gc> ScriptObjectData<'gc> {
     /// Create new object data of a given class.
     /// This is a low-level function used to implement things like object allocators.
-    pub fn new(instance_of: ClassObject<'gc>) -> Self {
+    pub fn new(instance_of: ClassObject<'gc>, object_type: ObjectType) -> Self {
         Self::custom_new(
             instance_of.inner_class_definition(),
             Some(instance_of.prototype()),
             instance_of.instance_vtable(),
+            object_type,
         )
     }
 
@@ -149,6 +207,7 @@ impl<'gc> ScriptObjectData<'gc> {
         instance_class: Class<'gc>,
         proto: Option<Object<'gc>>,
         vtable: VTable<'gc>,
+        object_type: ObjectType,
     ) -> Self {
         let default_slots = vtable.default_slots();
 
@@ -162,7 +221,7 @@ impl<'gc> ScriptObjectData<'gc> {
                 } else {
                     // FIXME this case throws a VerifyError during vtable
                     // construction in Flash Player
-                    Lock::new(Value::Undefined)
+                    Lock::new(Value::UNDEFINED)
                 }
             })
             .collect::<Box<_>>();
@@ -174,7 +233,13 @@ impl<'gc> ScriptObjectData<'gc> {
             proto: Lock::new(proto),
             instance_class,
             vtable: Lock::new(vtable),
+            object_type,
         }
+    }
+
+    /// Returns the concrete object type discriminant.
+    pub fn object_type(&self) -> ObjectType {
+        self.object_type
     }
 }
 
@@ -232,7 +297,7 @@ impl<'gc> ScriptObjectWrapper<'gc> {
                     self.instance_class(),
                 ))
             } else {
-                Ok(Value::Undefined)
+                Ok(Value::UNDEFINED)
             }
         }
     }
@@ -353,9 +418,9 @@ impl<'gc> ScriptObjectWrapper<'gc> {
 
     pub fn get_enumerant_name(self, index: u32) -> Option<Value<'gc>> {
         self.values().key_at(index as usize).map(|key| match key {
-            DynamicKey::String(name) => Value::String(*name),
-            DynamicKey::Object(obj) => Value::Object(*obj),
-            DynamicKey::Uint(val) => Value::Number(*val as f64),
+            DynamicKey::String(name) => Value::from_string(*name),
+            DynamicKey::Object(obj) => Value::from_object(*obj),
+            DynamicKey::Uint(val) => Value::from_f64(*val as f64),
         })
     }
 

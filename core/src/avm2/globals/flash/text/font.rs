@@ -27,7 +27,7 @@ pub fn get_font_name<'gc>(
         return Ok(AvmString::new_utf8(activation.gc(), font.descriptor().name()).into());
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 /// Implements `Font.fontStyle`
@@ -49,7 +49,7 @@ pub fn get_font_style<'gc>(
         return Ok(font_style.into());
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 /// Implements `Font.fontType`
@@ -70,7 +70,7 @@ pub fn get_font_type<'gc>(
         return Ok(font_type.into());
     }
 
-    Ok(Value::Null)
+    Ok(Value::NULL)
 }
 
 /// Implements `Font.hasGlyphs`
@@ -86,7 +86,7 @@ pub fn has_glyphs<'gc>(
         return Ok(font.has_glyphs_for_str(&my_str).into());
     }
 
-    Ok(Value::Bool(false))
+    Ok(Value::from_bool(false))
 }
 
 /// `Font.enumerateFonts`
@@ -159,7 +159,7 @@ pub fn register_font<'gc>(
             if let Some(lib) = activation.context.library.library_for_movie(movie) {
                 if let Some(Character::Font(font)) = lib.character_by_id(id) {
                     activation.context.library.register_global_font(font);
-                    return Ok(Value::Undefined);
+                    return Ok(Value::UNDEFINED);
                 }
             }
         }

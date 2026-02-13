@@ -41,7 +41,7 @@ pub fn set_interval<'gc>(
         params: params.to_vec(),
     };
 
-    Ok(Value::Integer(activation.context.timers.add_timer(
+    Ok(Value::from_integer(activation.context.timers.add_timer(
         callback,
         interval as i32,
         false,
@@ -56,7 +56,7 @@ pub fn clear_interval<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let id = args.get_u32(0);
     activation.context.timers.remove(id as i32);
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `flash.utils.setTimeout`
@@ -74,7 +74,7 @@ pub fn set_timeout<'gc>(
         params: params.to_vec(),
     };
 
-    Ok(Value::Integer(activation.context.timers.add_timer(
+    Ok(Value::from_integer(activation.context.timers.add_timer(
         callback,
         interval as i32,
         true,
@@ -89,7 +89,7 @@ pub fn clear_timeout<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let id = args.get_u32(0);
     activation.context.timers.remove(id as i32);
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `flash.utils.escapeMultiByte`
@@ -190,7 +190,7 @@ pub fn get_qualified_superclass_name<'gc>(
     if let Some(super_class) = class.super_class() {
         Ok(super_class.name().to_qualified_name(activation.gc()).into())
     } else {
-        Ok(Value::Null)
+        Ok(Value::NULL)
     }
 }
 

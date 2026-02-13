@@ -41,7 +41,7 @@ pub fn instance_init<'gc>(
         vector.set_is_fixed(is_fixed);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn call_handler<'gc>(
@@ -106,7 +106,7 @@ pub fn get_length<'gc>(
         return Ok(vector.length().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `Vector.length` setter
@@ -123,7 +123,7 @@ pub fn set_length<'gc>(
         vector.resize(new_length, activation)?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `Vector.fixed` getter
@@ -138,7 +138,7 @@ pub fn get_fixed<'gc>(
         return Ok(vector.is_fixed().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// `Vector.fixed` setter
@@ -155,7 +155,7 @@ pub fn set_fixed<'gc>(
         vector.set_is_fixed(new_fixed);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Helper function for `Vector.concat` impl
@@ -218,7 +218,7 @@ pub fn join<'gc>(
         let mut accum = Vec::with_capacity(vector.length());
 
         for item in vector.iter() {
-            if matches!(item, Value::Undefined) || matches!(item, Value::Null) {
+            if item.is_null_or_undefined() {
                 accum.push(istr!("null"));
             } else {
                 accum.push(item.coerce_to_string(activation)?);
@@ -228,7 +228,7 @@ pub fn join<'gc>(
         return Ok(AvmString::new(activation.gc(), crate::string::join(&accum, &separator)).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 macro_rules! delegate_method_to_array {
@@ -412,7 +412,7 @@ pub fn pop<'gc>(
         return vs.pop(activation);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Vector.push`
@@ -438,7 +438,7 @@ pub fn push<'gc>(
         return Ok(vs.length().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Vector.shift`
@@ -453,7 +453,7 @@ pub fn shift<'gc>(
         return vs.shift(activation);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Vector.unshift`
@@ -476,7 +476,7 @@ pub fn unshift<'gc>(
         return Ok(vs.length().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Vector.insertAt`
@@ -497,7 +497,7 @@ pub fn insert_at<'gc>(
         vs.insert(index, value, activation)?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Vector.removeAt`
@@ -514,7 +514,7 @@ pub fn remove_at<'gc>(
         return vs.remove(index, activation);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Vector.reverse`
@@ -531,7 +531,7 @@ pub fn reverse<'gc>(
         return Ok(this.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Vector.slice`
@@ -563,7 +563,7 @@ pub fn slice<'gc>(
         return Ok(new_vector.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Vector.sort`
@@ -645,7 +645,7 @@ pub fn sort<'gc>(
         return Ok(this.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `Vector.splice`
@@ -687,7 +687,7 @@ pub fn splice<'gc>(
         return Ok(new_vector.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Set up a builtin vector's Class. This will change its name, mark it as a

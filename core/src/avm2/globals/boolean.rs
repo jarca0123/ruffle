@@ -11,7 +11,7 @@ pub fn boolean_constructor<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let bool_value = args
         .get_optional(0)
-        .unwrap_or(Value::Bool(false))
+        .unwrap_or(Value::from_bool(false))
         .coerce_to_boolean();
 
     Ok(bool_value.into())
@@ -24,7 +24,7 @@ pub fn call_handler<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     Ok(args
         .get_optional(0)
-        .unwrap_or(Value::Bool(false))
+        .unwrap_or(Value::from_bool(false))
         .coerce_to_boolean()
         .into())
 }

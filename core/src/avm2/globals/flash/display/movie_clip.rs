@@ -6,7 +6,7 @@ use crate::avm2::array::ArrayStorage;
 use crate::avm2::error::make_error_2109;
 use crate::avm2::object::ArrayObject;
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueKind};
 use crate::display_object::{MovieClip, Scene};
 use crate::string::{AvmString, WString};
 
@@ -35,7 +35,7 @@ pub fn add_frame_script<'gc>(
         tracing::error!("Attempted to add frame scripts to non-MovieClip this!");
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `currentFrame`.
@@ -62,7 +62,7 @@ pub fn get_current_frame<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `currentFrameLabel`.
@@ -86,10 +86,10 @@ pub fn get_current_frame_label<'gc>(
                     Some(AvmString::new(activation.gc(), label).into())
                 }
             })
-            .unwrap_or(Value::Null));
+            .unwrap_or(Value::NULL));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `currentLabel`.
@@ -107,10 +107,10 @@ pub fn get_current_label<'gc>(
         return Ok(mc
             .current_label()
             .map(|(label, _start_frame)| AvmString::new(activation.gc(), label).into())
-            .unwrap_or(Value::Null));
+            .unwrap_or(Value::NULL));
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Given a scene, produce its name, length, and a list of frame labels.
@@ -168,7 +168,7 @@ pub fn get_current_labels<'gc>(
         return Ok(labels_for_scene(activation, mc, &scene)?.2.into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `currentScene`.
@@ -201,7 +201,7 @@ pub fn get_current_scene<'gc>(
         return Ok(scene);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn get_enabled<'gc>(
@@ -218,7 +218,7 @@ pub fn get_enabled<'gc>(
         return Ok(mc.avm2_enabled().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn set_enabled<'gc>(
@@ -237,7 +237,7 @@ pub fn set_enabled<'gc>(
         mc.set_avm2_enabled(enabled);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `scenes`.
@@ -280,7 +280,7 @@ pub fn get_scenes<'gc>(
         return Ok(ArrayObject::from_storage(activation.context, scene_objects).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `framesLoaded`.
@@ -298,7 +298,7 @@ pub fn get_frames_loaded<'gc>(
         return Ok(mc.frames_loaded().min(mc.header_frames() as i32).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `isPlaying`.
@@ -316,7 +316,7 @@ pub fn get_is_playing<'gc>(
         return Ok((mc.programmatically_played() && mc.playing()).into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `totalFrames`.
@@ -334,7 +334,7 @@ pub fn get_total_frames<'gc>(
         return Ok(mc.header_frames().into());
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `gotoAndPlay`.
@@ -357,7 +357,7 @@ pub fn goto_and_play<'gc>(
         goto_frame(activation, mc, frame_or_label, scene, false)?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `gotoAndStop`.
@@ -378,7 +378,7 @@ pub fn goto_and_stop<'gc>(
         goto_frame(activation, mc, frame_or_label, scene, true)?;
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 pub fn goto_frame<'gc>(
@@ -399,9 +399,10 @@ pub fn goto_frame<'gc>(
     }
     .unwrap_or(0) as i32;
 
-    let frame = match frame_or_label.normalize() {
-        Value::Integer(i) => i + scene,
-        frame_or_label => {
+    let frame_or_label = frame_or_label.normalize();
+    let frame = match frame_or_label.kind() {
+        ValueKind::Integer(i) => i + scene,
+        _ => {
             let frame_or_label = frame_or_label.coerce_to_string(activation)?;
             let frame = crate::avm2::value::string_to_int(&frame_or_label, 10, true);
             if !frame.is_nan() {
@@ -463,7 +464,7 @@ pub fn stop<'gc>(
         mc.stop(activation.context);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `play`.
@@ -482,7 +483,7 @@ pub fn play<'gc>(
         mc.play();
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `prevFrame`.
@@ -500,7 +501,7 @@ pub fn prev_frame<'gc>(
         mc.prev_frame(activation.context);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `nextFrame`.
@@ -518,7 +519,7 @@ pub fn next_frame<'gc>(
         mc.next_frame(activation.context);
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `prevScene`.
@@ -543,7 +544,7 @@ pub fn prev_scene<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }
 
 /// Implements `nextScene`.
@@ -568,5 +569,5 @@ pub fn next_scene<'gc>(
         }
     }
 
-    Ok(Value::Undefined)
+    Ok(Value::UNDEFINED)
 }

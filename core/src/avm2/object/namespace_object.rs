@@ -4,7 +4,7 @@ use crate::avm2::Error;
 use crate::avm2::Namespace;
 use crate::avm2::activation::Activation;
 use crate::avm2::object::TObject;
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::value::Value;
 use crate::string::AvmString;
 use core::fmt;
@@ -50,7 +50,7 @@ impl<'gc> NamespaceObject<'gc> {
         prefix: Option<AvmString<'gc>>,
     ) -> Self {
         let class = activation.avm2().classes().namespace;
-        let base = ScriptObjectData::new(class);
+        let base = ScriptObjectData::new(class, ObjectType::NamespaceObject);
 
         NamespaceObject(Gc::new(
             activation.gc(),
@@ -65,7 +65,7 @@ impl<'gc> NamespaceObject<'gc> {
     /// Box a namespace into an object.
     pub fn from_namespace(activation: &mut Activation<'_, 'gc>, namespace: Namespace<'gc>) -> Self {
         let class = activation.avm2().classes().namespace;
-        let base = ScriptObjectData::new(class);
+        let base = ScriptObjectData::new(class, ObjectType::NamespaceObject);
 
         NamespaceObject(Gc::new(
             activation.gc(),
@@ -114,8 +114,8 @@ impl<'gc> TObject<'gc> for NamespaceObject<'gc> {
     ) -> Result<Value<'gc>, Error<'gc>> {
         Ok(match index {
             1 => self.namespace().as_uri(activation.strings()).into(),
-            2 => self.prefix().map(Into::into).unwrap_or(Value::Undefined),
-            _ => Value::Undefined,
+            2 => self.prefix().map(Into::into).unwrap_or(Value::UNDEFINED),
+            _ => Value::UNDEFINED,
         })
     }
 
@@ -127,7 +127,7 @@ impl<'gc> TObject<'gc> for NamespaceObject<'gc> {
         Ok(match index {
             1 => istr!("uri").into(),
             2 => istr!("prefix").into(),
-            _ => Value::Null,
+            _ => Value::NULL,
         })
     }
 }

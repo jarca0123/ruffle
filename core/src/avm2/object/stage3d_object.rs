@@ -1,6 +1,6 @@
 //! Object representation for Stage3D objects
 
-use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::object::script_object::{ObjectType, ScriptObjectData};
 use crate::avm2::object::{Object, TObject};
 use crate::context::UpdateContext;
 use core::fmt;
@@ -32,7 +32,7 @@ impl<'gc> Stage3DObject<'gc> {
         Stage3DObject(Gc::new(
             context.gc(),
             Stage3DObjectData {
-                base: ScriptObjectData::new(class),
+                base: ScriptObjectData::new(class, ObjectType::Stage3DObject),
                 context3d: Lock::new(None),
                 visible: Cell::new(true),
             },

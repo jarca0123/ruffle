@@ -243,7 +243,7 @@ impl<'gc> RegExp<'gc> {
                 .collect::<Vec<_>>();
 
             let args = FunctionArgs::from_slice(&args);
-            let r = f.call(activation, Value::Null, args)?;
+            let r = f.call(activation, Value::NULL, args)?;
             return Ok(Cow::Owned(WString::from(
                 r.coerce_to_string(activation)?.as_wstr(),
             )));
