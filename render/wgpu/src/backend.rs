@@ -17,7 +17,9 @@ use image::imageops::FilterType;
 use ruffle_render::backend::{
     BitmapCacheEntry, Context3D, Context3DProfile, PixelBenderOutput, PixelBenderTarget,
 };
-use ruffle_render::backend::{RenderBackend, ShapeHandle, ViewportDimensions};
+use ruffle_render::backend::{
+    RenderBackend, RenderOffscreenBatches, ShapeHandle, ViewportDimensions,
+};
 use ruffle_render::bitmap::{
     Bitmap, BitmapFormat, BitmapHandle, BitmapSource, PixelRegion, RgbaBufRead, SyncHandle,
 };
@@ -729,10 +731,14 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     fn render_offscreen(
         &mut self,
         handle: BitmapHandle,
-        commands: CommandList,
+        batches: RenderOffscreenBatches,
         quality: StageQuality,
         bounds: PixelRegion,
     ) -> Option<Box<dyn SyncHandle>> {
+        if batches.is_empty() {
+            return None;
+        }
+
         let texture = as_texture(&handle);
 
         let extent = wgpu::Extent3d {
@@ -741,16 +747,12 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             depth_or_array_layers: 1,
         };
 
-        let mut target = TextureTarget {
+        let target = TextureTarget {
             size: extent,
             texture: texture.texture.clone(),
             format: wgpu::TextureFormat::Rgba8Unorm,
             buffer: None,
         };
-
-        let frame_output = target
-            .get_next_texture()
-            .expect("TextureTargetFrame.get_next_texture is infallible");
 
         let mut surface = Surface::new(
             &self.descriptors,
@@ -759,20 +761,29 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             texture.texture.height(),
             wgpu::TextureFormat::Rgba8Unorm,
         );
-        surface.draw_commands_and_copy_to(
-            frame_output.view(),
-            RenderTargetMode::FreshWithTexture(target.get_texture()),
-            &self.descriptors,
-            &mut self.active_frame.staging_belt,
-            &self.dynamic_transforms,
-            &mut self.active_frame.command_encoder,
-            &self.meshes,
-            commands,
-            LayerRef::Current,
-            &mut self.offscreen_texture_pool,
-        );
 
-        self.active_frame.maybe_flush(&self.descriptors);
+        for commands in batches {
+            // Each batch is rendered as its own pass against the running
+            // target texture - the previous pass's resolve (if any) is
+            // visible as input to this one.
+            let frame_view = target.texture.create_view(&Default::default());
+            surface.draw_commands_and_copy_to(
+                &frame_view,
+                RenderTargetMode::FreshWithTexture(target.get_texture()),
+                &self.descriptors,
+                &mut self.active_frame.staging_belt,
+                &self.dynamic_transforms,
+                &mut self.active_frame.command_encoder,
+                &self.meshes,
+                commands,
+                LayerRef::Current,
+                &mut self.offscreen_texture_pool,
+            );
+            // Count every sub-batch against the per-frame draw cap so that
+            // large pending batches submit periodically instead of piling
+            // thousands of passes into one command buffer.
+            self.active_frame.maybe_flush(&self.descriptors);
+        }
         Some(self.make_queue_sync_handle(target, None, handle, bounds))
     }
 

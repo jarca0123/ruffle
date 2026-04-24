@@ -17,6 +17,7 @@ use ruffle_render::filters::Filter;
 use ruffle_render::matrix::Matrix;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::transform::Transform;
+use smallvec::smallvec;
 use std::cell::{Ref, RefMut};
 use swf::{BlendMode, ColorTransform, Fixed8, Rectangle, Twips};
 
@@ -1616,9 +1617,10 @@ pub fn draw<'gc>(
         cache_draws.is_empty(),
         "BitmapData.draw() should not use cacheAsBitmap"
     );
-    let image = context
-        .renderer
-        .render_offscreen(handle, commands, quality, dirty_region);
+    let image =
+        context
+            .renderer
+            .render_offscreen(handle, smallvec![commands], quality, dirty_region);
 
     match image {
         Some(sync_handle) => {

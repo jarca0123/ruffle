@@ -9,6 +9,13 @@ use crate::pixel_bender_support::PixelBenderShaderArgument;
 use crate::quality::StageQuality;
 use crate::shape_utils::DistilledShape;
 use ruffle_wstr::{FromWStr, WStr};
+use smallvec::SmallVec;
+
+/// A sequence of command-list sub-batches passed to `render_offscreen`.
+/// Inline size of 1 covers the single-batch call path (e.g. `BitmapData.draw()`)
+/// without a heap allocation; longer sequences from deferred batching spill to
+/// heap identically to `Vec`.
+pub type RenderOffscreenBatches = SmallVec<[CommandList; 1]>;
 use std::any::Any;
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -36,10 +43,16 @@ pub trait RenderBackend: Any {
         bitmap_source: &dyn BitmapSource,
     ) -> ShapeHandle;
 
+    /// Renders the given sequence of command lists onto the texture bound
+    /// to `handle` and returns a sync handle for the resulting write. Each
+    /// entry in `batches` is rendered as its own render pass; with MSAA,
+    /// this means the previous pass's resolve is visible as input to the
+    /// next. A single long batch stays in one pass, so callers that pack
+    /// non-overlapping draws into one batch skip any per-draw resolve.
     fn render_offscreen(
         &mut self,
         handle: BitmapHandle,
-        commands: CommandList,
+        batches: RenderOffscreenBatches,
         quality: StageQuality,
         bounds: PixelRegion,
     ) -> Option<Box<dyn SyncHandle>>;
