@@ -804,6 +804,85 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         true
     }
 
+    fn copy_pixels_to_texture(
+        &mut self,
+        source: BitmapHandle,
+        source_region: PixelRegion,
+        destination: BitmapHandle,
+        dest_point: (u32, u32),
+    ) -> Option<Box<dyn SyncHandle>> {
+        let source_texture = as_texture(&source);
+        let dest_texture = as_texture(&destination);
+
+        let copy_width = source_region
+            .width()
+            .min(dest_texture.texture.width().saturating_sub(dest_point.0))
+            .min(
+                source_texture
+                    .texture
+                    .width()
+                    .saturating_sub(source_region.x_min),
+            );
+        let copy_height = source_region
+            .height()
+            .min(dest_texture.texture.height().saturating_sub(dest_point.1))
+            .min(
+                source_texture
+                    .texture
+                    .height()
+                    .saturating_sub(source_region.y_min),
+            );
+
+        if copy_width == 0 || copy_height == 0 {
+            return None;
+        }
+
+        let dest_region =
+            PixelRegion::for_region(dest_point.0, dest_point.1, copy_width, copy_height);
+
+        let target = TextureTarget {
+            size: wgpu::Extent3d {
+                width: dest_texture.texture.width(),
+                height: dest_texture.texture.height(),
+                depth_or_array_layers: 1,
+            },
+            texture: dest_texture.texture.clone(),
+            format: dest_texture.texture.format(),
+            buffer: None,
+        };
+
+        self.active_frame.command_encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &source_texture.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: source_region.x_min,
+                    y: source_region.y_min,
+                    z: 0,
+                },
+                aspect: Default::default(),
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &dest_texture.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: dest_point.0,
+                    y: dest_point.1,
+                    z: 0,
+                },
+                aspect: Default::default(),
+            },
+            wgpu::Extent3d {
+                width: copy_width,
+                height: copy_height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        self.active_frame.maybe_flush(&self.descriptors);
+        Some(self.make_queue_sync_handle(target, None, destination, dest_region))
+    }
+
     fn apply_filter(
         &mut self,
         source: BitmapHandle,

@@ -83,6 +83,20 @@ pub trait RenderBackend: Any {
         false
     }
 
+    /// Copies a rectangular region from one GPU texture to another without
+    /// CPU readback or blending. Returns a `SyncHandle` the caller can use
+    /// to mark the destination `GpuModified`. Backends without GPU support
+    /// return `None` and the caller should fall back to the CPU copy path.
+    fn copy_pixels_to_texture(
+        &mut self,
+        _source: BitmapHandle,
+        _source_region: PixelRegion,
+        _destination: BitmapHandle,
+        _dest_point: (u32, u32),
+    ) -> Option<Box<dyn SyncHandle>> {
+        None
+    }
+
     fn submit_frame(
         &mut self,
         clear: swf::Color,

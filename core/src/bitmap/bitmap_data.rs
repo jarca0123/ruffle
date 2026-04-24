@@ -358,6 +358,30 @@ impl<'gc> BitmapData<'gc> {
             .append_gpu_commands(gc, renderer, commands, dirty, quality);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_render_bitmap(
+        &self,
+        gc: &Mutation<'gc>,
+        renderer: &mut dyn RenderBackend,
+        bitmap: BitmapHandle,
+        transform: ruffle_render::transform::Transform,
+        smoothing: bool,
+        pixel_snapping: PixelSnapping,
+        dirty: PixelRegion,
+        quality: StageQuality,
+    ) {
+        self.0.append_render_bitmap(
+            gc,
+            renderer,
+            bitmap,
+            transform,
+            smoothing,
+            pixel_snapping,
+            dirty,
+            quality,
+        );
+    }
+
     pub fn can_read(&self, read_area: PixelRegion) -> bool {
         self.0.can_read(read_area)
     }
@@ -657,6 +681,65 @@ mod wrapper {
                         merged.union(*old);
                     }
                     data.pending_gpu_commands = Some((vec![(commands, dirty)], merged, quality));
+                }
+            }
+        }
+
+        /// Append one `render_bitmap` command to the deferred batch. When
+        /// the command can merge into the current sub-batch, no new
+        /// `CommandList` is allocated - the command is pushed onto the
+        /// existing list in place.
+        #[allow(clippy::too_many_arguments)]
+        pub fn append_render_bitmap(
+            &self,
+            gc: &Mutation<'gc>,
+            renderer: &mut dyn RenderBackend,
+            bitmap: BitmapHandle,
+            transform: ruffle_render::transform::Transform,
+            smoothing: bool,
+            pixel_snapping: PixelSnapping,
+            dirty: PixelRegion,
+            quality: StageQuality,
+        ) {
+            let mut data = self.0.borrow_mut(gc);
+            data.update_dirty_texture(renderer);
+
+            if let Some((_, _, existing_quality)) = &data.pending_gpu_commands
+                && *existing_quality != quality
+            {
+                data.flush_pending_gpu_commands(renderer, gc);
+            }
+
+            let command = ruffle_render::commands::Command::RenderBitmap {
+                bitmap,
+                transform,
+                smoothing,
+                pixel_snapping,
+            };
+
+            match &mut data.pending_gpu_commands {
+                Some((batches, union_dirty, _)) => {
+                    let needs_resolve_boundary = quality.sample_count() > 1
+                        && batches.last().is_some_and(|(_, d)| dirty.intersects(*d));
+                    if needs_resolve_boundary || batches.is_empty() {
+                        let mut list = CommandList::new();
+                        list.commands.push(command);
+                        batches.push((list, dirty));
+                    } else {
+                        let last = batches.last_mut().expect("batches is non-empty");
+                        last.0.commands.push(command);
+                        last.1.union(dirty);
+                    }
+                    union_dirty.union(dirty);
+                }
+                None => {
+                    let mut merged = dirty;
+                    if let DirtyState::GpuModified(_, old) = &data.dirty_state {
+                        merged.union(*old);
+                    }
+                    let mut list = CommandList::new();
+                    list.commands.push(command);
+                    data.pending_gpu_commands = Some((vec![(list, dirty)], merged, quality));
                 }
             }
         }
