@@ -905,24 +905,24 @@ impl<'gc> BitmapRawData<'gc> {
     // Updates the data stored with our `BitmapHandle` if this `BitmapRawData`
     // is dirty
     pub fn update_dirty_texture(&mut self, renderer: &mut dyn RenderBackend) {
-        let handle = self.bitmap_handle(renderer);
-        match &self.dirty_state {
-            DirtyState::CpuModified(region) => {
-                if let Err(e) = renderer.update_texture(
-                    &handle,
-                    Bitmap::new(
-                        self.width(),
-                        self.height(),
-                        BitmapFormat::Rgba,
-                        self.pixels_rgba(),
-                    ),
-                    *region,
-                ) {
-                    tracing::error!("Failed to update dirty bitmap {:?}: {:?}", handle, e);
-                }
-                self.dirty_state = DirtyState::Clean
+        // Only resolve the handle for the CpuModified arm - the Clean and
+        // GpuModified cases are no-ops, and this function is on the hot path
+        // of tight copyPixels/draw loops where the handle clone is wasted.
+        if let DirtyState::CpuModified(region) = self.dirty_state {
+            let handle = self.bitmap_handle(renderer);
+            if let Err(e) = renderer.update_texture(
+                &handle,
+                Bitmap::new(
+                    self.width(),
+                    self.height(),
+                    BitmapFormat::Rgba,
+                    self.pixels_rgba(),
+                ),
+                region,
+            ) {
+                tracing::error!("Failed to update dirty bitmap {:?}: {:?}", handle, e);
             }
-            DirtyState::Clean | DirtyState::GpuModified(_, _) => {}
+            self.dirty_state = DirtyState::Clean;
         }
     }
 
