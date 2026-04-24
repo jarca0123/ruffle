@@ -1667,8 +1667,6 @@ pub fn draw<'gc>(
         render_context.commands.pop_mask();
     }
 
-    let handle = target.bitmap_handle(render_context.gc(), render_context.renderer);
-
     let commands = if blend_mode == BlendMode::Normal {
         render_context.commands
     } else {
@@ -1680,29 +1678,24 @@ pub fn draw<'gc>(
         commands
     };
 
-    let (target, include_dirty_area) = target.overwrite_cpu_pixels_from_gpu(context.gc());
-    let mut write = target.borrow_mut(context.gc());
-    // If we have another dirty area to preserve, expand this to include it
-    if let Some(old) = include_dirty_area {
-        dirty_region.union(old);
-    }
-
     assert!(
         cache_draws.is_empty(),
         "BitmapData.draw() should not use cacheAsBitmap"
     );
-    let image =
-        context
-            .renderer
-            .render_offscreen(handle, smallvec![commands], quality, dirty_region);
-
-    match image {
-        Some(sync_handle) => {
-            write.set_gpu_dirty(context.gc(), sync_handle, dirty_region);
-            Ok(())
-        }
-        None => Err(BitmapDataDrawError::Unimplemented),
-    }
+    // Defer the draw into the target's pending GPU batch instead of calling
+    // `render_offscreen` synchronously. Consecutive `BitmapData.draw()` calls
+    // onto the same target then share one submission at flush time - crucial
+    // for scenes (e.g. cached backgrounds) that do tens of thousands of
+    // draws per frame and would otherwise hit the backend's per-frame draw
+    // cap with fresh command-encoder allocations.
+    target.append_gpu_commands(
+        context.gc(),
+        context.renderer,
+        commands,
+        dirty_region,
+        quality,
+    );
+    Ok(())
 }
 
 pub fn get_vector<'gc>(
