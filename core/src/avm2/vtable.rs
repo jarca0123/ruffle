@@ -27,6 +27,15 @@ struct VTableData<'gc> {
 
     protected_namespace: Option<Namespace<'gc>>,
 
+    /// Copy-on-write parent. Inherited traits are *not* copied into this
+    /// vtable; instead they are resolved by walking up the `parent` chain.
+    /// This avoids cloning the (potentially huge) superclass trait map for
+    /// every subclass — see `init_vtable`.
+    parent: Option<VTable<'gc>>,
+
+    /// Only the traits *declared or overridden* by the defining class.
+    /// Use `VTable::get_trait` / `all_resolved_traits` to get the full,
+    /// inheritance-flattened view that walks the `parent` chain.
     resolved_traits: PropertyMap<'gc, Property>,
 
     /// Use hashmaps for the metadata tables because metadata will rarely be present on traits
@@ -37,8 +46,27 @@ struct VTableData<'gc> {
     /// slot_table is indexed by `slot_id`
     slot_table: Box<[SlotInfo<'gc>]>,
 
-    /// method_table is indexed by `disp_id`
-    method_table: Box<[ClassBoundMethod<'gc>]>,
+    /// The number of methods owned by the `parent` chain. `disp_id`s below this
+    /// value are inherited and resolved by walking `parent` (unless overridden,
+    /// see `method_overrides`); `disp_id`s at or above it index `own_methods`.
+    method_base: usize,
+
+    /// Methods *declared* by this class, indexed by `disp_id - method_base`.
+    /// Inherited methods are NOT copied here — they stay shared via `parent`.
+    own_methods: Box<[ClassBoundMethod<'gc>]>,
+
+    /// Methods this class *overrides* from an ancestor, keyed by the inherited
+    /// `disp_id` (which is `< method_base`). Kept as a small slice rather than a
+    /// `HashMap` so the entries can be mutated in place through the gc barrier
+    /// (see `replace_scopes_with`). Overrides are rare, so linear scan is fine.
+    method_overrides: Box<[MethodOverride<'gc>]>,
+}
+
+#[derive(Collect, Clone)]
+#[collect(no_drop)]
+struct MethodOverride<'gc> {
+    disp_id: usize,
+    method: ClassBoundMethod<'gc>,
 }
 
 impl PartialEq for VTable<'_> {
@@ -112,8 +140,44 @@ impl<'gc> VTable<'gc> {
         Ok(VTable(Gc::new(context.gc(), this)))
     }
 
+    /// The traits declared/overridden by *this* class only (not inherited).
+    /// For the full inheritance-flattened view, use [`Self::all_resolved_traits`].
     pub fn resolved_traits(self) -> &'gc PropertyMap<'gc, Property> {
         &Gc::as_ref(self.0).resolved_traits
+    }
+
+    /// Look up a single trait by exact `QName`, walking the COW parent chain.
+    /// Child traits shadow inherited ones with the same name+namespace.
+    fn get_trait_by_qname(self, name: QName<'gc>) -> Option<Property> {
+        let mut current = Some(self);
+        while let Some(vt) = current {
+            if let Some(prop) = vt.0.resolved_traits.get(name) {
+                return Some(*prop);
+            }
+            current = vt.0.parent;
+        }
+        None
+    }
+
+    /// The full, inheritance-flattened list of resolved traits, walking the
+    /// COW parent chain. A child entry shadows any inherited entry with the
+    /// same local name + namespace, so each property is yielded exactly once.
+    pub fn all_resolved_traits(self) -> Vec<(AvmString<'gc>, Namespace<'gc>, &'gc Property)> {
+        let mut out: Vec<(AvmString<'gc>, Namespace<'gc>, &'gc Property)> = Vec::new();
+        let mut current = Some(self);
+        while let Some(vt) = current {
+            for (name, ns, prop) in Gc::as_ref(vt.0).resolved_traits.iter() {
+                if out
+                    .iter()
+                    .any(|(n, s, _)| *n == name && s.exact_version_match(ns))
+                {
+                    continue;
+                }
+                out.push((name, ns, prop));
+            }
+            current = vt.0.parent;
+        }
+        out
     }
 
     pub fn get_metadata_for_slot(self, slot_id: usize) -> Option<&'gc [Metadata<'gc>]> {
@@ -149,7 +213,14 @@ impl<'gc> VTable<'gc> {
             return None;
         }
 
-        self.resolved_traits().get_for_multiname(name).cloned()
+        let mut current = Some(self);
+        while let Some(vt) = current {
+            if let Some(prop) = vt.0.resolved_traits.get_for_multiname(name) {
+                return Some(*prop);
+            }
+            current = vt.0.parent;
+        }
+        None
     }
 
     pub fn get_trait_with_ns(self, name: &Multiname<'gc>) -> Option<(Namespace<'gc>, Property)> {
@@ -157,9 +228,14 @@ impl<'gc> VTable<'gc> {
             return None;
         }
 
-        self.resolved_traits()
-            .get_with_ns_for_multiname(name)
-            .map(|(ns, p)| (ns, *p))
+        let mut current = Some(self);
+        while let Some(vt) = current {
+            if let Some((ns, p)) = vt.0.resolved_traits.get_with_ns_for_multiname(name) {
+                return Some((ns, *p));
+            }
+            current = vt.0.parent;
+        }
+        None
     }
 
     /// Coerces `value` to the type of the slot with id `slot_id`
@@ -182,15 +258,37 @@ impl<'gc> VTable<'gc> {
     }
 
     pub fn has_trait(self, name: &Multiname<'gc>) -> bool {
-        self.resolved_traits().get_for_multiname(name).is_some()
+        self.get_trait(name).is_some()
+    }
+
+    /// The total number of methods reachable from this vtable, i.e. the number
+    /// of valid `disp_id`s. Used to compute the `method_base` of a subclass.
+    fn method_total(self) -> usize {
+        self.0.method_base + self.0.own_methods.len()
     }
 
     pub fn get_method(self, disp_id: usize) -> Option<Method<'gc>> {
-        self.0.method_table.get(disp_id).cloned().map(|x| x.method)
+        self.get_full_method(disp_id).map(|m| m.method)
     }
 
     pub fn get_full_method(self, disp_id: usize) -> Option<&'gc ClassBoundMethod<'gc>> {
-        Gc::as_ref(self.0).method_table.get(disp_id)
+        // Walk the copy-on-write parent chain: methods owned by this class live
+        // in `own_methods`, overridden inherited methods in `method_overrides`,
+        // and everything else is resolved from the superclass vtable.
+        let mut vt = self;
+        loop {
+            let data = Gc::as_ref(vt.0);
+            if disp_id >= data.method_base {
+                return data.own_methods.get(disp_id - data.method_base);
+            }
+            if let Some(o) = data.method_overrides.iter().find(|o| o.disp_id == disp_id) {
+                return Some(&o.method);
+            }
+            match data.parent {
+                Some(p) => vt = p,
+                None => return None,
+            }
+        }
     }
 
     pub fn slot_count(self) -> usize {
@@ -217,9 +315,20 @@ impl<'gc> VTable<'gc> {
     }
 
     pub fn replace_scopes_with(self, mc: &Mutation<'gc>, new_scope: ScopeChain<'gc>) {
-        let methods = field!(Gc::write(mc, self.0), VTableData, method_table).as_deref();
-        for i in 0..methods.len() {
-            unlock!(&methods[i], ClassBoundMethod, scope).set(Some(new_scope));
+        // NOTE: with the copy-on-write method table this only rewrites the
+        // scopes of methods *owned/overridden by this vtable*, not inherited
+        // ones (those are shared from the parent and rewriting them would leak
+        // into sibling subclasses). The sole caller is a bootstrap hack on the
+        // `Object` class vtable, whose own methods are what matter.
+        let write = Gc::write(mc, self.0);
+        let own = field!(write, VTableData, own_methods).as_deref();
+        for i in 0..own.len() {
+            unlock!(&own[i], ClassBoundMethod, scope).set(Some(new_scope));
+        }
+        let overrides = field!(write, VTableData, method_overrides).as_deref();
+        for i in 0..overrides.len() {
+            let method = field!(&overrides[i], MethodOverride, method);
+            unlock!(method, ClassBoundMethod, scope).set(Some(new_scope));
         }
     }
 
@@ -284,7 +393,14 @@ impl<'gc> VTable<'gc> {
         let mut slot_metadata_table = HashMap::new();
         let mut disp_metadata_table = HashMap::new();
         let mut slot_table = Vec::new();
-        let mut method_table = Vec::new();
+
+        // Copy-on-write method table: `own_methods` holds only methods declared
+        // by this class (global `disp_id = method_base + index`), inherited
+        // methods are resolved via the parent chain, and `method_overrides`
+        // holds entries for inherited `disp_id`s this class overrides.
+        let mut own_methods: Vec<ClassBoundMethod<'gc>> = Vec::new();
+        let mut method_overrides: Vec<MethodOverride<'gc>> = Vec::new();
+        let method_base = superclass_vtable.map(|sv| sv.method_total()).unwrap_or(0);
 
         // Subclasses cannot "override" slots in superclasses, so we only
         // maintain the list of slots that were declared by the subclass. At the
@@ -294,20 +410,32 @@ impl<'gc> VTable<'gc> {
         let mut force_auto_assign_slots = false;
 
         if let Some(superclass_vtable) = superclass_vtable {
-            resolved_traits = superclass_vtable.resolved_traits().clone();
+            // NOTE: `resolved_traits` is intentionally NOT cloned from the
+            // superclass. Inherited traits stay shared through the `parent`
+            // link (set when building `VTableData` below) and are resolved by
+            // walking the chain in `get_trait` / `all_resolved_traits`. This
+            // copy-on-write scheme is the whole point: it avoids cloning the
+            // (potentially huge) flattened superclass trait map per subclass.
+            //
+            // The metadata tables are still cloned, but they are almost always
+            // empty (metadata is rare on traits), so the clone is essentially
+            // free. The dense `slot_table` is still copied so slots can be
+            // indexed directly by slot_id; `method_table` is now copy-on-write
+            // (see `own_methods` / `method_overrides` / `method_base`).
             slot_metadata_table = superclass_vtable.0.slot_metadata_table.clone();
             disp_metadata_table = superclass_vtable.0.disp_metadata_table.clone();
             slot_table.extend_from_slice(&superclass_vtable.0.slot_table);
-            method_table.extend_from_slice(&superclass_vtable.0.method_table);
 
             first_slot_offset = superclass_vtable.slot_count();
 
             if let Some(protected_namespace) = defining_class_def.protected_namespace()
                 && let Some(super_protected_namespace) = superclass_vtable.0.protected_namespace
             {
-                // Copy all protected traits from superclass
-                // but with this class's protected namespace
-                for (local_name, ns, prop) in superclass_vtable.resolved_traits().iter() {
+                // Copy all protected traits from the whole superclass hierarchy
+                // but with this class's protected namespace. These are stored as
+                // *owned* traits of this vtable (they use a new namespace, so
+                // they never collide with the inherited ones).
+                for (local_name, ns, prop) in superclass_vtable.all_resolved_traits() {
                     if ns.exact_version_match(super_protected_namespace) {
                         let new_name = QName::new(protected_namespace, local_name);
                         resolved_traits.insert(new_name, *prop);
@@ -341,19 +469,30 @@ impl<'gc> VTable<'gc> {
                         scope: Lock::new(scope),
                         method: *method,
                     };
-                    match resolved_traits.get(trait_data.name()) {
-                        Some(Property::Method { disp_id, .. }) => {
+                    // Resolve any inherited trait with the same name by walking
+                    // the COW parent chain (it is no longer copied into our map).
+                    let existing = resolved_traits.get(trait_data.name()).copied().or_else(|| {
+                        superclass_vtable.and_then(|sv| sv.get_trait_by_qname(trait_data.name()))
+                    });
+                    match existing {
+                        Some(Property::Method { disp_id }) => {
                             if let Some(metadata) = trait_data.metadata() {
-                                disp_metadata_table.insert(*disp_id, metadata);
+                                disp_metadata_table.insert(disp_id, metadata);
                             }
 
-                            method_table[*disp_id] = entry;
+                            install_method(
+                                &mut own_methods,
+                                &mut method_overrides,
+                                method_base,
+                                disp_id,
+                                entry,
+                            );
                         }
                         // note: ideally overwriting other property types
                         // should be a VerifyError
                         None => {
-                            let disp_id = method_table.len();
-                            method_table.push(entry);
+                            let disp_id = method_base + own_methods.len();
+                            own_methods.push(entry);
                             resolved_traits
                                 .insert(trait_data.name(), Property::new_method(disp_id));
 
@@ -372,6 +511,15 @@ impl<'gc> VTable<'gc> {
                         scope: Lock::new(scope),
                         method: *method,
                     };
+                    // If a matching virtual property is inherited (only in the
+                    // parent chain), copy it down into our own map (copy-on-write)
+                    // so the `get_mut` below can complete it with this accessor.
+                    if resolved_traits.get(trait_data.name()).is_none()
+                        && let Some(inherited) = superclass_vtable
+                            .and_then(|sv| sv.get_trait_by_qname(trait_data.name()))
+                    {
+                        resolved_traits.insert(trait_data.name(), inherited);
+                    }
                     match resolved_traits.get_mut(trait_data.name()) {
                         Some(Property::Virtual {
                             get: Some(disp_id), ..
@@ -380,20 +528,26 @@ impl<'gc> VTable<'gc> {
                                 disp_metadata_table.insert(*disp_id, metadata);
                             }
 
-                            method_table[*disp_id] = entry;
+                            install_method(
+                                &mut own_methods,
+                                &mut method_overrides,
+                                method_base,
+                                *disp_id,
+                                entry,
+                            );
                         }
                         Some(Property::Virtual { get, .. }) => {
-                            let disp_id = method_table.len();
+                            let disp_id = method_base + own_methods.len();
                             *get = Some(disp_id);
-                            method_table.push(entry);
+                            own_methods.push(entry);
 
                             if let Some(metadata) = trait_data.metadata() {
                                 disp_metadata_table.insert(disp_id, metadata);
                             }
                         }
                         None => {
-                            let disp_id = method_table.len();
-                            method_table.push(entry);
+                            let disp_id = method_base + own_methods.len();
+                            own_methods.push(entry);
                             resolved_traits
                                 .insert(trait_data.name(), Property::new_getter(disp_id));
 
@@ -412,6 +566,14 @@ impl<'gc> VTable<'gc> {
                         scope: Lock::new(scope),
                         method: *method,
                     };
+                    // See the getter arm: copy an inherited virtual down into our
+                    // own map (copy-on-write) before completing it with this setter.
+                    if resolved_traits.get(trait_data.name()).is_none()
+                        && let Some(inherited) = superclass_vtable
+                            .and_then(|sv| sv.get_trait_by_qname(trait_data.name()))
+                    {
+                        resolved_traits.insert(trait_data.name(), inherited);
+                    }
                     match resolved_traits.get_mut(trait_data.name()) {
                         Some(Property::Virtual {
                             set: Some(disp_id), ..
@@ -420,11 +582,17 @@ impl<'gc> VTable<'gc> {
                                 disp_metadata_table.insert(*disp_id, metadata);
                             }
 
-                            method_table[*disp_id] = entry;
+                            install_method(
+                                &mut own_methods,
+                                &mut method_overrides,
+                                method_base,
+                                *disp_id,
+                                entry,
+                            );
                         }
                         Some(Property::Virtual { set, .. }) => {
-                            let disp_id = method_table.len();
-                            method_table.push(entry);
+                            let disp_id = method_base + own_methods.len();
+                            own_methods.push(entry);
                             *set = Some(disp_id);
 
                             if let Some(metadata) = trait_data.metadata() {
@@ -432,8 +600,8 @@ impl<'gc> VTable<'gc> {
                             }
                         }
                         None => {
-                            let disp_id = method_table.len();
-                            method_table.push(entry);
+                            let disp_id = method_base + own_methods.len();
+                            own_methods.push(entry);
                             resolved_traits
                                 .insert(trait_data.name(), Property::new_setter(disp_id));
 
@@ -535,11 +703,14 @@ impl<'gc> VTable<'gc> {
         Ok(VTableData {
             scope,
             protected_namespace: defining_class_def.protected_namespace(),
+            parent: superclass_vtable,
             resolved_traits,
             slot_metadata_table,
             disp_metadata_table,
             slot_table: slot_table.into_boxed_slice(),
-            method_table: method_table.into_boxed_slice(),
+            method_base,
+            own_methods: own_methods.into_boxed_slice(),
+            method_overrides: method_overrides.into_boxed_slice(),
         })
     }
 
@@ -558,7 +729,14 @@ impl<'gc> VTable<'gc> {
                 let interface_name = interface_trait.name();
                 if !interface_name.namespace().is_public() {
                     let public_name = QName::new(internal_ns, interface_name.local_name());
-                    if let Some(prop) = this.resolved_traits.get(public_name).copied() {
+                    // The implementing trait may be inherited, so consult the
+                    // COW parent chain in addition to this class's own traits.
+                    let prop = this
+                        .resolved_traits
+                        .get(public_name)
+                        .copied()
+                        .or_else(|| this.parent.and_then(|p| p.get_trait_by_qname(public_name)));
+                    if let Some(prop) = prop {
                         this.resolved_traits.insert(interface_name, prop);
                     }
                 }
@@ -608,8 +786,8 @@ impl<'gc> VTable<'gc> {
     }
 
     pub fn public_properties(self) -> impl Iterator<Item = (AvmString<'gc>, Property)> {
-        self.resolved_traits()
-            .iter()
+        self.all_resolved_traits()
+            .into_iter()
             .filter(|(_, ns, _)| ns.is_public())
             .map(|(name, _, prop)| (name, *prop))
     }
@@ -625,6 +803,29 @@ impl VTableInitError {
         match self {
             VTableInitError::SlotConflict => make_error_1107(activation),
         }
+    }
+}
+
+/// Install a method into the copy-on-write method table being built by
+/// `init_vtable`. A brand-new `disp_id` (>= `method_base`, i.e. a method this
+/// class declares) re-uses or extends `own_methods`; overriding an inherited
+/// `disp_id` (< `method_base`) records the override in `method_overrides`.
+fn install_method<'gc>(
+    own_methods: &mut [ClassBoundMethod<'gc>],
+    method_overrides: &mut Vec<MethodOverride<'gc>>,
+    method_base: usize,
+    disp_id: usize,
+    entry: ClassBoundMethod<'gc>,
+) {
+    if disp_id >= method_base {
+        own_methods[disp_id - method_base] = entry;
+    } else if let Some(o) = method_overrides.iter_mut().find(|o| o.disp_id == disp_id) {
+        o.method = entry;
+    } else {
+        method_overrides.push(MethodOverride {
+            disp_id,
+            method: entry,
+        });
     }
 }
 
