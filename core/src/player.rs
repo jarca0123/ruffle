@@ -316,6 +316,7 @@ pub struct Player {
 
     run_state: RunState,
     needs_render: bool,
+    gc_requested: bool,
 
     renderer: Box<dyn RenderBackend>,
     audio: Box<dyn AudioBackend>,
@@ -2303,6 +2304,7 @@ impl Player {
                 timers,
                 current_context_menu,
                 needs_render: &mut this.needs_render,
+                gc_requested: &mut this.gc_requested,
                 avm1,
                 avm2,
                 external_interface,
@@ -2395,7 +2397,19 @@ impl Player {
         self.update_mouse_state(EnumSet::empty(), false, &mut false);
 
         // GC
-        self.gc_arena.borrow_mut().collect_debt();
+        if std::mem::take(&mut self.gc_requested) {
+            // `System.gc()` requested a full collection. gc-arena can only
+            // collect between mutations, so we honor it here: finish any
+            // in-progress cycle, then run a complete mark-and-sweep.
+            let mut arena = self.gc_arena.borrow_mut();
+            arena.finish_cycle();
+            if let Some(marked) = arena.finish_marking() {
+                marked.start_sweeping();
+            }
+            arena.finish_cycle();
+        } else {
+            self.gc_arena.borrow_mut().collect_debt();
+        }
 
         rval
     }
@@ -3054,6 +3068,7 @@ impl PlayerBuilder {
                     RunState::Suspended
                 },
                 needs_render: true,
+                gc_requested: false,
                 self_reference: self_ref.clone(),
                 load_behavior: self.load_behavior,
                 spoofed_url: self.spoofed_url.clone(),
