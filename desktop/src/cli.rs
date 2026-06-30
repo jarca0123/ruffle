@@ -55,6 +55,11 @@ pub struct Opt {
     #[clap(long, short)]
     pub graphics: Option<GraphicsBackend>,
 
+    /// Use the experimental native OpenGL renderer (own glow-based backend),
+    /// bypassing wgpu and the egui UI. For GL-only hardware / renderer testing.
+    #[clap(long)]
+    pub gl_native: bool,
+
     /// Power preference for the graphics device used. High power usage tends to prefer dedicated GPUs,
     /// whereas a low power usage tends prefer integrated GPUs.
     ///

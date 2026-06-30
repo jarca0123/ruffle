@@ -633,6 +633,42 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         self.active_frame
             .submit_for_target(&self.descriptors, &self.target, frame_output);
         self.offscreen_texture_pool = TexturePool::new();
+
+        // LOCAL-ONLY diagnostic: periodically log live GPU resource counts /
+        // memory to distinguish a resource leak (counts climb monotonically)
+        // from driver-internal caching. Enable with `RUFFLE_GPU_STATS=1`.
+        if std::env::var_os("RUFFLE_GPU_STATS").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static FRAME: AtomicU64 = AtomicU64::new(0);
+            let n = FRAME.fetch_add(1, Ordering::Relaxed);
+            if n % 300 == 0 {
+                let mib = |bytes: isize| bytes as f64 / (1024.0 * 1024.0);
+                let counters = self.descriptors.device.get_internal_counters();
+                let (allocated, reserved, num_allocs) = self
+                    .descriptors
+                    .device
+                    .generate_allocator_report()
+                    .map(|r| {
+                        (
+                            mib(r.total_allocated_bytes as isize),
+                            mib(r.total_reserved_bytes as isize),
+                            r.allocations.len(),
+                        )
+                    })
+                    .unwrap_or((0.0, 0.0, 0));
+                tracing::info!(
+                    "[gpu-stats] frame {n}: textures={} ({:.1} MiB), buffers={} ({:.1} MiB), bind_groups={} | allocator: {:.1} MiB used / {:.1} MiB reserved ({} allocations)",
+                    counters.hal.textures.read(),
+                    mib(counters.hal.texture_memory.read()),
+                    counters.hal.buffers.read(),
+                    mib(counters.hal.buffer_memory.read()),
+                    counters.hal.bind_groups.read(),
+                    allocated,
+                    reserved,
+                    num_allocs,
+                );
+            }
+        }
     }
 
     #[instrument(level = "debug", skip_all)]

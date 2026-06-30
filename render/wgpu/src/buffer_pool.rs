@@ -8,10 +8,31 @@ use std::sync::{Arc, Mutex, Weak};
 type PoolInner<T> = Mutex<Vec<T>>;
 type Constructor<Type, Description> = Box<dyn Fn(&Descriptors, &Description) -> Type>;
 
+/// Upper bound on the bytes of *idle* (returned-to-pool) textures we keep cached.
+/// When exceeded, least-recently-used size buckets are evicted.
+///
+/// The pool is keyed by exact texture size, and a key is created the first time
+/// a given size is requested. Content rendered at continuously-varying sizes
+/// (filters, `cacheAsBitmap`) would otherwise create one permanently-retained
+/// texture per distinct size, growing without bound for as long as the content
+/// keeps moving. LRU eviction caps that growth.
+const TEXTURE_POOL_BYTE_BUDGET: u64 = 128 * 1024 * 1024;
+
 #[derive(Debug, Default)]
 pub struct TexturePool {
-    pools: FnvHashMap<TextureKey, BufferPool<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>>,
+    pools: FnvHashMap<TextureKey, SizedPool>,
     globals_cache: FnvHashMap<GlobalsKey, Arc<Globals>>,
+    /// Monotonic logical clock, bumped on every `get_texture`, used for LRU ordering.
+    clock: u64,
+}
+
+#[derive(Debug)]
+struct SizedPool {
+    pool: BufferPool<(wgpu::Texture, wgpu::TextureView), AlwaysCompatible>,
+    /// Estimated bytes of a single texture in this bucket.
+    bytes_each: u64,
+    /// `clock` value of the most recent `get_texture` for this size (for LRU).
+    last_used: u64,
 }
 
 impl TexturePool {
@@ -33,7 +54,10 @@ impl TexturePool {
             format,
             sample_count,
         };
-        let pool = self.pools.entry(key).or_insert_with(|| {
+        self.clock += 1;
+        let now = self.clock;
+        let is_new = !self.pools.contains_key(&key);
+        let slot = self.pools.entry(key).or_insert_with(|| {
             let label = if cfg!(feature = "render_debug_labels") {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 static ID_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -42,22 +66,66 @@ impl TexturePool {
             } else {
                 None
             };
-            BufferPool::new(Box::new(move |descriptors, _description| {
-                let texture = descriptors.device.create_texture(&wgpu::TextureDescriptor {
-                    label: label.as_deref(),
-                    size,
-                    mip_level_count: 1,
-                    sample_count,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    view_formats: &[format],
-                    usage,
-                });
-                let view = texture.create_view(&Default::default());
-                (texture, view)
-            }))
+            SizedPool {
+                pool: BufferPool::new(Box::new(move |descriptors, _description| {
+                    let texture = descriptors.device.create_texture(&wgpu::TextureDescriptor {
+                        label: label.as_deref(),
+                        size,
+                        mip_level_count: 1,
+                        sample_count,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        view_formats: &[format],
+                        usage,
+                    });
+                    let view = texture.create_view(&Default::default());
+                    (texture, view)
+                })),
+                bytes_each: texture_byte_size(&key),
+                last_used: now,
+            }
         });
-        pool.take(descriptors, AlwaysCompatible)
+        slot.last_used = now;
+        let entry = slot.pool.take(descriptors, AlwaysCompatible);
+        // Only a freshly-inserted size can push us over budget; checking here
+        // (rather than every call) avoids locking every bucket on the hot path.
+        // The just-used key has the newest `last_used`, so it is evicted last.
+        if is_new {
+            self.evict_if_needed();
+        }
+        entry
+    }
+
+    /// Evict least-recently-used size buckets until the cached (idle) texture
+    /// bytes are back under [`TEXTURE_POOL_BYTE_BUDGET`].
+    ///
+    /// Only idle textures (sitting in a bucket's free list) count toward the
+    /// budget; textures currently in flight are held by live `PoolEntry`s via a
+    /// `Weak` handle, so evicting their bucket simply frees them on drop instead
+    /// of returning them to the pool.
+    fn evict_if_needed(&mut self) {
+        let mut total: u64 = self
+            .pools
+            .values()
+            .map(|s| s.bytes_each.saturating_mul(s.pool.available_len() as u64))
+            .sum();
+        if total <= TEXTURE_POOL_BYTE_BUDGET {
+            return;
+        }
+
+        let mut by_age: Vec<(u64, TextureKey)> =
+            self.pools.iter().map(|(k, s)| (s.last_used, *k)).collect();
+        by_age.sort_unstable_by_key(|(last_used, _)| *last_used);
+
+        for (_, key) in by_age {
+            if total <= TEXTURE_POOL_BYTE_BUDGET {
+                break;
+            }
+            if let Some(slot) = self.pools.remove(&key) {
+                total = total
+                    .saturating_sub(slot.bytes_each.saturating_mul(slot.pool.available_len() as u64));
+            }
+        }
     }
 
     pub fn get_globals(
@@ -89,6 +157,18 @@ struct TextureKey {
     usage: wgpu::TextureUsages,
     format: wgpu::TextureFormat,
     sample_count: u32,
+}
+
+/// Estimated GPU memory of a single texture with the given key. Used only for
+/// LRU budgeting, so an approximation (ignoring driver alignment/mip padding) is
+/// fine. Compressed/odd formats with no defined copy size fall back to 4 bpp.
+fn texture_byte_size(key: &TextureKey) -> u64 {
+    let bytes_per_pixel = key.format.block_copy_size(None).unwrap_or(4) as u64;
+    bytes_per_pixel
+        .saturating_mul(key.size.width as u64)
+        .saturating_mul(key.size.height as u64)
+        .saturating_mul(key.size.depth_or_array_layers as u64)
+        .saturating_mul(key.sample_count as u64)
 }
 
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
@@ -137,6 +217,14 @@ impl<Type, Description: BufferDescription> BufferPool<Type, Description> {
             available: Arc::new(Mutex::new(vec![])),
             constructor,
         }
+    }
+
+    /// Number of idle buffers currently sitting in this pool's free list.
+    pub fn available_len(&self) -> usize {
+        self.available
+            .lock()
+            .expect("Should not be able to lock recursively")
+            .len()
     }
 
     pub fn take(

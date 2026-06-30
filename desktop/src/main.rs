@@ -11,6 +11,7 @@ mod backends;
 mod cli;
 mod custom_event;
 mod dbus;
+mod gl_app;
 mod gui;
 mod log;
 mod player;
@@ -184,6 +185,17 @@ fn main() -> Result<(), Error> {
     };
 
     subscriber.init();
+
+    // Experimental native OpenGL path: bypass the wgpu/egui App entirely.
+    if preferences.cli.gl_native {
+        let movie_url = preferences
+            .cli
+            .movie_url
+            .clone()
+            .context("--gl-native requires a movie URL or file path")?;
+        let spoof_url = preferences.cli.spoof_url.as_ref().map(|url| url.to_string());
+        return gl_app::run(movie_url, spoof_url, preferences);
+    }
 
     let result = App::new(preferences).and_then(|(mut app, event_loop)| {
         event_loop.run_app(&mut app).context("Event loop failure")

@@ -1,0 +1,60 @@
+[package]
+name = "ruffle_render_gl"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# NOTE: glow's `tex_image_2d`/`tex_sub_image_2d` take a `glow::PixelUnpackData`
+# whose shape is version-sensitive; keep this pin in sync with the workspace dep.
+glow = { workspace = true }
+log = { workspace = true }
+bytemuck = { workspace = true, features = ["derive"] }
+swf = { path = "../../swf" }
+thiserror = { workspace = true }
+
+# Native build: tessellator only. We must NOT pull the `web` feature (which
+# forces `wasm-bindgen`) into a native target.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+ruffle_render = { path = "..", features = ["tessellator"] }
+
+# Web build: glow wraps a web_sys WebGL context. We keep the original web_sys
+# context around for queries glow doesn't expose (drawing buffer size, debug
+# renderer info). glow brings its own web-sys feature set for the GL handles.
+[target.'cfg(target_family = "wasm")'.dependencies]
+ruffle_render = { path = "..", features = ["tessellator", "web"] }
+ruffle_web_common = { path = "../../web/common" }
+js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies.web-sys]
+workspace = true
+features = [
+    "HtmlCanvasElement",
+    "WebGl2RenderingContext",
+    "WebGlRenderingContext",
+    "WebglDebugRendererInfo",
+]
+
+# Native harness (examples/native.rs) — winit + glutin window driving a Player.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+ruffle_core = { path = "../../core", features = [
+    "default_font",
+    "default_compatibility_rules",
+] }
+ruffle_render = { path = "..", features = ["tessellator"] }
+winit = "0.30"
+glutin = "0.32"
+glutin-winit = "0.5"
+raw-window-handle = "0.6"
+env_logger = "0.11"
+
+[[example]]
+name = "native"
+required-features = []

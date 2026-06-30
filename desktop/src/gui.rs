@@ -51,7 +51,7 @@ pub struct RuffleGui {
 }
 
 impl RuffleGui {
-    fn new(
+    pub fn new(
         window: Weak<winit::window::Window>,
         event_loop: EventLoopProxy<RuffleEvent>,
         default_content: Option<ContentDescriptor>,
@@ -81,7 +81,7 @@ impl RuffleGui {
     }
 
     /// Renders all of the main Ruffle UI, including the main menu and context menus.
-    fn update(
+    pub fn update(
         &mut self,
         egui_ctx: &egui::Context,
         show_menu: bool,
@@ -164,7 +164,7 @@ impl RuffleGui {
     }
 
     /// Notifies the GUI that a new player was created.
-    fn on_player_created(
+    pub fn on_player_created(
         &mut self,
         opt: LaunchOptions,
         content_descriptor: ContentDescriptor,

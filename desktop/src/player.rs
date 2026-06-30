@@ -532,10 +532,29 @@ impl PlayerId {
 /// A `Player`-bound future that is currently running.
 pub struct PlayerRunnable(async_task::Runnable<PlayerId>);
 
+impl PlayerRunnable {
+    /// Poll the task once. Used by render paths that drive the executor
+    /// directly (e.g. the native GL app) rather than via `PlayerController`.
+    pub fn run(self) {
+        self.0.run();
+    }
+}
+
 /// A bare-bones executor that schedules tasks on the winit event loop.
-struct WinitExecutor {
+pub struct WinitExecutor {
     event_loop: EventLoopProxy<RuffleEvent>,
     player_id: PlayerId,
+}
+
+impl WinitExecutor {
+    /// Create an executor with a fresh `PlayerId`. For render paths that own a
+    /// single player for the process lifetime (e.g. the native GL app).
+    pub fn new(event_loop: EventLoopProxy<RuffleEvent>) -> Self {
+        Self {
+            event_loop,
+            player_id: PlayerId::new(),
+        }
+    }
 }
 
 impl<E: std::error::Error + 'static> FutureSpawner<E> for WinitExecutor {

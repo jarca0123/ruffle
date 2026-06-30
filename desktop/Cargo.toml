@@ -22,6 +22,14 @@ fontdb = "0.23"
 ruffle_core = { path = "../core", features = ["audio", "clap", "mp3", "aac", "nellymoser", "default_compatibility_rules", "egui"] }
 ruffle_render = { path = "../render", features = ["clap"] }
 ruffle_render_wgpu = { path = "../render/wgpu", features = ["clap"] }
+# Native OpenGL backend (experimental, --gl-native) — own glow-based renderer,
+# bypasses the wgpu/egui GuiController. For GL-only hardware / host-mem testing.
+ruffle_render_gl = { path = "../render/gl" }
+glow = { workspace = true }
+glutin = "0.32"
+glutin-winit = "0.5"
+raw-window-handle = "0.6"
+egui_glow = "0.33.3"
 ruffle_video_software = { path = "../video/software", optional = true }
 ruffle_video_external = { path = "../video/external", features = ["openh264"], optional = true }
 ruffle_frontend_utils = { path = "../frontend-utils", features = ["cpal", "fs", "navigator"] }

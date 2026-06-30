@@ -505,6 +505,7 @@ impl RuffleInstanceBuilder {
         #[cfg(not(any(
             feature = "canvas",
             feature = "webgl",
+            feature = "gl",
             feature = "webgpu",
             feature = "wgpu-webgl"
         )))]
@@ -512,7 +513,9 @@ impl RuffleInstanceBuilder {
 
         let is_transparent = self.wmode.as_deref() == Some("transparent");
 
-        let mut renderer_list = vec!["wgpu-webgl", "webgpu", "webgl", "canvas"];
+        // The glow-based "gl" backend is forced first; the others remain as
+        // fallbacks in case GL context creation fails.
+        let mut renderer_list = vec!["gl", "wgpu-webgl", "webgpu", "webgl", "canvas"];
         if let Some(preferred_renderer) = &self.preferred_renderer {
             if let Some(pos) = renderer_list.iter().position(|&r| r == preferred_renderer) {
                 renderer_list.remove(pos);
@@ -600,6 +603,27 @@ impl RuffleInstanceBuilder {
                         }
                         Err(error) => {
                             tracing::error!("Error creating WebGL renderer: {}", error)
+                        }
+                    }
+                }
+                #[cfg(all(feature = "gl", target_family = "wasm"))]
+                "gl" => {
+                    tracing::info!("Creating glow GL renderer...");
+                    let canvas: HtmlCanvasElement = document
+                        .create_element("canvas")
+                        .into_js_result()?
+                        .dyn_into()
+                        .map_err(|_| "Expected HtmlCanvasElement")?;
+                    match ruffle_render_gl::GlRenderBackend::new_for_webgl(
+                        &canvas,
+                        is_transparent,
+                        self.quality,
+                    ) {
+                        Ok(renderer) => {
+                            return Ok((Box::new(renderer), canvas));
+                        }
+                        Err(error) => {
+                            tracing::error!("Error creating GL renderer: {}", error)
                         }
                     }
                 }
