@@ -7,7 +7,9 @@
 uniform sampler2D u_current; // src
 uniform sampler2D u_parent;  // dst
 // 0 multiply, 1 lighten, 2 darken, 3 difference, 4 invert,
-// 5 alpha, 6 erase, 7 overlay, 8 hardlight
+// 5 alpha, 6 erase, 7 overlay, 8 hardlight, 9 alpha-mask
+// (u_current = maskee, u_parent = mask; output = maskee * mask.a),
+// 10 add, 11 subtract, 12 screen
 uniform int u_blend_mode;
 
 varying vec2 v_uv;
@@ -38,6 +40,20 @@ void main() {
     } else if (u_blend_mode == 6) {
         // erase: cut the source alpha out of the parent.
         outc = vec4(dst.rgb * (1.0 - src.a), (1.0 - src.a) * dst.a);
+    } else if (u_blend_mode == 9) {
+        // alpha mask: the maskee (src) modulated by the mask's alpha (dst.a).
+        // Composited over the target with normal blend by the caller.
+        outc = vec4(src.rgb * dst.a, src.a * dst.a);
+    } else if (u_blend_mode == 10) {
+        // add (premultiplied), matching the fixed-function ONE/ONE +
+        // ONE/ONE_MINUS_SRC_ALPHA state used for single-draw batches.
+        outc = vec4(src.rgb + dst.rgb, src.a + dst.a * (1.0 - src.a));
+    } else if (u_blend_mode == 11) {
+        // subtract: dst - src (reverse subtract), src-over alpha.
+        outc = vec4(dst.rgb - src.rgb, src.a + dst.a * (1.0 - src.a));
+    } else if (u_blend_mode == 12) {
+        // screen: src + dst*(1 - src) (ONE/ONE_MINUS_SRC_COLOR).
+        outc = vec4(src.rgb + dst.rgb * (1.0 - src.rgb), src.a + dst.a * (1.0 - src.a));
     } else {
         // Un-premultiply for the blend function (dst guarded for dst.a == 0).
         vec3 s = src.rgb / src.a;

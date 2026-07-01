@@ -32,10 +32,13 @@ use glutin_winit::{DisplayBuilder, GlWindow};
 use raw_window_handle::HasWindowHandle;
 
 use ruffle_core::backend::navigator::SocketMode;
-use ruffle_core::backend::ui::FontDefinition;
+use ruffle_core::backend::ui::{
+    DialogResultFuture, FileFilter, FontDefinition, FullscreenError, LanguageIdentifier,
+    MouseCursor, MultiDialogResultFuture, NullUiBackend, UiBackend,
+};
 use ruffle_core::compatibility_rules::CompatibilityRules;
 use ruffle_core::events::{MouseButton as RuffleMouseButton, MouseWheelDelta, PlayerEvent};
-use ruffle_core::font::{DefaultFont, FontFileData};
+use ruffle_core::font::{DefaultFont, FontFileData, FontQuery};
 use ruffle_core::limits::ExecutionLimit;
 use ruffle_core::tag_utils::SwfMovie;
 use ruffle_core::{FloatDuration, Player, PlayerBuilder};
@@ -166,9 +169,17 @@ impl GlApp {
             NullNavigatorInterface,
         );
 
+        // A shared system-font database, used both for the eager default-font
+        // registration below and for lazy `load_device_font` lookups when a movie
+        // names a specific device font (e.g. Starling's "Verdana" text fields).
+        let mut font_database = fontdb::Database::new();
+        font_database.load_system_fonts();
+        let font_database = Rc::new(font_database);
+
         let mut builder = PlayerBuilder::new()
             .with_renderer(backend)
             .with_navigator(navigator)
+            .with_ui(GlUiBackend::new(font_database.clone()))
             .with_viewport_dimensions(width, height, 1.0)
             .with_autoplay(true)
             .with_compatibility_rules(CompatibilityRules::default())
@@ -182,7 +193,7 @@ impl GlApp {
         let player = builder.build();
         {
             let mut player = player.lock().expect("player lock");
-            register_device_fonts(&mut player);
+            register_device_fonts(&mut player, &font_database);
             player.fetch_root_movie(self.movie_url.to_string(), Vec::new(), Box::new(|_| {}));
         }
         Ok(player)
@@ -569,11 +580,132 @@ impl ApplicationHandler<RuffleEvent> for GlApp {
     }
 }
 
-/// Eagerly register system device fonts so HTML/TLF text renders.
-fn register_device_fonts(player: &mut Player) {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
+/// Minimal UI backend for the native-GL path. Behaves like [`NullUiBackend`]
+/// for everything except device-font loading: when a movie names a device font
+/// (e.g. Starling renders its `TextField`s with "Verdana"), core calls
+/// `load_device_font` lazily, and we resolve it against the system font
+/// database — falling back to a generic sans-serif face when the exact name is
+/// not installed, so text still renders instead of vanishing.
+struct GlUiBackend {
+    inner: NullUiBackend,
+    font_database: Rc<fontdb::Database>,
+}
 
+impl GlUiBackend {
+    fn new(font_database: Rc<fontdb::Database>) -> Self {
+        Self {
+            inner: NullUiBackend::new(),
+            font_database,
+        }
+    }
+}
+
+impl UiBackend for GlUiBackend {
+    fn load_device_font(&self, query: &FontQuery, register: &mut dyn FnMut(FontDefinition)) {
+        // Try the exact requested face first, then fall back to concrete
+        // sans-serif families that are actually installed on the system. We
+        // avoid `fontdb::Family::SansSerif` because `fontdb` does not resolve
+        // the generic families after `load_system_fonts()` (that needs
+        // fontconfig), so it would silently return nothing — leaving named
+        // fonts like "Verdana" (uninstalled on most Linux boxes) as empty text.
+        for candidate in std::iter::once(query.name.as_str()).chain(
+            [
+                "Arial",
+                "Liberation Sans",
+                "DejaVu Sans",
+                "Noto Sans",
+                "FreeSans",
+            ]
+            .into_iter(),
+        ) {
+            if let Some(mut font) =
+                query_device_font(&self.font_database, candidate, query.is_bold, query.is_italic)
+            {
+                // Register under the *requested* name so the movie's lookup hits,
+                // even when we substituted a different family.
+                if let FontDefinition::FontFile { name, .. } = &mut font {
+                    *name = query.name.to_string();
+                }
+                tracing::info!(
+                    "GL: device font \"{}\" (bold: {}, italic: {}) resolved via \"{candidate}\"",
+                    query.name,
+                    query.is_bold,
+                    query.is_italic,
+                );
+                register(font);
+                return;
+            }
+        }
+        tracing::warn!("GL: no device font found for \"{}\"", query.name);
+    }
+
+    fn mouse_visible(&self) -> bool {
+        self.inner.mouse_visible()
+    }
+    fn set_mouse_visible(&mut self, visible: bool) {
+        self.inner.set_mouse_visible(visible)
+    }
+    fn set_mouse_cursor(&mut self, cursor: MouseCursor) {
+        self.inner.set_mouse_cursor(cursor)
+    }
+    fn clipboard_content(&mut self) -> String {
+        self.inner.clipboard_content()
+    }
+    fn set_clipboard_content(&mut self, content: String) {
+        self.inner.set_clipboard_content(content)
+    }
+    fn set_fullscreen(&mut self, is_full: bool) -> Result<(), FullscreenError> {
+        self.inner.set_fullscreen(is_full)
+    }
+    fn display_root_movie_download_failed_message(&self, invalid_swf: bool, fetch_error: String) {
+        self.inner
+            .display_root_movie_download_failed_message(invalid_swf, fetch_error)
+    }
+    fn message(&self, message: &str) {
+        self.inner.message(message)
+    }
+    fn open_virtual_keyboard(&self) {
+        self.inner.open_virtual_keyboard()
+    }
+    fn close_virtual_keyboard(&self) {
+        self.inner.close_virtual_keyboard()
+    }
+    fn language(&self) -> LanguageIdentifier {
+        self.inner.language()
+    }
+    fn display_unsupported_video(&self, url: Url) {
+        self.inner.display_unsupported_video(url)
+    }
+    fn sort_device_fonts(
+        &self,
+        query: &FontQuery,
+        register: &mut dyn FnMut(FontDefinition),
+    ) -> Vec<FontQuery> {
+        self.inner.sort_device_fonts(query, register)
+    }
+    fn display_file_open_dialog(&mut self, filters: Vec<FileFilter>) -> Option<DialogResultFuture> {
+        self.inner.display_file_open_dialog(filters)
+    }
+    fn display_file_open_dialog_multiple(
+        &mut self,
+        filters: Vec<FileFilter>,
+    ) -> Option<MultiDialogResultFuture> {
+        self.inner.display_file_open_dialog_multiple(filters)
+    }
+    fn display_file_save_dialog(
+        &mut self,
+        file_name: String,
+        title: String,
+    ) -> Option<DialogResultFuture> {
+        self.inner.display_file_save_dialog(file_name, title)
+    }
+    fn close_file_dialog(&mut self) {
+        self.inner.close_file_dialog()
+    }
+}
+
+/// Eagerly register system device fonts so HTML/TLF text renders.
+fn register_device_fonts(player: &mut Player, db: &fontdb::Database) {
     let fallbacks: &[(DefaultFont, &[&str])] = &[
         (
             DefaultFont::Sans,
@@ -609,7 +741,7 @@ fn register_device_fonts(player: &mut Player) {
                 continue;
             }
             for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
-                if let Some(font) = query_device_font(&db, name, bold, italic) {
+                if let Some(font) = query_device_font(db, name, bold, italic) {
                     player.register_device_font(font);
                 }
             }

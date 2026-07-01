@@ -260,6 +260,18 @@ pub struct ParsedBytecode {
     operations: Vec<(Opcode, DestField, SourceField, Source2)>,
 }
 
+impl ParsedBytecode {
+    /// The decoded instruction stream, for backends that translate AGAL directly
+    /// (rather than via the `naga` codegen).
+    pub fn operations(&self) -> &[(Opcode, DestField, SourceField, Source2)] {
+        &self.operations
+    }
+
+    pub fn shader_type(&self) -> ShaderType {
+        self.shader_type
+    }
+}
+
 impl<'a> NagaBuilder<'a> {
     pub fn parse_bytecode(mut agal: &[u8]) -> Result<ParsedBytecode, AgalError> {
         let data = &mut agal;

@@ -11,9 +11,12 @@
 //! function, e.g. from glutin). WebGL1 is a complete first-class path — WebGL2,
 //! GLES3 and desktop GL >= 3.0 only add MSAA on top.
 
+mod agal;
 mod context;
+mod context3d;
 mod error;
 mod filters;
+mod pixelbender;
 mod pool;
 mod shader;
 
@@ -31,6 +34,10 @@ use ruffle_render::bitmap::{
     RgbaBufRead, SyncHandle,
 };
 use ruffle_render::commands::{Command, CommandHandler, CommandList, RenderBlendMode};
+use ruffle_render::pixel_bender::{
+    PixelBenderShader, PixelBenderShaderHandle, PixelBenderType,
+};
+use ruffle_render::pixel_bender_support::{ImageInputTexture, PixelBenderShaderArgument};
 use ruffle_render::error::Error as BitmapError;
 use ruffle_render::filters::Filter;
 use ruffle_render::matrix::Matrix;
@@ -54,6 +61,109 @@ const BATCH_COLOR_VERTEX_GLSL: &str = include_str!("../shaders/batch_color.vert"
 const BATCH_COLOR_FRAGMENT_GLSL: &str = include_str!("../shaders/batch_color.frag");
 const BATCH_BITMAP_VERTEX_GLSL: &str = include_str!("../shaders/batch_bitmap.vert");
 const COPY_FRAGMENT_GLSL: &str = include_str!("../shaders/copy.frag");
+// Fullscreen NDC quad for PixelBender; the fragment stage reads gl_FragCoord.
+const PIXELBENDER_VERTEX_GLSL: &str =
+    "attribute vec2 position;\nvoid main() {\n    gl_Position = vec4(position, 0.0, 1.0);\n}\n";
+
+/// A compiled PixelBender shader: the GLSL program plus the metadata needed to
+/// bind parameters and image inputs at run time.
+struct GlPixelBenderShader {
+    gl: GlContext,
+    program: glow::Program,
+    shader: PixelBenderShader,
+    float_slots: usize,
+    int_slots: usize,
+    param_slots: Vec<Option<pixelbender::ParamSlot>>,
+    output_channels: usize,
+    position_loc: Option<u32>,
+    u_float_params: Option<glow::UniformLocation>,
+    u_int_params: Option<glow::UniformLocation>,
+    u_zeroed: Option<glow::UniformLocation>,
+    u_out_size: Option<glow::UniformLocation>,
+    // (input index, sampler location, size location, nearest filtering)
+    u_inputs: Vec<(
+        u8,
+        Option<glow::UniformLocation>,
+        Option<glow::UniformLocation>,
+        bool,
+    )>,
+}
+
+impl std::fmt::Debug for GlPixelBenderShader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GlPixelBenderShader")
+            .field("name", &self.shader.name)
+            .finish()
+    }
+}
+
+impl ruffle_render::pixel_bender::PixelBenderShaderImpl for GlPixelBenderShader {
+    fn parsed_shader(&self) -> &PixelBenderShader {
+        &self.shader
+    }
+}
+
+impl Drop for GlPixelBenderShader {
+    fn drop(&mut self) {
+        unsafe { self.gl.delete_program(self.program) };
+    }
+}
+
+/// Writes a PixelBender parameter value into the float/int uniform-array data at
+/// its assigned slot (matching the naga port's packing).
+fn write_param_value(
+    value: &PixelBenderType,
+    slot: pixelbender::ParamSlot,
+    float_data: &mut [f32],
+    int_data: &mut [i32],
+) {
+    use PixelBenderType::*;
+    let putf = |d: &mut [f32], off: usize, v: [f32; 4]| {
+        if off + 4 <= d.len() {
+            d[off..off + 4].copy_from_slice(&v);
+        }
+    };
+    let puti = |d: &mut [i32], off: usize, v: [i32; 4]| {
+        if off + 4 <= d.len() {
+            d[off..off + 4].copy_from_slice(&v);
+        }
+    };
+    let b = slot.offset * 4;
+    match value {
+        TFloat(a) => putf(float_data, b, [*a, 0.0, 0.0, 0.0]),
+        TFloat2(a, c) => putf(float_data, b, [*a, *c, 0.0, 0.0]),
+        TFloat3(a, c, e) => putf(float_data, b, [*a, *c, *e, 0.0]),
+        TFloat4(a, c, e, f) => putf(float_data, b, [*a, *c, *e, *f]),
+        TFloat2x2(arr) => putf(float_data, b, *arr),
+        TFloat3x3(arr) => {
+            for c in 0..3 {
+                putf(
+                    float_data,
+                    b + c * 4,
+                    [arr[c * 3], arr[c * 3 + 1], arr[c * 3 + 2], 0.0],
+                );
+            }
+        }
+        TFloat4x4(arr) => {
+            for c in 0..4 {
+                putf(
+                    float_data,
+                    b + c * 4,
+                    [arr[c * 4], arr[c * 4 + 1], arr[c * 4 + 2], arr[c * 4 + 3]],
+                );
+            }
+        }
+        TInt(a) | TBool(a) => puti(int_data, b, [*a as i32, 0, 0, 0]),
+        TInt2(a, c) | TBool2(a, c) => puti(int_data, b, [*a as i32, *c as i32, 0, 0]),
+        TInt3(a, c, e) | TBool3(a, c, e) => {
+            puti(int_data, b, [*a as i32, *c as i32, *e as i32, 0])
+        }
+        TInt4(a, c, e, f) | TBool4(a, c, e, f) => {
+            puti(int_data, b, [*a as i32, *c as i32, *e as i32, *f as i32])
+        }
+        TString(_) => {}
+    }
+}
 const TEXTURE_VERTEX_GLSL: &str = include_str!("../shaders/texture.vert");
 const GRADIENT_FRAGMENT_GLSL: &str = include_str!("../shaders/gradient.frag");
 const BITMAP_FRAGMENT_GLSL: &str = include_str!("../shaders/bitmap.frag");
@@ -125,6 +235,11 @@ pub struct GlRenderBackend {
     batch_color_program: ShaderProgram,
     /// Raw texture passthrough used to seed offscreen MSAA buffers.
     copy_program: ShaderProgram,
+    /// Static NDC fullscreen quad ([-1,1]) for PixelBender passes, plus a VAO
+    /// (required on core profiles) reconfigured per pass for the shader's
+    /// `position` attribute location.
+    pb_quad_vbo: glow::Buffer,
+    pb_vao: glow::VertexArray,
 
     // Shared dynamic buffers for the solid-color draw batcher.
     batch_vao: glow::VertexArray,
@@ -183,6 +298,12 @@ pub struct GlRenderBackend {
     // (true) or the single-sample `offscreen_fbo` (false). Lets a nested complex
     // blend know how to read the parent.
     offscreen_msaa: bool,
+    // Color texture of the current single-sample offscreen pass (the parent
+    // content lives here directly, no resolve needed). `None` for MSAA/screen.
+    offscreen_color: Option<glow::Texture>,
+    // Testing knob (RUFFLE_GL_FORCE_OLDEST): also drop GL_MIN/MAX so Darken/
+    // Lighten take the GLES2 fallback path.
+    force_oldest: bool,
 
     // Single-sample offscreen framebuffer for `Layer` blends: children render
     // into it so that Alpha/Erase (and nested complex blends) composite against
@@ -226,11 +347,11 @@ pub struct GlRenderBackend {
     viewport_scale_factor: f64,
 }
 
-struct RegistryData {
-    gl: GlContext,
-    width: u32,
-    height: u32,
-    texture: glow::Texture,
+pub(crate) struct RegistryData {
+    pub(crate) gl: GlContext,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) texture: glow::Texture,
 }
 
 impl fmt::Debug for RegistryData {
@@ -434,8 +555,20 @@ impl GlRenderBackend {
 
     fn finish_construction(created: CreatedContext, is_transparent: bool) -> Result<Self, Error> {
         let gl = created.gl;
-        let caps = created.caps;
-        let msaa_sample_count = created.msaa_sample_count;
+        let mut caps = created.caps;
+        let mut msaa_sample_count = created.msaa_sample_count;
+
+        // Testing knob: pretend we're on the oldest GL (WebGL1/GLES2 feature set)
+        // even on a modern desktop context — disables MSAA and the GL_MIN/MAX
+        // blend equations, exercising the single-sample offscreen / fallback code
+        // paths. Keeps the desktop shader dialect so shaders still compile.
+        let force_oldest = std::env::var_os("RUFFLE_GL_FORCE_OLDEST").is_some();
+        if force_oldest {
+            caps.is_gles3_or_webgl2 = false;
+            msaa_sample_count = 1;
+            log::warn!("RUFFLE_GL_FORCE_OLDEST: forcing oldest-GL feature set (no MSAA, no MIN/MAX)");
+        }
+
         let is_embedded = caps.is_embedded;
 
         if log::log_enabled!(log::Level::Info) {
@@ -576,6 +709,18 @@ impl GlRenderBackend {
         let layer_stencil =
             unsafe { gl.create_renderbuffer() }.map_err(Error::UnableToCreateRenderBuffer)?;
 
+        let pb_quad_vbo = unsafe { gl.create_buffer() }.map_err(Error::UnableToCreateBuffer)?;
+        let pb_vao = unsafe { gl.create_vertex_array() }.map_err(Error::UnableToCreateVAO)?;
+        unsafe {
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(pb_quad_vbo));
+            let quad: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0];
+            gl.buffer_data_u8_slice(
+                glow::ARRAY_BUFFER,
+                bytemuck::cast_slice(&quad),
+                glow::STATIC_DRAW,
+            );
+        }
+
         let mut renderer = Self {
             gl: gl.clone(),
             caps,
@@ -590,6 +735,8 @@ impl GlRenderBackend {
             bitmap_program,
             batch_color_program,
             copy_program,
+            pb_quad_vbo,
+            pb_vao,
             batch_vao,
             batch_vbo,
             batch_ibo,
@@ -620,6 +767,8 @@ impl GlRenderBackend {
             blend_msaa_resolve_fbo,
             blend_msaa_resolve_color,
             offscreen_msaa: false,
+            offscreen_color: None,
+            force_oldest,
             layer_fbo,
             layer_stencil,
             layer_stencil_dims: (0, 0),
@@ -1052,10 +1201,49 @@ impl GlRenderBackend {
     }
 
     fn apply_blend_mode(&mut self, mode: RenderBlendMode) {
-        let minmax_ok = !self.caps.is_embedded || self.caps.is_gles3_or_webgl2;
+        let minmax_ok = self.minmax_ok();
         let key = blend_key(&mode, minmax_ok);
         self.active_hw_blend = key;
         self.apply_hw_blend(key);
+    }
+
+    /// Reads the default framebuffer back as top-down RGBA8 bytes (used by the
+    /// headless test harness to capture a rendered frame). GL is bottom-up, so
+    /// the rows are flipped.
+    pub fn read_framebuffer(&self) -> (u32, u32, Vec<u8>) {
+        let w = self.renderbuffer_width.max(0) as u32;
+        let h = self.renderbuffer_height.max(0) as u32;
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        unsafe {
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            self.gl.read_pixels(
+                0,
+                0,
+                w as i32,
+                h as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)),
+            );
+        }
+        // Flip vertically: GL row 0 is the bottom, images are top-down.
+        let stride = (w * 4) as usize;
+        if stride > 0 {
+            let mut flipped = vec![0u8; pixels.len()];
+            for y in 0..h as usize {
+                let src = y * stride;
+                let dst = (h as usize - 1 - y) * stride;
+                flipped[dst..dst + stride].copy_from_slice(&pixels[src..src + stride]);
+            }
+            pixels = flipped;
+        }
+        (w, h, pixels)
+    }
+
+    /// Whether GL_MIN/GL_MAX blend equations are available (desktop GL, or
+    /// GLES3/WebGL2). Used to gate the Darken/Lighten fast path.
+    fn minmax_ok(&self) -> bool {
+        (!self.caps.is_embedded || self.caps.is_gles3_or_webgl2) && !self.force_oldest
     }
 
     /// Sets GL blend state from a key (`[rgb_eq, alpha_eq, rgb_src, rgb_dst,
@@ -1506,6 +1694,15 @@ impl GlRenderBackend {
 
         let quad = &self.color_quad_draws;
         self.bind_vertex_array(Some(quad[0].vao));
+        // Re-bind the quad's own index buffer: registering a shape (e.g. a device
+        // font glyph, lazily tessellated mid-frame) binds its index buffer to
+        // `ELEMENT_ARRAY_BUFFER` while this persistent VAO happens to be bound,
+        // clobbering the VAO's element-buffer binding. Without this, the draw
+        // reads indices from a stale buffer and rasterizes nothing.
+        unsafe {
+            self.gl
+                .bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(quad[0].index_buffer.buffer));
+        }
 
         let count = if COUNT < 0 {
             quad[0].num_indices
@@ -1707,10 +1904,14 @@ impl GlRenderBackend {
         let saved_msaa = self.msaa_buffers.take();
         let saved_offscreen = self.in_offscreen;
         let saved_offscreen_msaa = self.offscreen_msaa;
+        let saved_offscreen_color = self.offscreen_color;
         let saved_active_blend = self.active_hw_blend;
         let saved_batch_blend = self.batch_blend;
         self.in_offscreen = true;
         self.offscreen_msaa = use_msaa;
+        // Single-sample passes render straight into `texture`; a nested complex
+        // blend reads its parent from there.
+        self.offscreen_color = if use_msaa { None } else { Some(texture) };
         // The offscreen content starts from a clean Normal blend (its own blends
         // push/pop from there); the outer batch was already flushed above.
         self.active_hw_blend = NORMAL_BLEND_KEY;
@@ -1732,6 +1933,11 @@ impl GlRenderBackend {
             gl.viewport(0, 0, width, height);
             self.set_stencil_state();
             gl.stencil_mask(0xff);
+            // Masks clear the stencil to a 0 fill value. `glClearStencil` is
+            // global GL state shared with Context3D (Stage3D), which sets its own
+            // clear value — so set ours explicitly rather than assuming the
+            // default, or offscreen masks silently break after a Stage3D clear.
+            gl.clear_stencil(0);
             if let Some(c) = clear {
                 gl.clear_color(
                     c.r as f32 / 255.0,
@@ -1765,6 +1971,7 @@ impl GlRenderBackend {
         self.msaa_buffers = saved_msaa;
         self.in_offscreen = saved_offscreen;
         self.offscreen_msaa = saved_offscreen_msaa;
+        self.offscreen_color = saved_offscreen_color;
         self.active_hw_blend = saved_active_blend;
         self.batch_blend = saved_batch_blend;
         self.apply_hw_blend(saved_active_blend);
@@ -1811,6 +2018,11 @@ impl GlRenderBackend {
     ) -> bool {
         if width == 0 || height == 0 {
             return true;
+        }
+        // A ShaderFilter runs a PixelBender program; handle it before borrowing
+        // the fixed-function filter set.
+        if let Filter::ShaderFilter(sf) = filter {
+            return self.apply_shader_filter(texture, width, height, sf);
         }
         if self.filters.is_none() {
             match filters::Filters::new(self.gl.clone(), self.caps.is_embedded) {
@@ -2174,6 +2386,20 @@ impl GlRenderBackend {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.blend_msaa_resolve_fbo));
                 gl.bind_texture(glow::TEXTURE_2D, Some(dst_tex));
                 gl.copy_tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, rx, ry_fb, rw, rh);
+            } else if let Some(off_tex) = self.offscreen_color {
+                // Nested inside a single-sample offscreen pass: the parent is
+                // already in the offscreen texture. The src render re-attached the
+                // shared FBO to its own texture, so re-attach the parent first.
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.offscreen_fbo));
+                gl.framebuffer_texture_2d(
+                    glow::FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(off_tex),
+                    0,
+                );
+                gl.bind_texture(glow::TEXTURE_2D, Some(dst_tex));
+                gl.copy_tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, rx, ry_fb, rw, rh);
             } else if let Some(msaa) = &self.msaa_buffers {
                 // Multisample-resolve blits require *identical* source and
                 // destination rectangles, so we can't blit straight into a
@@ -2208,6 +2434,9 @@ impl GlRenderBackend {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(layer));
             } else if self.in_offscreen && self.offscreen_msaa {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.blend_msaa_fbo));
+            } else if self.offscreen_color.is_some() {
+                // Already re-attached to the parent (offscreen) texture above.
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.offscreen_fbo));
             } else if let Some(msaa) = &self.msaa_buffers {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(msaa.render_framebuffer));
             } else {
@@ -2241,6 +2470,411 @@ impl GlRenderBackend {
 
         self.pool.release(src_tex, rw_u, rh_u);
         self.pool.release(dst_tex, rw_u, rh_u);
+    }
+
+    /// Region-sized PixelBender-shader blend: isolates the group into a foreground
+    /// texture, copies the framebuffer region as the background, runs the shader
+    /// (input 0 = background, input 1 = foreground — matching wgpu) in Filter mode,
+    /// and replaces the region with its output. On-screen targets only; a nested
+    /// pass falls back to a plain draw.
+    fn draw_shader_blend(
+        &mut self,
+        commands: CommandList,
+        pb: &GlPixelBenderShader,
+        rx: i32,
+        ry: i32,
+        rw: i32,
+        rh: i32,
+    ) {
+        let (rw_u, rh_u) = (rw as u32, rh as u32);
+        let fallback = |this: &mut Self, commands: CommandList| {
+            this.push_blend_mode(RenderBlendMode::Builtin(BlendMode::Normal));
+            commands.execute(this);
+            this.pop_blend_mode();
+        };
+        let Some(src_tex) = self.pool.acquire(rw_u, rh_u) else {
+            return fallback(self, commands);
+        };
+        let Some(dst_tex) = self.pool.acquire(rw_u, rh_u) else {
+            self.pool.release(src_tex, rw_u, rh_u);
+            return fallback(self, commands);
+        };
+        let Some(res_tex) = self.pool.acquire(rw_u, rh_u) else {
+            self.pool.release(src_tex, rw_u, rh_u);
+            self.pool.release(dst_tex, rw_u, rh_u);
+            return fallback(self, commands);
+        };
+
+        // Foreground: isolate the group into `src_tex`.
+        let saved_mask = self.mask_state;
+        let saved_num_masks = self.num_masks;
+        let (ox, oy) = self.target_origin;
+        let view = region_view_matrix((rx + ox) as f32, (ry + oy) as f32, rw as f32, rh as f32);
+        let transparent = Color { r: 0, g: 0, b: 0, a: 0 };
+        self.render_commands_to_texture(src_tex, rw, rh, Some(transparent), view, true, commands);
+        self.mask_state = saved_mask;
+        self.num_masks = saved_num_masks;
+
+        // Background: copy the framebuffer region into `dst_tex`.
+        let ry_fb = self.renderbuffer_height - (ry + rh);
+        let gl = self.gl.clone();
+        unsafe {
+            if let Some(msaa) = &self.msaa_buffers {
+                gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(msaa.render_framebuffer));
+                gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(msaa.color_framebuffer));
+                gl.blit_framebuffer(
+                    rx, ry_fb, rx + rw, ry_fb + rh, rx, ry_fb, rx + rw, ry_fb + rh,
+                    glow::COLOR_BUFFER_BIT, glow::NEAREST,
+                );
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(msaa.color_framebuffer));
+                gl.bind_texture(glow::TEXTURE_2D, Some(dst_tex));
+                gl.copy_tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, rx, ry_fb, rw, rh);
+            } else {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                gl.bind_texture(glow::TEXTURE_2D, Some(dst_tex));
+                gl.copy_tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, rx, ry_fb, rw, rh);
+            }
+        }
+
+        // Run the shader (Filter mode) into `res_tex`.
+        let float_data = vec![0.0f32; pb.float_slots * 4];
+        let int_data = vec![0i32; pb.int_slots * 4];
+        self.bind_and_draw_pixelbender(
+            pb,
+            res_tex,
+            rw,
+            rh,
+            true,
+            &[
+                (0, dst_tex, rw as f32, rh as f32),
+                (1, src_tex, rw as f32, rh as f32),
+            ],
+            &float_data,
+            &int_data,
+        );
+
+        // Replace the region with the shader's output.
+        unsafe {
+            if let Some(msaa) = &self.msaa_buffers {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(msaa.render_framebuffer));
+            } else {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            }
+            gl.viewport(rx, ry_fb, rw, rh);
+        }
+        self.mask_state_dirty = true;
+        self.set_stencil_state();
+        unsafe { gl.stencil_mask(0x00) };
+        self.fill_with_texture(res_tex, true);
+        unsafe {
+            gl.stencil_mask(0xff);
+            gl.viewport(0, 0, self.renderbuffer_width, self.renderbuffer_height);
+        }
+        self.active_program = std::ptr::null();
+        self.mask_state_dirty = true;
+        self.apply_hw_blend(self.active_hw_blend);
+        self.pool.release(src_tex, rw_u, rh_u);
+        self.pool.release(dst_tex, rw_u, rh_u);
+        self.pool.release(res_tex, rw_u, rh_u);
+    }
+
+    /// Region-sized alpha mask: renders the maskee and the mask into region
+    /// textures, then composites `maskee * mask.a` over the target with normal
+    /// blend. Unlike a complex blend it never reads the framebuffer, so it works
+    /// in any target (screen, cache, layer). Cost scales with the content, not
+    /// the stage (wgpu uses a full-surface pass).
+    fn draw_alpha_mask(
+        &mut self,
+        maskee_commands: CommandList,
+        mask_commands: CommandList,
+        rx: i32,
+        ry: i32,
+        rw: i32,
+        rh: i32,
+    ) {
+        if self.filters.is_none() {
+            match filters::Filters::new(self.gl.clone(), self.caps.is_embedded) {
+                Ok(f) => self.filters = Some(f),
+                Err(e) => {
+                    log::error!("Couldn't initialize GL blend programs: {e}");
+                    maskee_commands.execute(self);
+                    return;
+                }
+            }
+        }
+
+        let (rw_u, rh_u) = (rw as u32, rh as u32);
+        let Some(maskee_tex) = self.pool.acquire(rw_u, rh_u) else {
+            maskee_commands.execute(self);
+            return;
+        };
+        let Some(mask_tex) = self.pool.acquire(rw_u, rh_u) else {
+            self.pool.release(maskee_tex, rw_u, rh_u);
+            maskee_commands.execute(self);
+            return;
+        };
+
+        // render_commands_to_texture resets the mask state for the nested pass;
+        // save/restore the outer mask that still applies to the composite.
+        let saved_mask = self.mask_state;
+        let saved_num_masks = self.num_masks;
+
+        let (ox, oy) = self.target_origin;
+        let flipped = self.view_matrix[1][1] < 0.0;
+        let view = if flipped {
+            region_view_matrix((rx + ox) as f32, (ry + oy) as f32, rw as f32, rh as f32)
+        } else {
+            region_view_matrix_unflipped((rx + ox) as f32, (ry + oy) as f32, rw as f32, rh as f32)
+        };
+        let transparent = Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        };
+
+        self.render_commands_to_texture(maskee_tex, rw, rh, Some(transparent), view, true, maskee_commands);
+        self.mask_state = saved_mask;
+        self.num_masks = saved_num_masks;
+        self.render_commands_to_texture(mask_tex, rw, rh, Some(transparent), view, true, mask_commands);
+        self.mask_state = saved_mask;
+        self.num_masks = saved_num_masks;
+
+        let ry_fb = if flipped {
+            self.renderbuffer_height - (ry + rh)
+        } else {
+            ry
+        };
+
+        let gl = self.gl.clone();
+        let target_fbo = self.target_fbo;
+        unsafe {
+            // Bind the draw target and restrict drawing to the region. Keep normal
+            // (premultiplied-over) blend so the masked content composites over the
+            // existing background.
+            if let Some(layer) = target_fbo {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(layer));
+            } else if self.in_offscreen && self.offscreen_msaa {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.blend_msaa_fbo));
+            } else if let Some(msaa) = &self.msaa_buffers {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(msaa.render_framebuffer));
+            } else {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            }
+            gl.viewport(rx, ry_fb, rw, rh);
+        }
+        self.apply_hw_blend(NORMAL_BLEND_KEY);
+
+        // Apply the current mask (if any) but don't write the stencil buffer.
+        self.mask_state_dirty = true;
+        self.set_stencil_state();
+        unsafe { gl.stencil_mask(0x00) };
+
+        // mode 9: maskee (u_current) modulated by mask alpha (u_parent.a).
+        self.filters
+            .as_ref()
+            .expect("blend programs initialized")
+            .draw_blend(maskee_tex, mask_tex, 9);
+
+        unsafe {
+            gl.stencil_mask(0xff);
+            gl.viewport(0, 0, self.renderbuffer_width, self.renderbuffer_height);
+        }
+
+        self.active_program = std::ptr::null();
+        self.mask_state_dirty = true;
+        self.apply_hw_blend(self.active_hw_blend);
+
+        self.pool.release(maskee_tex, rw_u, rh_u);
+        self.pool.release(mask_tex, rw_u, rh_u);
+    }
+
+    /// Applies a `ShaderFilter` (a PixelBender program) to `texture` in place:
+    /// runs the shader with `texture` as the source input, then copies the result
+    /// back over it.
+    fn apply_shader_filter(
+        &mut self,
+        texture: glow::Texture,
+        width: u32,
+        height: u32,
+        sf: &ruffle_render::filters::ShaderFilter,
+    ) -> bool {
+        let arc = sf.shader.0.clone();
+        let pb: &GlPixelBenderShader = match <dyn Any>::downcast_ref(&*arc) {
+            Some(pb) => pb,
+            None => return false,
+        };
+        let Some(out_tex) = self.pool.acquire(width, height) else {
+            return false;
+        };
+        // Filter mode: samples outside the source become transparent.
+        self.execute_pixelbender(
+            pb,
+            &sf.shader_args,
+            out_tex,
+            width as i32,
+            height as i32,
+            true,
+            Some((texture, width as f32, height as f32)),
+        );
+        // Copy the result back into the in-place texture.
+        let gl = self.gl.clone();
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.scratch_fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(out_tex),
+                0,
+            );
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.copy_tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, 0, 0, width as i32, height as i32);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+        self.pool.release(out_tex, width, height);
+        self.active_program = std::ptr::null();
+        self.mask_state_dirty = true;
+        true
+    }
+
+    /// Renders a compiled PixelBender shader over `out_tex` (`out_w`×`out_h`),
+    /// binding value params into the uniform arrays and image inputs into
+    /// samplers. `zeroed` selects Filter mode (samples outside inputs become
+    /// transparent) vs ShaderJob mode (clamp).
+    fn execute_pixelbender(
+        &mut self,
+        pb: &GlPixelBenderShader,
+        arguments: &[PixelBenderShaderArgument],
+        out_tex: glow::Texture,
+        out_w: i32,
+        out_h: i32,
+        zeroed: bool,
+        // Bound to the first image input (the filter source); overrides its arg.
+        source_override: Option<(glow::Texture, f32, f32)>,
+    ) {
+        let mut float_data = vec![0.0f32; pb.float_slots * 4];
+        let mut int_data = vec![0i32; pb.int_slots * 4];
+        // (input index, texture, width, height)
+        let mut tex_bindings: Vec<(u8, glow::Texture, f32, f32)> = Vec::new();
+        let mut source_used = source_override.is_none();
+        for arg in arguments {
+            match arg {
+                PixelBenderShaderArgument::ImageInput { index, texture, .. } => {
+                    if !source_used {
+                        source_used = true;
+                        let (t, w, h) = source_override.unwrap();
+                        tex_bindings.push((*index, t, w, h));
+                    } else if let Some(ImageInputTexture::Bitmap(h)) = texture.as_ref() {
+                        let r = as_registry_data(h);
+                        tex_bindings.push((*index, r.texture, r.width as f32, r.height as f32));
+                    }
+                }
+                PixelBenderShaderArgument::ValueInput { index, value } => {
+                    if let Some(Some(slot)) = pb.param_slots.get(*index as usize) {
+                        write_param_value(value, *slot, &mut float_data, &mut int_data);
+                    }
+                }
+            }
+        }
+
+        self.bind_and_draw_pixelbender(
+            pb,
+            out_tex,
+            out_w,
+            out_h,
+            zeroed,
+            &tex_bindings,
+            &float_data,
+            &int_data,
+        );
+    }
+
+    /// Binds a compiled PixelBender shader's params and image inputs (in the given
+    /// order — `tex_bindings[i]` goes to texture unit `i`) and draws the NDC quad
+    /// into `out_tex` via the scratch FBO. The low-level half of
+    /// [`Self::execute_pixelbender`], shared with the shader-blend path which binds
+    /// raw region textures rather than argument-derived ones.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_and_draw_pixelbender(
+        &mut self,
+        pb: &GlPixelBenderShader,
+        out_tex: glow::Texture,
+        out_w: i32,
+        out_h: i32,
+        zeroed: bool,
+        tex_bindings: &[(u8, glow::Texture, f32, f32)],
+        float_data: &[f32],
+        int_data: &[i32],
+    ) {
+        let gl = self.gl.clone();
+        unsafe {
+            gl.bind_vertex_array(Some(self.pb_vao));
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.scratch_fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(out_tex),
+                0,
+            );
+            gl.viewport(0, 0, out_w, out_h);
+            gl.disable(glow::BLEND);
+            gl.disable(glow::STENCIL_TEST);
+            gl.color_mask(true, true, true, true);
+            gl.use_program(Some(pb.program));
+
+            if let Some(l) = &pb.u_out_size {
+                gl.uniform_2_f32(Some(l), out_w as f32, out_h as f32);
+            }
+            if let Some(l) = &pb.u_zeroed {
+                gl.uniform_1_i32(Some(l), zeroed as i32);
+            }
+            if let Some(l) = &pb.u_float_params {
+                gl.uniform_4_f32_slice(Some(l), float_data);
+            }
+            if let Some(l) = &pb.u_int_params {
+                gl.uniform_4_i32_slice(Some(l), int_data);
+            }
+            for (unit, (index, tex, w, h)) in tex_bindings.iter().enumerate() {
+                gl.active_texture(glow::TEXTURE0 + unit as u32);
+                gl.bind_texture(glow::TEXTURE_2D, Some(*tex));
+                let clamp = glow::CLAMP_TO_EDGE as i32;
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, clamp);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, clamp);
+                let info = pb.u_inputs.iter().find(|(i, _, _, _)| i == index);
+                // ES 1.00 filtering is per-texture: match the shader's sampler.
+                let filter = if info.map(|(_, _, _, n)| *n).unwrap_or(false) {
+                    glow::NEAREST
+                } else {
+                    glow::LINEAR
+                } as i32;
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
+                if let Some((_, sloc, szloc, _)) = info {
+                    if let Some(sl) = sloc {
+                        gl.uniform_1_i32(Some(sl), unit as i32);
+                    }
+                    if let Some(zl) = szloc {
+                        gl.uniform_2_f32(Some(zl), *w, *h);
+                    }
+                }
+            }
+
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.pb_quad_vbo));
+            if let Some(loc) = pb.position_loc {
+                gl.vertex_attrib_pointer_f32(loc, 2, glow::FLOAT, false, 8, 0);
+                gl.enable_vertex_attrib_array(loc);
+            }
+            gl.draw_arrays(glow::TRIANGLE_FAN, 0, 4);
+
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.bind_vertex_array(None);
+            gl.enable(glow::BLEND);
+            gl.active_texture(glow::TEXTURE0);
+        }
+        self.active_program = std::ptr::null();
+        self.mask_state_dirty = true;
     }
 
     /// Renders a `Layer` blend's children into a single-sample offscreen region
@@ -2474,12 +3108,36 @@ fn command_bounds(commands: &CommandList) -> Option<Rectangle<Twips>> {
     acc
 }
 
-/// Whether a `Layer` blend must be rendered offscreen: only if it contains
-/// Alpha/Erase children, which require a transparent layer to composite into. A
-/// nested `Layer` isolates its own, so we don't descend into one. Other blends
-/// inside a layer keep their existing on-target behavior.
+/// Whether a blend group is a single leaf draw (one shape/bitmap/rect/line), for
+/// which the fixed-function fast path composites identically to isolating the
+/// group. Anything else — multiple commands, a nested blend, or a mask — can have
+/// overlapping content whose internal composition must happen before the group is
+/// blended against the backdrop, so it needs the isolate-then-composite path.
+fn blend_group_is_single_draw(commands: &CommandList) -> bool {
+    matches!(
+        commands.commands.as_slice(),
+        [Command::RenderShape { .. }
+            | Command::RenderBitmap { .. }
+            | Command::RenderStage3D { .. }
+            | Command::DrawRect { .. }
+            | Command::DrawLine { .. }
+            | Command::DrawLineRect { .. }]
+    )
+}
+
+/// Whether a `Layer` blend must be rendered offscreen. It must whenever it
+/// contains a child that composites against the layer's backdrop — i.e. any
+/// blend other than Normal (Alpha/Erase need a transparent layer to composite
+/// into; Multiply/Screen/etc. must read the layer's isolated content rather than
+/// the stage behind it). This matches wgpu, which always renders a `Layer` into a
+/// fresh texture. Normal-only layers composite associatively, so they can draw
+/// straight onto the target; a nested `Layer` isolates its own content, so we
+/// don't descend into one.
 fn layer_needs_offscreen(commands: &CommandList) -> bool {
     commands.commands.iter().any(|c| match c {
+        // A nested Layer isolates itself; a Normal group composites associatively
+        // (isolate-then-over == draw-in-place), so neither forces isolation here —
+        // but a Normal group may still hide a blend that does, so descend into it.
         Command::Blend(_, RenderBlendMode::Builtin(BlendMode::Alpha))
         | Command::Blend(_, RenderBlendMode::Builtin(BlendMode::Erase)) => true,
         Command::Blend(_, RenderBlendMode::Builtin(BlendMode::Layer)) => false,
@@ -2506,6 +3164,12 @@ fn complex_blend_index(mode: &RenderBlendMode) -> Option<i32> {
             BlendMode::Erase => Some(6),
             BlendMode::Overlay => Some(7),
             BlendMode::HardLight => Some(8),
+            // Add/Subtract/Screen are fixed-function-expressible (and take the
+            // fast path for a single leaf draw), but a multi-child group must be
+            // isolated first, then composited via these shader formulas.
+            BlendMode::Add => Some(10),
+            BlendMode::Subtract => Some(11),
+            BlendMode::Screen => Some(12),
             _ => None,
         },
         // No PixelBender backend on GL: shader blends fall back to hardware
@@ -2601,6 +3265,8 @@ impl Drop for GlRenderBackend {
             self.gl.delete_program(self.batch_color_program.program);
             self.gl.delete_program(self.batch_bitmap_program.program);
             self.gl.delete_program(self.copy_program.program);
+            self.gl.delete_buffer(self.pb_quad_vbo);
+            self.gl.delete_vertex_array(self.pb_vao);
             self.gl.delete_vertex_array(self.batch_vao);
             self.gl.delete_buffer(self.batch_vbo);
             self.gl.delete_buffer(self.batch_ibo);
@@ -2676,6 +3342,7 @@ impl RenderBackend for GlRenderBackend {
                 | Filter::DisplacementMapFilter(_)
                 | Filter::GradientGlowFilter(_)
                 | Filter::GradientBevelFilter(_)
+                | Filter::ShaderFilter(_)
         )
     }
 
@@ -2707,6 +3374,76 @@ impl RenderBackend for GlRenderBackend {
             let d = as_registry_data(&destination);
             (d.texture, d.width, d.height)
         };
+
+        // ShaderFilter runs a PixelBender program (uses `self` directly, so it
+        // must run before borrowing the fixed-function filter set).
+        if let Filter::ShaderFilter(sf) = &filter {
+            let arc = sf.shader.0.clone();
+            let pb: &GlPixelBenderShader = <dyn Any>::downcast_ref(&*arc)?;
+            // The shader output is the size of the filter source region (matching
+            // wgpu's `ShaderFilter::apply`), *not* the destination bitmap. The
+            // result is then blitted into the destination at `dest_point`, leaving
+            // the rest of the destination untouched.
+            let (sw, sh) = source_size;
+            let out_tex = self.pool.acquire(sw, sh)?;
+            self.execute_pixelbender(
+                pb,
+                &sf.shader_args,
+                out_tex,
+                sw as i32,
+                sh as i32,
+                true,
+                Some((src_tex, sw as f32, sh as f32)),
+            );
+
+            // Blit the result into the destination at `dest_point`, clamping a
+            // negative offset by skipping the corresponding source rows/cols
+            // (same arithmetic as the fixed-function filter path below).
+            let (dest_x, dest_y) = dest_point;
+            let src_offset_x = dest_x.min(0).unsigned_abs();
+            let src_offset_y = dest_y.min(0).unsigned_abs();
+            let final_dest_x = dest_x.max(0) as u32;
+            let final_dest_y = dest_y.max(0) as u32;
+            let copy_w = sw
+                .saturating_sub(src_offset_x)
+                .min(dst_w.saturating_sub(final_dest_x));
+            let copy_h = sh
+                .saturating_sub(src_offset_y)
+                .min(dst_h.saturating_sub(final_dest_y));
+            let gl = self.gl.clone();
+            if copy_w > 0 && copy_h > 0 {
+                unsafe {
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.scratch_fbo));
+                    gl.framebuffer_texture_2d(
+                        glow::FRAMEBUFFER,
+                        glow::COLOR_ATTACHMENT0,
+                        glow::TEXTURE_2D,
+                        Some(out_tex),
+                        0,
+                    );
+                    gl.bind_texture(glow::TEXTURE_2D, Some(dst_tex));
+                    gl.copy_tex_sub_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        final_dest_x as i32,
+                        final_dest_y as i32,
+                        src_offset_x as i32,
+                        src_offset_y as i32,
+                        copy_w as i32,
+                        copy_h as i32,
+                    );
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                }
+            }
+            self.pool.release(out_tex, sw, sh);
+            self.active_program = std::ptr::null();
+            self.mask_state_dirty = true;
+            return Some(Box::new(GlSyncHandle {
+                gl: self.gl.clone(),
+                handle: destination.clone(),
+                copy_area: PixelRegion::for_whole_size(dst_w, dst_h),
+            }));
+        }
 
         let filters = self.filters.as_ref().expect("filters just initialized");
         let result = match &filter {
@@ -3234,9 +3971,14 @@ impl RenderBackend for GlRenderBackend {
 
     fn create_context3d(
         &mut self,
-        _profile: Context3DProfile,
+        profile: Context3DProfile,
     ) -> Result<Box<dyn Context3D>, BitmapError> {
-        Err(BitmapError::Unimplemented("createContext3D".into()))
+        Ok(Box::new(context3d::GlContext3D::new(
+            self.gl.clone(),
+            profile,
+            self.caps.is_embedded,
+            self.caps.is_gles3_or_webgl2,
+        )))
     }
 
     fn debug_info(&self) -> Cow<'static, str> {
@@ -3287,11 +4029,74 @@ impl RenderBackend for GlRenderBackend {
 
     fn compile_pixelbender_shader(
         &mut self,
-        _shader: ruffle_render::pixel_bender::PixelBenderShader,
-    ) -> Result<ruffle_render::pixel_bender::PixelBenderShaderHandle, BitmapError> {
-        Err(BitmapError::Unimplemented(
-            "compile_pixelbender_shader".into(),
-        ))
+        shader: PixelBenderShader,
+    ) -> Result<PixelBenderShaderHandle, BitmapError> {
+        let translated = pixelbender::translate(&shader)
+            .map_err(|e| BitmapError::Unimplemented(format!("PixelBender: {e}").into()))?;
+
+        let is_embedded = self.caps.is_embedded;
+        let gl = self.gl.clone();
+        let vertex =
+            shader::compile_shader(&gl, is_embedded, glow::VERTEX_SHADER, PIXELBENDER_VERTEX_GLSL)
+                .map_err(|e| BitmapError::Unimplemented(format!("PixelBender vertex: {e:?}").into()))?;
+        let fragment =
+            shader::compile_shader(&gl, is_embedded, glow::FRAGMENT_SHADER, &translated.glsl)
+                .map_err(|e| {
+                    BitmapError::Unimplemented(format!("PixelBender fragment: {e:?}").into())
+                })?;
+
+        let program = unsafe {
+            let p = gl
+                .create_program()
+                .map_err(|e| BitmapError::Unimplemented(format!("PixelBender program: {e}").into()))?;
+            gl.attach_shader(p, vertex);
+            gl.attach_shader(p, fragment);
+            gl.link_program(p);
+            let ok = gl.get_program_link_status(p);
+            gl.delete_shader(vertex);
+            gl.delete_shader(fragment);
+            if !ok {
+                let msg = gl.get_program_info_log(p);
+                gl.delete_program(p);
+                return Err(BitmapError::Unimplemented(
+                    format!("PixelBender link error: {msg}").into(),
+                ));
+            }
+            p
+        };
+
+        let position_loc = unsafe { gl.get_attrib_location(program, "position") };
+        let loc = |n: &str| unsafe { gl.get_uniform_location(program, n) };
+        let u_inputs = translated
+            .inputs
+            .iter()
+            .map(|&i| {
+                (
+                    i,
+                    loc(&format!("u_tex_{i}")),
+                    loc(&format!("u_tex_size_{i}")),
+                    translated.nearest_inputs.contains(&i),
+                )
+            })
+            .collect();
+
+        let pb = GlPixelBenderShader {
+            gl: self.gl.clone(),
+            program,
+            float_slots: translated.float_slots,
+            int_slots: translated.int_slots,
+            param_slots: translated.param_slots,
+            output_channels: translated.output_channels,
+            position_loc,
+            u_float_params: loc("u_float_params[0]"),
+            u_int_params: loc("u_int_params[0]"),
+            u_zeroed: loc("u_zeroed"),
+            u_out_size: loc("u_out_size"),
+            u_inputs,
+            shader,
+        };
+        self.active_program = std::ptr::null();
+        Ok(PixelBenderShaderHandle(Arc::new(pb)))
     }
 
     fn resolve_sync_handle(
@@ -3307,11 +4112,102 @@ impl RenderBackend for GlRenderBackend {
 
     fn run_pixelbender_shader(
         &mut self,
-        _handle: ruffle_render::pixel_bender::PixelBenderShaderHandle,
-        _arguments: &[ruffle_render::pixel_bender_support::PixelBenderShaderArgument],
-        _target: &PixelBenderTarget,
+        handle: PixelBenderShaderHandle,
+        arguments: &[PixelBenderShaderArgument],
+        target: &PixelBenderTarget,
     ) -> Result<PixelBenderOutput, BitmapError> {
-        Err(BitmapError::Unimplemented("run_pixelbender_shader".into()))
+        let arc = handle.0.clone();
+        let pb: &GlPixelBenderShader = <dyn Any>::downcast_ref(&*arc)
+            .expect("PixelBender handle must be a GL shader");
+
+        let gl = self.gl.clone();
+        match target {
+            // ShaderJob mode: samples outside a texture are clamped (not zeroed).
+            PixelBenderTarget::Bitmap(h) => {
+                let r = as_registry_data(h);
+                let (tex, w, hh) = (r.texture, r.width as i32, r.height as i32);
+                self.execute_pixelbender(pb, arguments, tex, w, hh, false, None);
+                Ok(PixelBenderOutput::Bitmap(Box::new(GlSyncHandle {
+                    gl: self.gl.clone(),
+                    handle: h.clone(),
+                    copy_area: PixelRegion::for_whole_size(w as u32, hh as u32),
+                })))
+            }
+            PixelBenderTarget::Bytes { width, height } => {
+                let (w, hh) = (*width as i32, *height as i32);
+                let channels = pb.output_channels.max(1);
+                // ShaderJob output is Vector.<Number>: render to a float target so
+                // values aren't clamped to [0,1] like an RGBA8 bitmap.
+                let tex = unsafe {
+                    let t = gl.create_texture().map_err(bitmap_gl_error)?;
+                    gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                    gl.tex_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        glow::RGBA32F as i32,
+                        w,
+                        hh,
+                        0,
+                        glow::RGBA,
+                        glow::FLOAT,
+                        glow::PixelUnpackData::Slice(None),
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_MIN_FILTER,
+                        glow::NEAREST as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_MAG_FILTER,
+                        glow::NEAREST as i32,
+                    );
+                    t
+                };
+
+                self.execute_pixelbender(pb, arguments, tex, w, hh, false, None);
+
+                let mut raw = vec![0u8; (w * hh * 16) as usize];
+                unsafe {
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.scratch_fbo));
+                    gl.framebuffer_texture_2d(
+                        glow::FRAMEBUFFER,
+                        glow::COLOR_ATTACHMENT0,
+                        glow::TEXTURE_2D,
+                        Some(tex),
+                        0,
+                    );
+                    gl.read_pixels(
+                        0,
+                        0,
+                        w,
+                        hh,
+                        glow::RGBA,
+                        glow::FLOAT,
+                        glow::PixelPackData::Slice(Some(&mut raw)),
+                    );
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                    gl.delete_texture(tex);
+                }
+
+                // The core reads exactly `output_channels` floats per pixel, so
+                // strip the RGBA padding for 1/2/3-channel outputs.
+                let floats: &[f32] = bytemuck::cast_slice(&raw);
+                let bytes = if channels >= 4 {
+                    raw
+                } else {
+                    let n = (w * hh) as usize;
+                    let mut out = Vec::with_capacity(n * channels);
+                    for p in 0..n {
+                        for c in 0..channels {
+                            out.push(floats[p * 4 + c]);
+                        }
+                    }
+                    bytemuck::cast_slice(&out).to_vec()
+                };
+                Ok(PixelBenderOutput::Bytes(bytes))
+            }
+        }
     }
 
     fn create_empty_texture(
@@ -3591,9 +4487,21 @@ impl CommandHandler for GlRenderBackend {
         }
     }
 
-    fn render_stage3d(&mut self, _bitmap: BitmapHandle, _transform: Transform) {
-        self.flush_batch();
-        panic!("Stage3D should not have been created on GL backend")
+    fn render_stage3d(&mut self, bitmap: BitmapHandle, transform: Transform) {
+        // The Stage3D back buffer is an ordinary registered texture; composite it
+        // onto the stage like a bitmap. (Context3D renders into it bottom-up, so
+        // the draw pipeline is responsible for presenting it Flash-top-down.)
+        let entry = as_registry_data(&bitmap);
+        let texture = entry.texture;
+        let matrix = transform.matrix * Matrix::scale(entry.width as f32, entry.height as f32);
+        let key = BitmapBatchKey {
+            texture,
+            smoothing: false,
+            mult: transform.color_transform.mult_rgba_normalized(),
+            add: transform.color_transform.add_rgba_normalized(),
+        };
+        self.set_stencil_state();
+        self.append_bitmap_draw(key, matrix);
     }
 
     fn draw_rect(&mut self, color: Color, matrix: Matrix) {
@@ -3657,8 +4565,16 @@ impl CommandHandler for GlRenderBackend {
         // draw. Darken/Lighten keep the destination alpha and require
         // EXT_blend_minmax on GLES2/WebGL1, hence the `minmax_ok` gate; without
         // it they fall back to the region-composite path below.
-        let minmax_ok = !self.caps.is_embedded || self.caps.is_gles3_or_webgl2;
-        if is_hw_blend(&blend, minmax_ok) {
+        let minmax_ok = self.minmax_ok();
+        // The fixed-function fast path is only equivalent to an isolated group
+        // when the group is a single leaf draw: then "blend this shape against the
+        // target" is the same whether done directly or rendered to a fresh texture
+        // and composited. A multi-child group must combine its children among
+        // themselves (Normal) first and blend the *result* against the backdrop
+        // once — drawing each child with the blend func instead composites them
+        // against each other, which is wrong for overlapping content. Single-draw
+        // groups keep the batchable path (e.g. hundreds of Multiply puffs).
+        if is_hw_blend(&blend, minmax_ok) && blend_group_is_single_draw(&commands) {
             self.push_blend_mode(blend);
             commands.execute(self);
             self.pop_blend_mode();
@@ -3668,6 +4584,27 @@ impl CommandHandler for GlRenderBackend {
         // Everything else reads the destination or needs an offscreen pass, so
         // flush the pending batch before changing target/state.
         self.flush_batch();
+
+        // A PixelBender-shader blend runs the compiled shader with the backdrop and
+        // the isolated group as its two image inputs. Only on-screen targets are
+        // handled; a nested pass falls back to a plain draw.
+        if let RenderBlendMode::Shader(handle) = &blend {
+            // Clone the handle's Arc so the borrow of the compiled shader is tied to
+            // this local, leaving `self` free to mutate during the draw.
+            let arc = handle.0.clone();
+            if !self.in_offscreen {
+                if let Some(pb) = <dyn Any>::downcast_ref::<GlPixelBenderShader>(&*arc) {
+                    if let Some((rx, ry, rw, rh)) = self.blend_region(&commands) {
+                        self.draw_shader_blend(commands, pb, rx, ry, rw, rh);
+                        return;
+                    }
+                }
+            }
+            self.push_blend_mode(RenderBlendMode::Builtin(BlendMode::Normal));
+            commands.execute(self);
+            self.pop_blend_mode();
+            return;
+        }
 
         // A complex blend reads and composites against the bound framebuffer, so
         // when we're already rendering into a single-sample offscreen with no
@@ -3696,16 +4633,18 @@ impl CommandHandler for GlRenderBackend {
         // where `draw_complex_blend` resolves the multisampled parent back. A
         // single-sample offscreen pass has no readable parent here, so it falls
         // through to a plain draw instead of compositing onto the wrong target.
-        if !self.in_offscreen || self.offscreen_msaa {
+        if !self.in_offscreen || self.offscreen_msaa || self.offscreen_color.is_some() {
             if let Some(mode) = complex_blend_index(&blend) {
-                // Alpha/Erase only make sense compositing into a Layer's
-                // transparent content; on the bare stage they'd erase to black, so
-                // skip them rather than draw the wrong thing.
+                // Alpha/Erase composite against the "nearest layer": an enclosing
+                // `Layer` (target_fbo), or the current offscreen surface itself
+                // (e.g. a `BitmapData.draw` target, matching wgpu's
+                // `LayerRef::Current`). Only the bare stage has no layer to
+                // composite into — there they'd erase to black, so skip them.
                 let needs_layer = matches!(
                     blend,
                     RenderBlendMode::Builtin(BlendMode::Alpha | BlendMode::Erase)
                 );
-                if needs_layer && self.target_fbo.is_none() {
+                if needs_layer && !self.in_offscreen && self.target_fbo.is_none() {
                     return;
                 }
 
@@ -3726,10 +4665,13 @@ impl CommandHandler for GlRenderBackend {
         self.pop_blend_mode();
     }
 
-    fn render_alpha_mask(&mut self, maskee_commands: CommandList, _mask_commands: CommandList) {
+    fn render_alpha_mask(&mut self, maskee_commands: CommandList, mask_commands: CommandList) {
         self.flush_batch();
-        // TODO Add support for alpha masks
-        maskee_commands.execute(self);
+        // The visible result lives within the maskee's bounds (it's what gets
+        // masked), so size the region to it.
+        if let Some((rx, ry, rw, rh)) = self.blend_region(&maskee_commands) {
+            self.draw_alpha_mask(maskee_commands, mask_commands, rx, ry, rw, rh);
+        }
     }
 }
 
@@ -3847,7 +4789,6 @@ struct Draw {
     draw_type: DrawType,
     #[expect(dead_code)]
     vertex_buffer: Buffer,
-    #[expect(dead_code)]
     index_buffer: Buffer,
     vao: glow::VertexArray,
     num_indices: i32,

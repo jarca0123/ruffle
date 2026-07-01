@@ -123,6 +123,12 @@ impl Display for ShaderType {
 
 pub use builder::{ParsedBytecode, TEXTURE_SAMPLER_START_BIND_INDEX, TEXTURE_START_BIND_INDEX};
 pub use types::{Filter, Mipmap, SamplerConfig, Wrapping};
+// Exposed so alternative backends (e.g. the GL GLSL-ES translator) can consume the
+// parsed AGAL directly instead of going through the `naga` codegen.
+pub use types::{
+    DestField, Dimension, DirectMode, Mask, Opcode, RegisterType, SamplerField, Source2,
+    SourceField,
+};
 
 /// Compiles an Adobe AGAL shader to a Naga Module.
 ///

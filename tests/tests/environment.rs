@@ -54,6 +54,10 @@ impl Environment for NativeEnvironment {
         &self,
         _requirements: &ruffle_test_framework::options::RenderOptions,
     ) -> bool {
+        // The native GL backend is available on demand; don't force-build wgpu.
+        if std::env::var_os("RUFFLE_TEST_GL").is_some() {
+            return true;
+        }
         self.descriptors.is_some()
     }
 
@@ -97,6 +101,10 @@ mod renderer {
         width: u32,
         height: u32,
     ) -> Option<(Box<dyn RenderInterface>, Box<dyn RenderBackend>)> {
+        // Opt in to the native OpenGL backend for image tests.
+        if std::env::var_os("RUFFLE_TEST_GL").is_some() {
+            return create_gl_pair(width, height);
+        }
         let descriptors = env.descriptors.clone()?;
         let target = TextureTarget::new(&descriptors.device, (width, height)).expect(
             "WGPU Texture Target creation must not fail, everything was checked ahead of time",
@@ -124,6 +132,138 @@ mod renderer {
 
             renderer.capture_frame().expect("Failed to capture image")
         }
+    }
+
+    // ---- Native OpenGL backend (headless via an EGL device + pbuffer) ----
+
+    use glutin::api::egl::context::PossiblyCurrentContext;
+    use glutin::api::egl::device::Device as EglDevice;
+    use glutin::api::egl::display::Display as EglDisplay;
+    use glutin::api::egl::surface::Surface as EglSurface;
+    use glutin::config::ConfigTemplateBuilder;
+    use glutin::context::{
+        ContextApi, ContextAttributesBuilder, NotCurrentGlContext, Version,
+    };
+    use glutin::display::GlDisplay;
+    use glutin::surface::{GlSurface, PbufferSurface, SurfaceAttributesBuilder};
+    use ruffle_render::backend::ViewportDimensions;
+    use ruffle_render::quality::StageQuality;
+    use ruffle_render_gl::GlRenderBackend;
+    use std::num::NonZeroU32;
+
+    struct GlRenderInterface {
+        // Kept alive (and current) for the lifetime of the backend.
+        _context: PossiblyCurrentContext,
+        _surface: EglSurface<PbufferSurface>,
+        _display: EglDisplay,
+    }
+
+    impl RenderInterface for GlRenderInterface {
+        fn name(&self) -> String {
+            format!("{}-gl", std::env::consts::OS)
+        }
+
+        fn capture(&self, backend: &mut dyn RenderBackend) -> RgbaImage {
+            let renderer = <dyn Any>::downcast_mut::<GlRenderBackend>(backend).unwrap();
+            let (w, h, pixels) = renderer.read_framebuffer();
+            RgbaImage::from_raw(w, h, pixels).expect("GL framebuffer readback failed")
+        }
+    }
+
+    fn create_gl_pair(
+        width: u32,
+        height: u32,
+    ) -> Option<(Box<dyn RenderInterface>, Box<dyn RenderBackend>)> {
+        macro_rules! step {
+            ($what:expr, $e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("GL test env: {} failed: {:?}", $what, e);
+                        return None;
+                    }
+                }
+            };
+        }
+
+        let devices: Vec<_> = step!("query_devices", EglDevice::query_devices()).collect();
+        // `RUFFLE_TEST_GL_DEV=N` selects EGL device index N (e.g. a software
+        // llvmpipe device); otherwise the first device is used.
+        let device = match std::env::var("RUFFLE_TEST_GL_DEV")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(i) => devices.get(i),
+            None => devices.first(),
+        };
+        let device = match device {
+            Some(d) => d,
+            None => {
+                eprintln!("GL test env: no EGL devices found");
+                return None;
+            }
+        };
+        eprintln!("GL test env: using EGL device {:?}", device.name());
+        let display = step!("with_device", unsafe {
+            EglDisplay::with_device(&device, None)
+        });
+
+        let template = ConfigTemplateBuilder::new()
+            .with_surface_type(glutin::config::ConfigSurfaceTypes::PBUFFER)
+            .with_alpha_size(8)
+            .build();
+        let config = match step!("find_configs", unsafe { display.find_configs(template) }).next() {
+            Some(c) => c,
+            None => {
+                eprintln!("GL test env: no EGL config found");
+                return None;
+            }
+        };
+
+        let ctx_attrs = ContextAttributesBuilder::new()
+            .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
+            .build(None);
+        let not_current = step!("create_context", unsafe {
+            display.create_context(&config, &ctx_attrs)
+        });
+
+        let surf_attrs = SurfaceAttributesBuilder::<PbufferSurface>::new().build(
+            NonZeroU32::new(width.max(1)).unwrap(),
+            NonZeroU32::new(height.max(1)).unwrap(),
+        );
+        let surface = step!("create_pbuffer_surface", unsafe {
+            display.create_pbuffer_surface(&config, &surf_attrs)
+        });
+
+        let context = step!("make_current", not_current.make_current(&surface));
+
+        let mut backend = step!("GlRenderBackend::new", unsafe {
+            GlRenderBackend::new_from_loader_function(
+                |sym| {
+                    let c = std::ffi::CString::new(sym).unwrap();
+                    display.get_proc_address(c.as_c_str()) as *const _
+                },
+                false,
+                // Match wgpu's test backend (`WgpuRenderBackend::new` builds its
+                // surface at `StageQuality::Low`, i.e. no MSAA), so composited
+                // bitmap edges are pixel-identical to the reference images.
+                StageQuality::Low,
+            )
+        });
+        backend.set_viewport_dimensions(ViewportDimensions {
+            width,
+            height,
+            scale_factor: 1.0,
+        });
+
+        Some((
+            Box::new(GlRenderInterface {
+                _context: context,
+                _surface: surface,
+                _display: display,
+            }),
+            Box::new(backend),
+        ))
     }
 
     /*

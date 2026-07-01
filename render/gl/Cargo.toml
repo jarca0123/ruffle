@@ -18,6 +18,9 @@ log = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
 swf = { path = "../../swf" }
 thiserror = { workspace = true }
+# Stage3D: AGAL bytecode parsing (the `naga` codegen is unused on GL — a custom
+# GLSL ES translator handles the oldest-GL targets).
+naga-agal = { path = "../naga-agal" }
 
 # Native build: tessellator only. We must NOT pull the `web` feature (which
 # forces `wasm-bindgen`) into a native target.

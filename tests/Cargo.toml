@@ -16,6 +16,9 @@ workspace = true
 # not match your local machine's Vulkan version / image output.
 imgtests = [
     "ruffle_render_wgpu",
+    "ruffle_render_gl",
+    "ruffle_render",
+    "glutin",
     "ruffle_test_framework/ruffle_video_software",
     "ruffle_test_framework/ruffle_video_external",
 ]
@@ -24,6 +27,9 @@ lzma = ["ruffle_test_framework/lzma"]
 
 [dependencies]
 ruffle_render_wgpu = { path = "../render/wgpu", optional = true }
+ruffle_render_gl = { path = "../render/gl", optional = true }
+ruffle_render = { path = "../render", optional = true }
+glutin = { version = "0.32", optional = true }
 ruffle_fs_tests_runner = { path = "fs-tests-runner" }
 ruffle_test_framework = { path = "framework", features = ["clap"] }
 clap = { workspace = true }

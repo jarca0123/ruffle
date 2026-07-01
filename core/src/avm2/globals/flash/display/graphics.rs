@@ -22,11 +22,12 @@ use crate::display_object::TDisplayObject;
 use crate::drawing::Drawing;
 use crate::string::{AvmString, WStr};
 use either::Either;
+use ruffle_render::bitmap::BitmapSource;
 use ruffle_render::shape_utils::{DrawCommand, FillRule, GradientType};
 use std::f64::consts::FRAC_1_SQRT_2;
 use swf::{
-    Color, FillStyle, Fixed8, Gradient, GradientInterpolation, GradientRecord, GradientSpread,
-    LineCapStyle, LineJoinStyle, LineStyle, Matrix, Point, Twips,
+    Color, FillStyle, Fixed8, Fixed16, Gradient, GradientInterpolation, GradientRecord,
+    GradientSpread, LineCapStyle, LineJoinStyle, LineStyle, Matrix, Point, Twips,
 };
 
 /// Convert an RGB `color` and `alpha` argument pair into a `swf::Color`.
@@ -1069,15 +1070,6 @@ pub fn draw_triangles<'gc>(
             "winding behavior"
         );
 
-        if uvt_data.is_some() {
-            avm2_stub_method!(
-                activation,
-                "flash.display.Graphics",
-                "drawTriangles",
-                "with uvt data"
-            );
-        }
-
         draw_triangles_internal(
             activation,
             &mut drawing,
@@ -1196,6 +1188,34 @@ impl TriangleData {
         }
     }
 
+    /// Like [`Self::iter_triangles`] but also yields, for each triangle, the index
+    /// of each vertex into the flat vertex list — used to look up matching UV data.
+    /// Total number of vertices (to match against UV data length).
+    fn num_vertices(&self) -> usize {
+        match self {
+            Self::Indexed { vertices, .. } => vertices.len(),
+            Self::Sequential { triangles } => triangles.len() * 3,
+        }
+    }
+
+    fn iter_triangles_with_uv_indices(
+        &self,
+    ) -> impl Iterator<Item = ([Point<Twips>; 3], [usize; 3])> + '_ {
+        match self {
+            Self::Indexed { vertices, indices } => {
+                Either::Left(indices.iter().map(|&[i0, i1, i2]| {
+                    let (i0, i1, i2) = (i0 as usize, i1 as usize, i2 as usize);
+                    ([vertices[i0], vertices[i1], vertices[i2]], [i0, i1, i2])
+                }))
+            }
+            Self::Sequential { triangles } => {
+                Either::Right(triangles.iter().enumerate().map(|(t, &tri)| {
+                    (tri, [t * 3, t * 3 + 1, t * 3 + 2])
+                }))
+            }
+        }
+    }
+
     fn iter_triangles(&self) -> impl Iterator<Item = [Point<Twips>; 3]> + '_ {
         match self {
             Self::Indexed { vertices, indices } => {
@@ -1264,12 +1284,66 @@ fn draw_triangles_internal<'gc>(
     drawing: &mut Drawing,
     vertices: &Object<'gc>,
     indices: Option<&Object<'gc>>,
-    _uvt_data: Option<&Object<'gc>>,
+    uvt_data: Option<&Object<'gc>>,
     culling: TriangleCulling,
 ) -> Result<(), Error<'gc>> {
     let Some(data) = TriangleData::new(activation, vertices, indices)? else {
         return Ok(());
     };
+
+    // With UV data and a bitmap fill, each triangle is textured: the bitmap is
+    // affinely mapped so the fill samples it at the per-vertex UVs.
+    if let Some(uvt) = uvt_data
+        && let Some(FillStyle::Bitmap {
+            id,
+            is_smoothed,
+            is_repeating,
+            ..
+        }) = drawing.current_fill_style().cloned()
+        && let Some(size) = drawing.bitmap_size(id)
+    {
+        // UV coordinates are normalized; scale into bitmap-pixel space (the space
+        // a `FillStyle::Bitmap` matrix maps from). The `t` component (perspective)
+        // is ignored — Flash only uses it for perspective-correct mapping, which we
+        // approximate affinely.
+        let uv_storage = uvt.as_vector_storage().expect("uvtData is not a Vector");
+        let uvs = uv_storage.storage();
+        let num_vertices = data.num_vertices();
+        let stride = if num_vertices > 0 {
+            uvs.len() / num_vertices
+        } else {
+            0
+        };
+        if stride >= 2 {
+            let bitmap_px = |i: usize| -> (f64, f64) {
+                (
+                    uvs[i * stride].as_f64() * size.width as f64,
+                    uvs[i * stride + 1].as_f64() * size.height as f64,
+                )
+            };
+            for (tri, [i0, i1, i2]) in data.iter_triangles_with_uv_indices() {
+                if culling.cull(tri) {
+                    continue;
+                }
+                let uv = [bitmap_px(i0), bitmap_px(i1), bitmap_px(i2)];
+                let Some(matrix) = solve_uv_matrix(uv, tri) else {
+                    continue;
+                };
+                drawing.set_fill_style(Some(FillStyle::Bitmap {
+                    id,
+                    matrix,
+                    is_smoothed,
+                    is_repeating,
+                }));
+                let [a, b, c] = tri;
+                drawing.draw_command(DrawCommand::MoveTo(a));
+                drawing.draw_command(DrawCommand::LineTo(b));
+                drawing.draw_command(DrawCommand::LineTo(c));
+                drawing.draw_command(DrawCommand::LineTo(a));
+            }
+            return Ok(());
+        }
+    }
 
     for [a, b, c] in data.iter_triangles().filter(|&tri| !culling.cull(tri)) {
         drawing.draw_command(DrawCommand::MoveTo(a));
@@ -1279,6 +1353,50 @@ fn draw_triangles_internal<'gc>(
     }
 
     Ok(())
+}
+
+/// Solves the affine matrix mapping bitmap-pixel space (`uv`) onto the triangle's
+/// twip-space vertices (`pos`), i.e. `M * uv[i] == pos[i]`. Returns `None` for a
+/// degenerate (zero-area) UV triangle.
+fn solve_uv_matrix(uv: [(f64, f64); 3], pos: [Point<Twips>; 3]) -> Option<Matrix> {
+    let (b0, b1, b2) = (uv[0], uv[1], uv[2]);
+    let bx1 = b1.0 - b0.0;
+    let by1 = b1.1 - b0.1;
+    let bx2 = b2.0 - b0.0;
+    let by2 = b2.1 - b0.1;
+    let det = bx1 * by2 - bx2 * by1;
+    if det.abs() < 1e-6 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    // inverse of [[bx1, bx2], [by1, by2]]
+    let i00 = by2 * inv;
+    let i01 = -bx2 * inv;
+    let i10 = -by1 * inv;
+    let i11 = bx1 * inv;
+
+    let p0 = (pos[0].x.get() as f64, pos[0].y.get() as f64);
+    let px1 = pos[1].x.get() as f64 - p0.0;
+    let py1 = pos[1].y.get() as f64 - p0.1;
+    let px2 = pos[2].x.get() as f64 - p0.0;
+    let py2 = pos[2].y.get() as f64 - p0.1;
+
+    // L = [[px1, px2], [py1, py2]] * inv(bitmap edges)
+    let a = px1 * i00 + px2 * i10;
+    let c = px1 * i01 + px2 * i11;
+    let b = py1 * i00 + py2 * i10;
+    let d = py1 * i01 + py2 * i11;
+    let tx = p0.0 - (a * b0.0 + c * b0.1);
+    let ty = p0.1 - (b * b0.0 + d * b0.1);
+
+    Some(Matrix {
+        a: Fixed16::from_f64(a),
+        b: Fixed16::from_f64(b),
+        c: Fixed16::from_f64(c),
+        d: Fixed16::from_f64(d),
+        tx: Twips::new(tx as i32),
+        ty: Twips::new(ty as i32),
+    })
 }
 
 /// Implements `Graphics.drawGraphicsData`

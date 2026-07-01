@@ -114,6 +114,12 @@ impl Drawing {
         self.new_fill(style, Some(self.default_winding_rule));
     }
 
+    /// The fill style currently in effect (e.g. to derive per-triangle bitmap
+    /// fills for `Graphics.drawTriangles` with UV data).
+    pub fn current_fill_style(&self) -> Option<&FillStyle> {
+        self.current_fill.as_ref().map(|fill| &fill.style)
+    }
+
     /// Set fill rule and keep the same fill style.
     pub fn set_fill_rule(&mut self, rule: Option<FillRule>) {
         let style = self.current_fill.as_ref().map(|fill| fill.style.clone());
