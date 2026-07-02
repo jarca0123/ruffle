@@ -1064,9 +1064,9 @@ pub fn draw_triangles<'gc>(
         draw_triangles_internal(
             activation,
             &mut drawing,
-            &vertices,
-            indices.as_ref(),
-            uvt_data.as_ref(),
+            vertices,
+            indices,
+            uvt_data,
             culling,
         )?;
     }
@@ -1273,12 +1273,12 @@ impl TriangleCulling {
 fn draw_triangles_internal<'gc>(
     activation: &mut Activation<'_, 'gc>,
     drawing: &mut Drawing,
-    vertices: &Object<'gc>,
-    indices: Option<&Object<'gc>>,
-    uvt_data: Option<&Object<'gc>>,
+    vertices: Object<'gc>,
+    indices: Option<Object<'gc>>,
+    uvt_data: Option<Object<'gc>>,
     culling: TriangleCulling,
 ) -> Result<(), Error<'gc>> {
-    let Some(data) = TriangleData::new(activation, vertices, indices)? else {
+    let Some(data) = TriangleData::new(activation, &vertices, indices.as_ref())? else {
         return Ok(());
     };
 
@@ -1558,7 +1558,7 @@ pub fn draw_graphics_data<'gc>(
         if let Some(mut drawing) = this.as_drawing() {
             for elem in vector.iter() {
                 if let Some(obj) = elem.as_object() {
-                    handle_igraphics_data(activation, &mut drawing, &obj)?;
+                    handle_igraphics_data(activation, &mut drawing, obj)?;
                 }
             }
         };
@@ -1744,7 +1744,7 @@ fn process_commands<'gc>(
 fn handle_igraphics_data<'gc>(
     activation: &mut Activation<'_, 'gc>,
     drawing: &mut Drawing,
-    obj: &Object<'gc>,
+    obj: Object<'gc>,
 ) -> Result<(), Error<'gc>> {
     let class = obj.instance_class();
 
@@ -1800,7 +1800,7 @@ fn handle_igraphics_data<'gc>(
                 let fill = obj.get_slot(graphics_stroke_slots::FILL).as_object();
 
                 if let Some(fill) = fill {
-                    handle_igraphics_fill(activation, drawing, &fill)?
+                    handle_igraphics_fill(activation, drawing, fill)?
                 } else {
                     None
                 }
@@ -1852,7 +1852,7 @@ fn handle_igraphics_data<'gc>(
 fn handle_graphics_triangle_path<'gc>(
     activation: &mut Activation<'_, 'gc>,
     drawing: &mut Drawing,
-    obj: &Object<'gc>,
+    obj: Object<'gc>,
 ) -> Result<(), Error<'gc>> {
     let culling = {
         let culling = obj
@@ -1874,23 +1874,7 @@ fn handle_graphics_triangle_path<'gc>(
         .as_object();
 
     if let Some(vertices) = vertices {
-        if uvt_data.is_some() {
-            avm2_stub_method!(
-                activation,
-                "flash.display.Graphics",
-                "drawGraphicsData",
-                "GraphicsTrianglePath with uvt data"
-            );
-        }
-
-        draw_triangles_internal(
-            activation,
-            drawing,
-            &vertices,
-            indices.as_ref(),
-            uvt_data.as_ref(),
-            culling,
-        )?;
+        draw_triangles_internal(activation, drawing, vertices, indices, uvt_data, culling)?;
     }
 
     Ok(())
@@ -1899,7 +1883,7 @@ fn handle_graphics_triangle_path<'gc>(
 fn handle_igraphics_fill<'gc>(
     activation: &mut Activation<'_, 'gc>,
     drawing: &mut Drawing,
-    obj: &Object<'gc>,
+    obj: Object<'gc>,
 ) -> Result<Option<FillStyle>, Error<'gc>> {
     let class = obj.instance_class();
 
@@ -1925,7 +1909,7 @@ fn handle_igraphics_fill<'gc>(
 
 fn handle_solid_fill<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    obj: &Object<'gc>,
+    obj: Object<'gc>,
 ) -> Result<FillStyle, Error<'gc>> {
     let alpha = obj
         .get_slot(graphics_solid_fill_slots::ALPHA)
@@ -1942,7 +1926,7 @@ fn handle_solid_fill<'gc>(
 
 fn handle_gradient_fill<'gc>(
     activation: &mut Activation<'_, 'gc>,
-    obj: &Object<'gc>,
+    obj: Object<'gc>,
 ) -> Result<FillStyle, Error<'gc>> {
     let alphas = obj
         .get_slot(graphics_gradient_fill_slots::ALPHAS)
@@ -2032,7 +2016,7 @@ fn handle_gradient_fill<'gc>(
 fn handle_bitmap_fill<'gc>(
     activation: &mut Activation<'_, 'gc>,
     drawing: &mut Drawing,
-    obj: &Object<'gc>,
+    obj: Object<'gc>,
 ) -> Result<FillStyle, Error<'gc>> {
     let bitmap_data = obj
         .get_slot(graphics_bitmap_fill_slots::BITMAP_DATA)

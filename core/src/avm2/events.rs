@@ -4,11 +4,11 @@ use crate::avm2::Avm2;
 use crate::avm2::activation::Activation;
 use crate::avm2::function::FunctionArgs;
 use crate::avm2::globals::slots::flash_events_event_dispatcher as slots;
-use crate::avm2::object::{EventObject, FunctionObject, FunctionObjectWeak, Object, TObject as _};
+use crate::avm2::object::{EventObject, FunctionObject, Object, TObject as _, WeakObject};
 use crate::display_object::TDisplayObject;
 use crate::string::AvmString;
 use fnv::FnvHashMap;
-use gc_arena::{Collect, Gc, GcWeak, Mutation};
+use gc_arena::{Collect, Gc, Mutation};
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
@@ -319,7 +319,7 @@ impl Default for DispatchList<'_> {
 #[collect(no_drop)]
 enum HandlerRef<'gc> {
     Strong(FunctionObject<'gc>),
-    Weak(FunctionObjectWeak<'gc>),
+    Weak(WeakObject<'gc>),
 }
 
 impl<'gc> HandlerRef<'gc> {
@@ -329,7 +329,7 @@ impl<'gc> HandlerRef<'gc> {
     fn as_ptr(&self) -> *const () {
         match self {
             HandlerRef::Strong(handler) => Gc::as_ptr(handler.0) as *const (),
-            HandlerRef::Weak(handler) => GcWeak::as_ptr(handler.0) as *const (),
+            HandlerRef::Weak(handler) => handler.as_ptr() as *const (),
         }
     }
 
@@ -338,7 +338,7 @@ impl<'gc> HandlerRef<'gc> {
     fn upgrade(&self, mc: &Mutation<'gc>) -> Option<FunctionObject<'gc>> {
         match self {
             HandlerRef::Strong(handler) => Some(*handler),
-            HandlerRef::Weak(handler) => handler.0.upgrade(mc).map(FunctionObject),
+            HandlerRef::Weak(handler) => handler.upgrade(mc).and_then(|o| o.as_function_object()),
         }
     }
 }
@@ -359,7 +359,7 @@ struct EventHandler<'gc> {
 impl<'gc> EventHandler<'gc> {
     fn new(handler: FunctionObject<'gc>, use_capture: bool, use_weak: bool) -> Self {
         let handler = if use_weak {
-            HandlerRef::Weak(FunctionObjectWeak(Gc::downgrade(handler.0)))
+            HandlerRef::Weak(Object::from(handler).downgrade())
         } else {
             HandlerRef::Strong(handler)
         };
