@@ -771,6 +771,7 @@ impl<'gc> Object<'gc> {
         pub fn as_shared_object for SharedObjectObject;
         pub fn as_sound_transform for SoundTransformObject;
         pub fn as_style_sheet for StyleSheetObject;
+        pub fn as_worker_object for WorkerObject;
         pub fn as_content_element_object for ContentElementObject;
         pub fn as_element_format_object for ElementFormatObject;
         pub fn as_font_description_object for FontDescriptionObject;
