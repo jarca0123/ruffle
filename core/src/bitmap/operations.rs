@@ -508,17 +508,67 @@ pub fn color_transform<'gc>(
     let mut write = target.borrow_mut(mc);
     let transparency = write.transparency();
 
-    for y in y_min..y_max {
-        for x in x_min..x_max {
-            let color = write.get_pixel32_raw(x, y).to_un_multiplied_alpha();
+    // Each output channel is a pure function of its input channel:
+    // `clamp(multiply * c + add)`. Precompute a 256-entry table per channel so
+    // the per-pixel inner loop is four lookups instead of four Fixed8 multiplies
+    // plus saturating adds and clamps.
+    let build_lut = |multiply: swf::Fixed8, add: i16| {
+        let mut lut = [0u8; 256];
+        for (c, slot) in lut.iter_mut().enumerate() {
+            *slot = multiply
+                .mul_int(c as i16)
+                .saturating_add(add)
+                .clamp(0, 255) as u8;
+        }
+        lut
+    };
+    let r_lut = build_lut(color_transform.r_multiply, color_transform.r_add);
+    let g_lut = build_lut(color_transform.g_multiply, color_transform.g_add);
+    let b_lut = build_lut(color_transform.b_multiply, color_transform.b_add);
+    let a_lut = build_lut(color_transform.a_multiply, color_transform.a_add);
 
-            let color = color_transform * swf::Color::from(color);
+    // Grab the pixel buffer once (a single `Rc::make_mut`) and walk it row by
+    // row over plain slices, so the inner loop is free of per-pixel bounds
+    // checks, index arithmetic and refcount checks.
+    let width = write.width() as usize;
+    let pixels = write.raw_pixels_mut();
 
-            write.set_pixel32_raw(
-                x,
-                y,
-                Color::from(color).to_premultiplied_alpha(transparency),
-            )
+    if !transparency {
+        // Opaque bitmap: alpha is fixed at 255, so premultiplied == straight and
+        // the un/premultiply round-trip is the identity. Skip both entirely and
+        // just remap RGB through the tables.
+        for y in y_min..y_max {
+            let row_start = y as usize * width;
+            let row = &mut pixels[row_start + x_min as usize..row_start + x_max as usize];
+            for px in row {
+                *px = Color::rgba(
+                    r_lut[px.red() as usize],
+                    g_lut[px.green() as usize],
+                    b_lut[px.blue() as usize],
+                    255,
+                );
+            }
+        }
+    } else {
+        for y in y_min..y_max {
+            let row_start = y as usize * width;
+            let row = &mut pixels[row_start + x_min as usize..row_start + x_max as usize];
+            for px in row {
+                // Matches the `if color.a > 0` guard in `ColorTransform * Color`:
+                // fully-transparent pixels are left untouched (a premultiplied
+                // pixel with alpha 0 already has zero RGB).
+                if px.alpha() == 0 {
+                    continue;
+                }
+                let color = px.to_un_multiplied_alpha();
+                let color = Color::rgba(
+                    r_lut[color.red() as usize],
+                    g_lut[color.green() as usize],
+                    b_lut[color.blue() as usize],
+                    a_lut[color.alpha() as usize],
+                );
+                *px = color.to_premultiplied_alpha(transparency);
+            }
         }
     }
     write.set_cpu_dirty(
