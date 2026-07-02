@@ -619,7 +619,12 @@ impl RuffleInstanceBuilder {
                         is_transparent,
                         self.quality,
                     ) {
-                        Ok(renderer) => {
+                        Ok(mut renderer) => {
+                            // The scene is rendered top-down (Flash-top at
+                            // framebuffer row 0). A WebGL canvas scans row 0 at
+                            // the bottom, just like a desktop GL window, so the
+                            // movie must be presented flipped to appear upright.
+                            renderer.set_present_flipped(true);
                             return Ok((Box::new(renderer), canvas));
                         }
                         Err(error) => {

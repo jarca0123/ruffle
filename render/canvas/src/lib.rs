@@ -1079,6 +1079,10 @@ fn swf_shape_to_canvas_commands(
                     },
                 });
             }
+            // The canvas backend does not report `supports_perspective_triangles`,
+            // so the core subdivides them into affine `Fill`s and this variant is
+            // never produced here; the arm exists only for exhaustiveness.
+            DrawPath::PerspectiveBitmap { .. } => {}
         }
     }
 
