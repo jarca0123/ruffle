@@ -106,7 +106,29 @@ where
     F: FnMut(&str) -> *const std::ffi::c_void,
 {
     // SAFETY: forwarded to the caller's contract above.
-    let glow_ctx = unsafe { glow::Context::from_loader_function(loader) };
+    let mut glow_ctx = unsafe { glow::Context::from_loader_function(loader) };
+
+    // Diagnostic (opt-in via `RUFFLE_GL_DEBUG`): on drivers exposing KHR_debug,
+    // report GL errors at their source (synchronously, so the log points at the
+    // failing call). Errors only — not the performance/notification spam. Off by
+    // default because synchronous debug output serializes driver calls. Must be
+    // installed before the `Rc` wrap, as the callback registration needs `&mut`.
+    let has_debug = std::env::var_os("RUFFLE_GL_DEBUG").is_some() && {
+        let exts = glow_ctx.supported_extensions();
+        exts.contains("GL_KHR_debug") || exts.contains("GL_ARB_debug_output")
+    };
+    if has_debug {
+        unsafe {
+            glow_ctx.enable(glow::DEBUG_OUTPUT);
+            glow_ctx.enable(glow::DEBUG_OUTPUT_SYNCHRONOUS);
+            glow_ctx.debug_message_callback(|_source, gltype, id, severity, message| {
+                if gltype == glow::DEBUG_TYPE_ERROR {
+                    log::warn!("[GL debug] error id={id} severity=0x{severity:04x}: {message}");
+                }
+            });
+        }
+    }
+
     let gl: GlContext = Rc::new(glow_ctx);
     let caps = detect_capabilities(&gl);
     let msaa = recommended_msaa_samples(&caps, quality);

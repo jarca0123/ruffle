@@ -5,26 +5,28 @@ uniform vec4 add_color;
 uniform mat3 u_matrix;
 
 uniform int u_gradient_type;
-uniform float u_ratios[16];
-uniform vec4 u_colors[16];
 uniform int u_repeat_mode;
 uniform float u_focal_point;
 uniform int u_interpolation;
+// Baked 256x1 gradient ramp (see `Gradient::ramp`). Sampled with hardware
+// linear filtering, matching wgpu's gradient texture.
+uniform sampler2D u_texture;
 
 varying vec2 frag_uv;
 
-vec4 interpolate(float t, float ratio1, float ratio2, vec4 color1, vec4 color2) {
-    color1 = clamp(mult_color * color1 + add_color, 0.0, 1.0);
-    color2 = clamp(mult_color * color2 + add_color, 0.0, 1.0);
-    float a = (t - ratio1) / (ratio2 - ratio1);
-    return mix(color1, color2, a);
-}
-
-vec3 linear_to_srgb(vec3 linear) {
-    vec3 a = 12.92 * linear;
-    vec3 b = 1.055 * pow(linear, vec3(1.0 / 2.4)) - 0.055;
-    vec3 c = step(vec3(0.0031308), linear);
-    return mix(a, b, c);
+// Matches wgpu's `common__linear_to_srgb`: the ramp stores straight (un-
+// premultiplied) colors, so un-premultiply by alpha before the transfer curve
+// and re-premultiply after, exactly as wgpu does. This is what makes
+// semi-transparent gradient stops match bit-for-bit.
+vec4 linear_to_srgb(vec4 c) {
+    vec3 rgb = c.rgb;
+    if (c.a > 0.0) {
+        rgb = rgb / c.a;
+    }
+    vec3 a = 12.92 * rgb;
+    vec3 b = 1.055 * pow(rgb, vec3(1.0 / 2.4)) - 0.055;
+    vec3 sel = step(vec3(0.0031308), rgb);
+    return vec4(mix(a, b, sel) * c.a, c.a);
 }
 
 void main() {
@@ -59,46 +61,17 @@ void main() {
         }
     }
 
-    // TODO: No non-constant array access in WebGL 1, so the following is kind of painful.
-    // We'd probably be better off passing in the gradient as a texture and sampling from there.
-    vec4 color;
-    if (t <= u_ratios[0]) {
-        color = clamp(mult_color * u_colors[0] + add_color, 0.0, 1.0);
-    } else if (t <= u_ratios[1]) {
-        color = interpolate(t, u_ratios[0], u_ratios[1], u_colors[0], u_colors[1]);
-    } else if (t <= u_ratios[2]) {
-        color = interpolate(t, u_ratios[1], u_ratios[2], u_colors[1], u_colors[2]);
-    } else if (t <= u_ratios[3]) {
-        color = interpolate(t, u_ratios[2], u_ratios[3], u_colors[2], u_colors[3]);
-    } else if (t <= u_ratios[4]) {
-        color = interpolate(t, u_ratios[3], u_ratios[4], u_colors[3], u_colors[4]);
-    } else if (t <= u_ratios[5]) {
-        color = interpolate(t, u_ratios[4], u_ratios[5], u_colors[4], u_colors[5]);
-    } else if (t <= u_ratios[6]) {
-        color = interpolate(t, u_ratios[5], u_ratios[6], u_colors[5], u_colors[6]);
-    } else if (t <= u_ratios[7]) {
-        color = interpolate(t, u_ratios[6], u_ratios[7], u_colors[6], u_colors[7]);
-    } else if (t <= u_ratios[8]) {
-        color = interpolate(t, u_ratios[7], u_ratios[8], u_colors[7], u_colors[8]);
-    } else if (t <= u_ratios[9]) {
-        color = interpolate(t, u_ratios[8], u_ratios[9], u_colors[8], u_colors[9]);
-    } else if (t <= u_ratios[10]) {
-        color = interpolate(t, u_ratios[9], u_ratios[10], u_colors[9], u_colors[10]);
-    } else if (t <= u_ratios[11]) {
-        color = interpolate(t, u_ratios[10], u_ratios[11], u_colors[10], u_colors[11]);
-    } else if (t <= u_ratios[12]) {
-        color = interpolate(t, u_ratios[11], u_ratios[12], u_colors[11], u_colors[12]);
-    } else if (t <= u_ratios[13]) {
-        color = interpolate(t, u_ratios[12], u_ratios[13], u_colors[12], u_colors[13]);
-    } else if (t <= u_ratios[14]) {
-        color = interpolate(t, u_ratios[13], u_ratios[14], u_colors[13], u_colors[14]);
-    } else {
-        color = clamp(mult_color * u_colors[14] + add_color, 0.0, 1.0);
-    }
+    // Sample the baked ramp. `t` is already folded into [0, 1] above, so the
+    // texture wrap mode is irrelevant (clamp). The 256-texel quantization plus
+    // hardware linear filtering matches wgpu exactly.
+    vec4 color = texture2D(u_texture, vec2(t, 0.0));
 
     if (u_interpolation != 0) {
-        color = vec4(linear_to_srgb(vec3(color)), color.a);
+        color = linear_to_srgb(color);
     }
+
+    // Color transform is applied after sampling/interpolation, matching wgpu.
+    color = clamp(mult_color * color + add_color, 0.0, 1.0);
 
     float alpha = clamp(color.a, 0.0, 1.0);
     gl_FragColor = vec4(color.rgb * alpha, alpha);

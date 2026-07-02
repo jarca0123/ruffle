@@ -604,6 +604,9 @@ impl WebGlRenderBackend {
                 TessDrawType::Color => &self.color_program,
                 TessDrawType::Gradient { .. } => &self.gradient_program,
                 TessDrawType::Bitmap(_) => &self.bitmap_program,
+                TessDrawType::PerspectiveBitmap(_) => {
+                    unreachable!("webgl does not enable perspective triangles")
+                }
             };
 
             // Unfortunately it doesn't seem to be possible to ensure that vertex attributes will be in
@@ -689,6 +692,9 @@ impl WebGlRenderBackend {
                     num_indices,
                     num_mask_indices,
                 },
+                TessDrawType::PerspectiveBitmap(_) => {
+                    unreachable!("webgl does not enable perspective triangles")
+                }
             });
 
             self.bind_vertex_array(None);

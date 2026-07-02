@@ -3,7 +3,8 @@ use ruffle_render::backend::{RenderBackend, ShapeHandle};
 use ruffle_render::bitmap::{BitmapHandle, BitmapInfo, BitmapSize, BitmapSource};
 use ruffle_render::commands::CommandHandler;
 use ruffle_render::shape_utils::{
-    DistilledShape, DrawCommand, DrawPath, FillRule, cubic_curve_bounds, quadratic_curve_bounds,
+    DistilledShape, DrawCommand, DrawPath, FillRule, PerspectiveVertex, cubic_curve_bounds,
+    quadratic_curve_bounds,
 };
 use std::cell::OnceCell;
 use swf::{FillStyle, LineStyle, Point, Rectangle, Twips};
@@ -97,6 +98,21 @@ impl Drawing {
                     }
 
                     this.set_fill_style(None);
+                }
+                DrawPath::PerspectiveBitmap {
+                    bitmap_id,
+                    is_smoothed,
+                    is_repeating,
+                    vertices,
+                } => {
+                    for tri in vertices.chunks_exact(3) {
+                        this.draw_perspective_triangle(
+                            bitmap_id,
+                            is_smoothed,
+                            is_repeating,
+                            [tri[0], tri[1], tri[2]],
+                        );
+                    }
                 }
             }
         }
@@ -245,6 +261,46 @@ impl Drawing {
         id
     }
 
+    /// Appends a perspective-correct textured triangle (`Graphics.drawTriangles`
+    /// with a 3-component `uvtData`). Consecutive triangles sharing a bitmap and
+    /// sampler state are batched into one run so an entire mesh renders as a single
+    /// draw. Only used when the renderer reports `supports_perspective_triangles`;
+    /// otherwise the core subdivides into affine fills instead. `x`/`y` are pixels,
+    /// `u`/`v` are normalized, `t` is `1/w`.
+    pub fn draw_perspective_triangle(
+        &mut self,
+        bitmap_id: u16,
+        is_smoothed: bool,
+        is_repeating: bool,
+        vertices: [PerspectiveVertex; 3],
+    ) {
+        for v in &vertices {
+            let point = Point::new(
+                Twips::from_pixels(v.x as f64),
+                Twips::from_pixels(v.y as f64),
+            );
+            let command = DrawCommand::MoveTo(point);
+            self.shape_bounds = stretch_bounds(&self.shape_bounds, &command, Twips::ZERO, point);
+            self.edge_bounds = stretch_bounds(&self.edge_bounds, &command, Twips::ZERO, point);
+        }
+
+        if let Some(DrawingPath::Perspective(last)) = self.paths.last_mut()
+            && last.bitmap_id == bitmap_id
+            && last.is_smoothed == is_smoothed
+            && last.is_repeating == is_repeating
+        {
+            last.vertices.extend_from_slice(&vertices);
+        } else {
+            self.paths.push(DrawingPath::Perspective(PerspectiveDraw {
+                bitmap_id,
+                is_smoothed,
+                is_repeating,
+                vertices: vertices.to_vec(),
+            }));
+        }
+        self.mark_dirty();
+    }
+
     /// Obtain a `ShapeHandle` that represents this `Drawing`, or `None` if it is empty.
     pub fn register_or_replace(&self, renderer: &mut dyn RenderBackend) -> Option<ShapeHandle> {
         if self.is_empty {
@@ -268,6 +324,14 @@ impl Drawing {
                             style: &line.style,
                             commands: line.commands.to_owned(),
                             is_closed: line.is_closed,
+                        });
+                    }
+                    DrawingPath::Perspective(p) => {
+                        paths.push(DrawPath::PerspectiveBitmap {
+                            bitmap_id: p.bitmap_id,
+                            is_smoothed: p.is_smoothed,
+                            is_repeating: p.is_repeating,
+                            vertices: p.vertices.clone(),
                         });
                     }
                 }
@@ -356,6 +420,29 @@ impl Drawing {
                         local_matrix,
                     ) {
                         return true;
+                    }
+                }
+                // Match the affine fallback (whose sub-triangle fills are
+                // hit-tested normally): test the point against each screen-space
+                // triangle. Vertices are pixels, like `point` once converted.
+                DrawingPath::Perspective(p) => {
+                    let px = point.x.to_pixels() as f32;
+                    let py = point.y.to_pixels() as f32;
+                    let edge = |a: &PerspectiveVertex, b: &PerspectiveVertex| {
+                        (px - b.x) * (a.y - b.y) - (a.x - b.x) * (py - b.y)
+                    };
+                    for tri in p.vertices.chunks_exact(3) {
+                        let d1 = edge(&tri[0], &tri[1]);
+                        let d2 = edge(&tri[1], &tri[2]);
+                        let d3 = edge(&tri[2], &tri[0]);
+                        // Inside when the point is on the same side of all edges
+                        // (allowing the boundary). A zero-area triangle covers
+                        // nothing, so require at least one non-zero edge.
+                        let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+                        let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+                        if (has_neg || has_pos) && !(has_neg && has_pos) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -450,9 +537,18 @@ struct DrawingLine {
 }
 
 #[derive(Debug, Clone)]
+struct PerspectiveDraw {
+    bitmap_id: u16,
+    is_smoothed: bool,
+    is_repeating: bool,
+    vertices: Vec<PerspectiveVertex>,
+}
+
+#[derive(Debug, Clone)]
 enum DrawingPath {
     Fill(DrawingFill),
     Line(DrawingLine),
+    Perspective(PerspectiveDraw),
 }
 
 fn stretch_bounds(

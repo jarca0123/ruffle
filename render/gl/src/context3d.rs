@@ -14,9 +14,9 @@ use crate::context::GlContext;
 use glow::HasContext as _;
 use ruffle_render::backend::{
     BufferUsage, Context3D, Context3DBlendFactor, Context3DCommand, Context3DCompareMode,
-    Context3DProfile, Context3DTextureFilter, Context3DTextureFormat, Context3DTriangleFace,
-    Context3DVertexBufferFormat, Context3DWrapMode, IndexBuffer, ProgramType, ShaderModule,
-    Texture, VertexBuffer,
+    Context3DProfile, Context3DStencilAction, Context3DTextureFilter, Context3DTextureFormat,
+    Context3DTriangleFace, Context3DVertexBufferFormat, Context3DWrapMode, IndexBuffer,
+    ProgramType, ShaderModule, Texture, VertexBuffer,
 };
 use ruffle_render::bitmap::BitmapHandle;
 use ruffle_render::error::Error;
@@ -399,6 +399,17 @@ pub struct GlContext3D {
     blend_src: Context3DBlendFactor,
     blend_dst: Context3DBlendFactor,
     color_mask: [bool; 4],
+    // Stencil state from `setStencilActions` / `setStencilReferenceValue`. The
+    // default (Always compare, Keep actions) is a no-op pass-through so content
+    // without explicit stencil use draws unaffected.
+    stencil_compare: Context3DCompareMode,
+    stencil_face: Context3DTriangleFace,
+    stencil_both_pass: Context3DStencilAction,
+    stencil_depth_fail: Context3DStencilAction,
+    stencil_fail: Context3DStencilAction,
+    stencil_ref: u32,
+    stencil_read_mask: u32,
+    stencil_write_mask: u32,
     /// Scissor rectangle in back-buffer pixels (Flash top-left origin), if set.
     scissor: Option<(i32, i32, i32, i32)>,
     /// Per-sampler `(wrap, filter)` state from `setSamplerStateAt`.
@@ -448,6 +459,14 @@ impl GlContext3D {
             blend_src: Context3DBlendFactor::One,
             blend_dst: Context3DBlendFactor::Zero,
             color_mask: [true; 4],
+            stencil_compare: Context3DCompareMode::Always,
+            stencil_face: Context3DTriangleFace::FrontAndBack,
+            stencil_both_pass: Context3DStencilAction::Keep,
+            stencil_depth_fail: Context3DStencilAction::Keep,
+            stencil_fail: Context3DStencilAction::Keep,
+            stencil_ref: 0,
+            stencil_read_mask: 0xff,
+            stencil_write_mask: 0xff,
             scissor: None,
             sampler_states: Default::default(),
             disposed_index,
@@ -549,15 +568,24 @@ impl GlContext3D {
                 }
             }
 
-            // Render state.
-            //
-            // Stage3D manages its own stencil state (masking is not wired up yet),
-            // but we share the GL context with the 2D renderer, which leaves
-            // `GL_STENCIL_TEST` enabled while drawing masked content. A stale
-            // stencil test would discard every Stage3D fragment (glClear is not
-            // subject to the stencil *test*, so the buffer still shows its clear
-            // color — which looks like "nothing draws"). Disable it explicitly.
-            gl.disable(glow::STENCIL_TEST);
+            // Render state. We render into our own back-buffer FBO (its own
+            // stencil buffer), so setting the func explicitly also overrides any
+            // stale `GL_STENCIL_TEST` the 2D renderer left enabled.
+            let sface = stencil_face(self.stencil_face);
+            gl.enable(glow::STENCIL_TEST);
+            gl.stencil_func_separate(
+                sface,
+                compare_func(self.stencil_compare),
+                self.stencil_ref as i32,
+                self.stencil_read_mask,
+            );
+            gl.stencil_op_separate(
+                sface,
+                stencil_action(self.stencil_fail),
+                stencil_action(self.stencil_depth_fail),
+                stencil_action(self.stencil_both_pass),
+            );
+            gl.stencil_mask(self.stencil_write_mask);
             if target_depth {
                 gl.enable(glow::DEPTH_TEST);
                 gl.depth_mask(self.depth_mask);
@@ -566,7 +594,9 @@ impl GlContext3D {
                 gl.disable(glow::DEPTH_TEST);
             }
             gl.enable(glow::BLEND);
-            gl.blend_func(blend_factor(self.blend_src), blend_factor(self.blend_dst));
+            let (src_rgb, src_a) = blend_factor(self.blend_src);
+            let (dst_rgb, dst_a) = blend_factor(self.blend_dst);
+            gl.blend_func_separate(src_rgb, dst_rgb, src_a, dst_a);
             match self.cull {
                 Context3DTriangleFace::None => gl.disable(glow::CULL_FACE),
                 face => {
@@ -594,12 +624,16 @@ impl GlContext3D {
                 first_index as i32 * 2,
             );
 
+            // Restore the shared GL state the 2D renderer expects, so our Stage3D
+            // state doesn't leak into 2D rendering.
             for reg in enabled_attrs {
                 gl.disable_vertex_attrib_array(reg);
             }
             gl.disable(glow::DEPTH_TEST);
             gl.disable(glow::CULL_FACE);
             gl.disable(glow::SCISSOR_TEST);
+            gl.disable(glow::STENCIL_TEST);
+            gl.stencil_mask(0xff);
             gl.color_mask(true, true, true, true);
             gl.bind_vertex_array(None);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -756,6 +790,12 @@ impl Context3D for GlContext3D {
     ) -> Result<Rc<dyn Texture>, Error> {
         let texture = unsafe { self.gl.create_texture() }
             .map_err(|e| Error::Unimplemented(format!("Context3D texture: {e}").into()))?;
+        // Zero-initialize: `uploadFromBitmapData` may only fill part of the texture
+        // (a smaller bitmap than the texture, or a sub-region), and the rest must
+        // read back as transparent black. A NULL upload leaves it undefined on GL,
+        // so a partially-uploaded texture would sample driver garbage; wgpu zero-
+        // fills new textures, so match that.
+        let zeros = vec![0u8; (width as usize) * (height as usize) * 4];
         unsafe {
             self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
             self.gl.tex_image_2d(
@@ -767,7 +807,7 @@ impl Context3D for GlContext3D {
                 0,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(None),
+                glow::PixelUnpackData::Slice(Some(&zeros)),
             );
             let clamp = glow::CLAMP_TO_EDGE as i32;
             self.gl
@@ -816,6 +856,26 @@ impl Context3D for GlContext3D {
                     glow::PixelUnpackData::Slice(None),
                 );
             }
+            // Without an explicit filter the min-filter defaults to
+            // NEAREST_MIPMAP_LINEAR; with no mip levels uploaded that leaves the
+            // cube map *incomplete*, so every sample returns black (e.g. a skybox
+            // and any water reflecting it). Default to LINEAR + clamp, matching
+            // `create_texture`; a later SetSamplerStateAt can still override.
+            let clamp = glow::CLAMP_TO_EDGE as i32;
+            self.gl
+                .tex_parameter_i32(glow::TEXTURE_CUBE_MAP, glow::TEXTURE_WRAP_S, clamp);
+            self.gl
+                .tex_parameter_i32(glow::TEXTURE_CUBE_MAP, glow::TEXTURE_WRAP_T, clamp);
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_CUBE_MAP,
+                glow::TEXTURE_MIN_FILTER,
+                glow::LINEAR as i32,
+            );
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_CUBE_MAP,
+                glow::TEXTURE_MAG_FILTER,
+                glow::LINEAR as i32,
+            );
         }
         Ok(Rc::new(GlTexture3D {
             gl: self.gl.clone(),
@@ -838,6 +898,9 @@ impl Context3D for GlContext3D {
         // Parse (surfaces malformed-program errors), translate to GLSL ES, and link.
         let vertex = naga_agal::parse_bytecode(&vertex_shader_agal)?;
         let fragment = naga_agal::parse_bytecode(&fragment_shader_agal)?;
+        // Validate sampler usage (a sampler register reused with mismatched
+        // properties is AGAL error #3696), matching the wgpu backend.
+        naga_agal::extract_sampler_configs(&fragment)?;
         let program = compile_program(&self.gl, self.is_embedded, &vertex, &fragment);
         *module.borrow_mut() = Some(Rc::new(GlShaderModule { program }));
         Ok(())
@@ -1059,6 +1122,28 @@ impl Context3D for GlContext3D {
                 self.blend_src = source_factor;
                 self.blend_dst = destination_factor;
             }
+            Context3DCommand::SetStencilActions {
+                triangle_face,
+                compare_mode,
+                on_both_pass,
+                on_depth_fail,
+                on_depth_pass_stencil_fail,
+            } => {
+                self.stencil_face = triangle_face;
+                self.stencil_compare = compare_mode;
+                self.stencil_both_pass = on_both_pass;
+                self.stencil_depth_fail = on_depth_fail;
+                self.stencil_fail = on_depth_pass_stencil_fail;
+            }
+            Context3DCommand::SetStencilReferenceValue {
+                reference_value,
+                read_mask,
+                write_mask,
+            } => {
+                self.stencil_ref = reference_value;
+                self.stencil_read_mask = read_mask;
+                self.stencil_write_mask = write_mask;
+            }
             Context3DCommand::DrawTriangles {
                 index_buffer,
                 first_index,
@@ -1066,9 +1151,6 @@ impl Context3D for GlContext3D {
             } => {
                 self.draw_triangles(index_buffer, first_index, num_triangles);
             }
-            // Remaining state commands are retained by later pipeline work; ignore
-            // them for now rather than erroring.
-            _ => {}
         }
     }
 
@@ -1280,6 +1362,28 @@ fn filter_mode(filter: Context3DTextureFilter) -> i32 {
     }
 }
 
+fn stencil_action(action: Context3DStencilAction) -> u32 {
+    match action {
+        Context3DStencilAction::Keep => glow::KEEP,
+        Context3DStencilAction::Zero => glow::ZERO,
+        Context3DStencilAction::Set => glow::REPLACE,
+        Context3DStencilAction::IncrementSaturate => glow::INCR,
+        Context3DStencilAction::DecrementSaturate => glow::DECR,
+        Context3DStencilAction::IncrementWrap => glow::INCR_WRAP,
+        Context3DStencilAction::DecrementWrap => glow::DECR_WRAP,
+        Context3DStencilAction::Invert => glow::INVERT,
+    }
+}
+
+/// GL face enum for a Stage3D triangle face (`None` applies to both faces).
+fn stencil_face(face: Context3DTriangleFace) -> u32 {
+    match face {
+        Context3DTriangleFace::Front => glow::FRONT,
+        Context3DTriangleFace::Back => glow::BACK,
+        Context3DTriangleFace::FrontAndBack | Context3DTriangleFace::None => glow::FRONT_AND_BACK,
+    }
+}
+
 fn compare_func(mode: Context3DCompareMode) -> u32 {
     match mode {
         Context3DCompareMode::Never => glow::NEVER,
@@ -1293,18 +1397,31 @@ fn compare_func(mode: Context3DCompareMode) -> u32 {
     }
 }
 
-fn blend_factor(factor: Context3DBlendFactor) -> u32 {
+/// Maps a Flash blend factor to a `(color, alpha)` GL factor pair. For the
+/// `*_COLOR` factors the alpha channel uses the corresponding `*_ALPHA` factor
+/// (a colour has no meaningful value for the alpha channel), matching wgpu's
+/// separate colour/alpha blend components — otherwise the resulting back-buffer
+/// alpha (and thus later `*_DESTINATION_*` blends) drifts.
+fn blend_factor(factor: Context3DBlendFactor) -> (u32, u32) {
     match factor {
-        Context3DBlendFactor::Zero => glow::ZERO,
-        Context3DBlendFactor::One => glow::ONE,
-        Context3DBlendFactor::SourceColor => glow::SRC_COLOR,
-        Context3DBlendFactor::OneMinusSourceColor => glow::ONE_MINUS_SRC_COLOR,
-        Context3DBlendFactor::SourceAlpha => glow::SRC_ALPHA,
-        Context3DBlendFactor::OneMinusSourceAlpha => glow::ONE_MINUS_SRC_ALPHA,
-        Context3DBlendFactor::DestinationColor => glow::DST_COLOR,
-        Context3DBlendFactor::OneMinusDestinationColor => glow::ONE_MINUS_DST_COLOR,
-        Context3DBlendFactor::DestinationAlpha => glow::DST_ALPHA,
-        Context3DBlendFactor::OneMinusDestinationAlpha => glow::ONE_MINUS_DST_ALPHA,
+        Context3DBlendFactor::Zero => (glow::ZERO, glow::ZERO),
+        Context3DBlendFactor::One => (glow::ONE, glow::ONE),
+        Context3DBlendFactor::SourceColor => (glow::SRC_COLOR, glow::SRC_ALPHA),
+        Context3DBlendFactor::OneMinusSourceColor => {
+            (glow::ONE_MINUS_SRC_COLOR, glow::ONE_MINUS_SRC_ALPHA)
+        }
+        Context3DBlendFactor::SourceAlpha => (glow::SRC_ALPHA, glow::SRC_ALPHA),
+        Context3DBlendFactor::OneMinusSourceAlpha => {
+            (glow::ONE_MINUS_SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA)
+        }
+        Context3DBlendFactor::DestinationColor => (glow::DST_COLOR, glow::DST_ALPHA),
+        Context3DBlendFactor::OneMinusDestinationColor => {
+            (glow::ONE_MINUS_DST_COLOR, glow::ONE_MINUS_DST_ALPHA)
+        }
+        Context3DBlendFactor::DestinationAlpha => (glow::DST_ALPHA, glow::DST_ALPHA),
+        Context3DBlendFactor::OneMinusDestinationAlpha => {
+            (glow::ONE_MINUS_DST_ALPHA, glow::ONE_MINUS_DST_ALPHA)
+        }
     }
 }
 

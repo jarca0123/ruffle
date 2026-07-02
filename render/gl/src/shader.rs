@@ -62,7 +62,7 @@ pub(crate) fn compile_shader(
 }
 
 // These should match the uniform names in the shaders.
-const NUM_UNIFORMS: usize = 12;
+const NUM_UNIFORMS: usize = 10;
 const UNIFORM_NAMES: [&str; NUM_UNIFORMS] = [
     "world_matrix",
     "view_matrix",
@@ -70,8 +70,6 @@ const UNIFORM_NAMES: [&str; NUM_UNIFORMS] = [
     "add_color",
     "u_matrix",
     "u_gradient_type",
-    "u_ratios",
-    "u_colors",
     "u_repeat_mode",
     "u_focal_point",
     "u_interpolation",
@@ -86,8 +84,6 @@ pub(crate) enum ShaderUniform {
     AddColor,
     TextureMatrix,
     GradientType,
-    GradientRatios,
-    GradientColors,
     GradientRepeatMode,
     GradientFocalPoint,
     GradientInterpolation,
@@ -152,10 +148,6 @@ impl ShaderProgram {
 
     pub(crate) fn uniform1f(&self, gl: &glow::Context, uniform: ShaderUniform, value: f32) {
         unsafe { gl.uniform_1_f32(self.loc(uniform), value) }
-    }
-
-    pub(crate) fn uniform1fv(&self, gl: &glow::Context, uniform: ShaderUniform, values: &[f32]) {
-        unsafe { gl.uniform_1_f32_slice(self.loc(uniform), values) }
     }
 
     pub(crate) fn uniform1i(&self, gl: &glow::Context, uniform: ShaderUniform, value: i32) {

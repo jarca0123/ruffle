@@ -167,9 +167,10 @@ fn write_param_value(
 const TEXTURE_VERTEX_GLSL: &str = include_str!("../shaders/texture.vert");
 const GRADIENT_FRAGMENT_GLSL: &str = include_str!("../shaders/gradient.frag");
 const BITMAP_FRAGMENT_GLSL: &str = include_str!("../shaders/bitmap.frag");
+const PERSPECTIVE_BITMAP_VERTEX_GLSL: &str = include_str!("../shaders/perspective_bitmap.vert");
+const PERSPECTIVE_BITMAP_FRAGMENT_GLSL: &str = include_str!("../shaders/perspective_bitmap.frag");
 
 const NUM_VERTEX_ATTRIBUTES: u32 = 2;
-const MAX_GRADIENT_COLORS: usize = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaskState {
@@ -192,6 +193,25 @@ struct Vertex {
 struct BitmapVertex {
     position: [f32; 2],
     uv: [f32; 2],
+}
+
+/// Vertex for perspective-correct textured triangles: shape-space position (px)
+/// plus `(u, v, t = 1/w)`. The vertex shader forms `(u*t, v*t, t)` and the fragment
+/// shader divides, giving perspective-correct sampling with no CPU subdivision.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct PerspectiveVertex {
+    position: [f32; 2],
+    uvt: [f32; 3],
+}
+
+impl From<ruffle_render::shape_utils::PerspectiveVertex> for PerspectiveVertex {
+    fn from(v: ruffle_render::shape_utils::PerspectiveVertex) -> Self {
+        Self {
+            position: [v.x, v.y],
+            uvt: [v.u, v.v, v.t],
+        }
+    }
 }
 
 /// State a run of batched bitmaps must share. A change flushes the batch.
@@ -229,9 +249,20 @@ pub struct GlRenderBackend {
     msaa_buffers: Option<MsaaBuffers>,
     msaa_sample_count: u32,
 
+    // When presenting to a real window (desktop), the MSAA-resolve present quad
+    // must flip vertically: the scene is drawn top-down (Flash-top at framebuffer
+    // row 0, so headless `read_framebuffer` needs no flip), but a window scans the
+    // default framebuffer with row 0 at the *bottom*, which would show the movie
+    // upside down. Headless capture leaves this false.
+    present_flip: bool,
+
     color_program: ShaderProgram,
     bitmap_program: ShaderProgram,
     gradient_program: ShaderProgram,
+    /// Shared 256x1 RGBA8 ramp texture, re-uploaded per gradient draw. Matches
+    /// wgpu, which bakes each gradient into a 256-texel texture and samples it
+    /// with hardware linear filtering (see `Gradient::ramp`).
+    gradient_texture: glow::Texture,
     batch_color_program: ShaderProgram,
     /// Raw texture passthrough used to seed offscreen MSAA buffers.
     copy_program: ShaderProgram,
@@ -256,9 +287,18 @@ pub struct GlRenderBackend {
     batch_bitmap_vao: glow::VertexArray,
     batch_bitmap_vbo: glow::Buffer,
     batch_bitmap_ibo: glow::Buffer,
+    // Perspective-correct textured triangles (Graphics.drawTriangles + 3-comp uvt).
+    perspective_bitmap_program: ShaderProgram,
+    perspective_uvt_location: Option<u32>,
     batch_bitmap_vertices: Vec<BitmapVertex>,
     batch_bitmap_indices: Vec<u32>,
     batch_bitmap_key: Option<BitmapBatchKey>,
+    // Keeps the current bitmap batch's texture alive until it flushes. The batch
+    // stores only the raw `glow::Texture` name (in the `Copy` key), so without
+    // holding the handle the caller could drop its last `BitmapHandle` before the
+    // flush, `RegistryData::drop` would delete the GL texture, and the flush would
+    // bind a freed name (GL_INVALID_OPERATION). One texture per pending batch.
+    batch_bitmap_handle: Option<BitmapHandle>,
     // Blend func (eq+factors) currently active for non-batched draws, and the one
     // the pending batch was filled under. A run of same-func draws (e.g. 500
     // Multiply puffs) accumulates into one draw; the batch is flushed under
@@ -610,6 +650,10 @@ impl GlRenderBackend {
         let gradient_program = ShaderProgram::new(&gl, texture_vertex, gradient_fragment)?;
         let copy_program = ShaderProgram::new(&gl, texture_vertex, copy_fragment)?;
 
+        // Shared ramp texture for gradient draws (data uploaded per draw).
+        let gradient_texture =
+            unsafe { gl.create_texture() }.map_err(Error::UnableToCreateTexture)?;
+
         let batch_color_vertex =
             shader::compile_shader(&gl, is_embedded, glow::VERTEX_SHADER, BATCH_COLOR_VERTEX_GLSL)?;
         let batch_color_fragment = shader::compile_shader(
@@ -673,6 +717,25 @@ impl GlRenderBackend {
             gl.bind_vertex_array(None);
         }
 
+        // Perspective-correct textured triangles: a dedicated vertex shader takes a
+        // per-vertex `(u, v, t)` attribute; the fragment shader does the divide.
+        let perspective_bitmap_vertex = shader::compile_shader(
+            &gl,
+            is_embedded,
+            glow::VERTEX_SHADER,
+            PERSPECTIVE_BITMAP_VERTEX_GLSL,
+        )?;
+        let perspective_bitmap_fragment = shader::compile_shader(
+            &gl,
+            is_embedded,
+            glow::FRAGMENT_SHADER,
+            PERSPECTIVE_BITMAP_FRAGMENT_GLSL,
+        )?;
+        let perspective_bitmap_program =
+            ShaderProgram::new(&gl, perspective_bitmap_vertex, perspective_bitmap_fragment)?;
+        let perspective_uvt_location =
+            unsafe { gl.get_attrib_location(perspective_bitmap_program.program, "uvt") };
+
         unsafe {
             gl.enable(glow::BLEND);
             // Initialise the blend func to Normal so it matches `active_hw_blend`
@@ -713,10 +776,14 @@ impl GlRenderBackend {
         let pb_vao = unsafe { gl.create_vertex_array() }.map_err(Error::UnableToCreateVAO)?;
         unsafe {
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(pb_quad_vbo));
-            let quad: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0];
+            // A single oversized triangle covering the [-1,1] viewport, rather
+            // than a two-triangle quad. A quad's internal (diagonal) edge leaves a
+            // faint seam in gl_FragCoord-derived math on some drivers; a single
+            // triangle has no internal edge, so PixelBender output is seam-free.
+            let tri: [f32; 6] = [-1.0, -1.0, 3.0, -1.0, -1.0, 3.0];
             gl.buffer_data_u8_slice(
                 glow::ARRAY_BUFFER,
-                bytemuck::cast_slice(&quad),
+                bytemuck::cast_slice(&tri),
                 glow::STATIC_DRAW,
             );
         }
@@ -729,9 +796,11 @@ impl GlRenderBackend {
 
             msaa_buffers: None,
             msaa_sample_count,
+            present_flip: false,
 
             color_program,
             gradient_program,
+            gradient_texture,
             bitmap_program,
             batch_color_program,
             copy_program,
@@ -743,12 +812,15 @@ impl GlRenderBackend {
             batch_vertices: Vec::new(),
             batch_indices: Vec::new(),
             batch_bitmap_program,
+            perspective_bitmap_program,
+            perspective_uvt_location,
             batch_bitmap_vao,
             batch_bitmap_vbo,
             batch_bitmap_ibo,
             batch_bitmap_vertices: Vec::new(),
             batch_bitmap_indices: Vec::new(),
             batch_bitmap_key: None,
+            batch_bitmap_handle: None,
             active_hw_blend: NORMAL_BLEND_KEY,
             batch_blend: NORMAL_BLEND_KEY,
 
@@ -897,18 +969,90 @@ impl GlRenderBackend {
         Ok(vec![draw])
     }
 
-    fn build_msaa_buffers(&mut self) -> Result<(), Error> {
-        if !self.caps.is_gles3_or_webgl2 || self.msaa_sample_count <= 1 {
+    fn build_msaa_buffers(&mut self) {
+        // These offscreen scene buffers serve two independent purposes:
+        //   1. Multisample resolve when the quality asks for MSAA (samples > 1).
+        //   2. Upright presentation to a real window (`present_flip`): the scene is
+        //      rendered top-down (Flash-top at framebuffer row 0), but a window
+        //      scans row 0 at the bottom, so the frame must be rendered offscreen
+        //      and blitted through the flipping present quad in `end_frame`.
+        // Purpose 2 means the present buffer must ALWAYS exist when `present_flip`
+        // is set — even with MSAA off, and even if a specific MSAA sample count is
+        // rejected by the driver — otherwise the movie renders straight to the
+        // backbuffer with no flip and shows upside-down (e.g. a game dropping to
+        // `stage.quality = "medium"` mid-play). So we fall back to single-sample.
+        let multisample = self.msaa_sample_count > 1;
+        let want_buffers = self.caps.is_gles3_or_webgl2 && (multisample || self.present_flip);
+        if !want_buffers {
+            // Drop any stale buffers so `end_frame`/`begin_frame` fall back to the
+            // default framebuffer (headless capture reads it directly, no flip).
+            self.msaa_buffers = None;
             unsafe {
                 self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 self.gl.bind_renderbuffer(glow::RENDERBUFFER, None);
             }
-            return Ok(());
+            return;
         }
 
-        // Delete previous buffers, if they exist (Drop deletes the GL objects).
+        // Drain any GL error left by earlier commands so the `check_error` calls in
+        // the build don't misattribute it and abort — which would drop the present
+        // buffer and flip the window. Report the first one: a stray error here means
+        // an earlier operation failed silently and is worth chasing down.
+        let mut stray = glow::NO_ERROR;
+        loop {
+            let e = unsafe { self.gl.get_error() };
+            if e == glow::NO_ERROR {
+                break;
+            }
+            if stray == glow::NO_ERROR {
+                stray = e;
+            }
+        }
+        if stray != glow::NO_ERROR {
+            log::warn!("GL: draining stray error 0x{stray:04x} before building scene buffers");
+        }
+
+        // Delete previous buffers first (Drop frees the GL objects).
         self.msaa_buffers = None;
 
+        // Try the requested sample count; if the driver rejects it (some accept
+        // only certain counts — e.g. 4 but not 2), fall back to a single-sample
+        // present buffer so the flip still works, just without antialiasing.
+        let samples = self.msaa_sample_count.max(1);
+        let built = match self.build_scene_buffers(samples) {
+            Ok(b) => Some(b),
+            Err(e) if samples > 1 => {
+                log::warn!(
+                    "GL: MSAA x{samples} scene buffer failed ({e:?}); using a single-sample present buffer"
+                );
+                while unsafe { self.gl.get_error() } != glow::NO_ERROR {}
+                match self.build_scene_buffers(1) {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        log::error!("GL: single-sample present buffer also failed: {e:?}");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("GL: failed to build scene buffers: {e:?}");
+                None
+            }
+        };
+        unsafe {
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            self.gl.bind_renderbuffer(glow::RENDERBUFFER, None);
+        }
+        self.msaa_buffers = built;
+    }
+
+    /// Builds the offscreen scene framebuffer set: a `render_framebuffer` the frame
+    /// is drawn into (multisample when `samples > 1`) plus a single-sample
+    /// `color_framebuffer`/`framebuffer_texture` that `end_frame` resolves into and
+    /// presents. `samples <= 1` builds a plain single-sample target — the resolve
+    /// blit then becomes a same-size copy, so `end_frame` works unchanged.
+    fn build_scene_buffers(&self, samples: u32) -> Result<MsaaBuffers, Error> {
+        let multisample = samples > 1;
         let gl = self.gl.clone();
         let buffers = unsafe {
             let render_framebuffer = gl
@@ -922,27 +1066,45 @@ impl GlRenderBackend {
                 .create_renderbuffer()
                 .map_err(Error::UnableToCreateRenderBuffer)?;
             gl.bind_renderbuffer(glow::RENDERBUFFER, Some(color_renderbuffer));
-            gl.renderbuffer_storage_multisample(
-                glow::RENDERBUFFER,
-                self.msaa_sample_count as i32,
-                glow::RGBA8,
-                self.renderbuffer_width,
-                self.renderbuffer_height,
-            );
-            check_error(&gl, "renderbuffer_storage_multisample (color)")?;
+            if multisample {
+                gl.renderbuffer_storage_multisample(
+                    glow::RENDERBUFFER,
+                    samples as i32,
+                    glow::RGBA8,
+                    self.renderbuffer_width,
+                    self.renderbuffer_height,
+                );
+            } else {
+                gl.renderbuffer_storage(
+                    glow::RENDERBUFFER,
+                    glow::RGBA8,
+                    self.renderbuffer_width,
+                    self.renderbuffer_height,
+                );
+            }
+            check_error(&gl, "renderbuffer_storage (color)")?;
 
             let stencil_renderbuffer = gl
                 .create_renderbuffer()
                 .map_err(Error::UnableToCreateRenderBuffer)?;
             gl.bind_renderbuffer(glow::RENDERBUFFER, Some(stencil_renderbuffer));
-            gl.renderbuffer_storage_multisample(
-                glow::RENDERBUFFER,
-                self.msaa_sample_count as i32,
-                glow::STENCIL_INDEX8,
-                self.renderbuffer_width,
-                self.renderbuffer_height,
-            );
-            check_error(&gl, "renderbuffer_storage_multisample (stencil)")?;
+            if multisample {
+                gl.renderbuffer_storage_multisample(
+                    glow::RENDERBUFFER,
+                    samples as i32,
+                    glow::STENCIL_INDEX8,
+                    self.renderbuffer_width,
+                    self.renderbuffer_height,
+                );
+            } else {
+                gl.renderbuffer_storage(
+                    glow::RENDERBUFFER,
+                    glow::STENCIL_INDEX8,
+                    self.renderbuffer_width,
+                    self.renderbuffer_height,
+                );
+            }
+            check_error(&gl, "renderbuffer_storage (stencil)")?;
 
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(render_framebuffer));
             gl.framebuffer_renderbuffer(
@@ -991,7 +1153,7 @@ impl GlRenderBackend {
                 glow::UNSIGNED_BYTE,
                 glow::PixelUnpackData::Slice(None),
             );
-            check_error(&gl, "tex_image_2d (msaa resolve texture)")?;
+            check_error(&gl, "tex_image_2d (scene resolve texture)")?;
             gl.bind_texture(glow::TEXTURE_2D, None);
 
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(color_framebuffer));
@@ -1014,8 +1176,7 @@ impl GlRenderBackend {
             }
         };
 
-        self.msaa_buffers = Some(buffers);
-        Ok(())
+        Ok(buffers)
     }
 
     fn register_shape_internal(
@@ -1032,6 +1193,65 @@ impl GlRenderBackend {
 
         let mut draws = Vec::with_capacity(lyon_mesh.draws.len());
         for draw in lyon_mesh.draws {
+            // Perspective triangles carry their per-vertex `(u, v, t)` in the draw
+            // type, not the lyon vertex buffer — build them with a stride-20 VBO
+            // (position + uvt) and draw non-indexed.
+            if matches!(draw.draw_type, TessDrawType::PerspectiveBitmap(_)) {
+                let TessDrawType::PerspectiveBitmap(pb) = draw.draw_type else {
+                    unreachable!()
+                };
+                let vertices: Vec<PerspectiveVertex> =
+                    pb.vertices.into_iter().map(PerspectiveVertex::from).collect();
+                let vertex_count = vertices.len() as i32;
+
+                let vao = self.create_vertex_array()?;
+                let vertex_buffer =
+                    unsafe { self.gl.create_buffer() }.map_err(Error::UnableToCreateBuffer)?;
+                let index_buffer =
+                    unsafe { self.gl.create_buffer() }.map_err(Error::UnableToCreateBuffer)?;
+                let program = &self.perspective_bitmap_program;
+                unsafe {
+                    self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertex_buffer));
+                    self.gl.buffer_data_u8_slice(
+                        glow::ARRAY_BUFFER,
+                        bytemuck::cast_slice(&vertices),
+                        glow::STATIC_DRAW,
+                    );
+                    if let Some(loc) = program.vertex_position_location {
+                        self.gl
+                            .vertex_attrib_pointer_f32(loc, 2, glow::FLOAT, false, 20, 0);
+                        self.gl.enable_vertex_attrib_array(loc);
+                    }
+                    if let Some(loc) = self.perspective_uvt_location {
+                        self.gl
+                            .vertex_attrib_pointer_f32(loc, 3, glow::FLOAT, false, 20, 8);
+                        self.gl.enable_vertex_attrib_array(loc);
+                    }
+                }
+                self.bind_vertex_array(None);
+                draws.push(Draw {
+                    draw_type: DrawType::PerspectiveBitmap(PerspectiveBitmapDraw {
+                        handle: bitmap_source.bitmap_handle(pb.bitmap_id, self),
+                        is_repeating: pb.is_repeating,
+                        is_smoothed: pb.is_smoothed,
+                    }),
+                    vao,
+                    vertex_buffer: Buffer {
+                        gl: self.gl.clone(),
+                        buffer: vertex_buffer,
+                    },
+                    index_buffer: Buffer {
+                        gl: self.gl.clone(),
+                        buffer: index_buffer,
+                    },
+                    // Vertex count for `draw_arrays`; masks omit it (0).
+                    num_indices: vertex_count,
+                    num_mask_indices: 0,
+                    color_cpu: None,
+                });
+                continue;
+            }
+
             let num_indices = draw.indices.len() as i32;
             let num_mask_indices = draw.mask_index_count as i32;
 
@@ -1047,6 +1267,7 @@ impl GlRenderBackend {
                 TessDrawType::Color => &self.color_program,
                 TessDrawType::Gradient { .. } => &self.gradient_program,
                 TessDrawType::Bitmap(_) => &self.bitmap_program,
+                TessDrawType::PerspectiveBitmap(_) => unreachable!("handled above"),
             };
 
             unsafe {
@@ -1135,6 +1356,7 @@ impl GlRenderBackend {
                     num_mask_indices,
                     color_cpu: None,
                 },
+                TessDrawType::PerspectiveBitmap(_) => unreachable!("handled above"),
             });
 
             self.bind_vertex_array(None);
@@ -1207,9 +1429,21 @@ impl GlRenderBackend {
         self.apply_hw_blend(key);
     }
 
+    /// When rendering to a real window (desktop), flips the final present quad
+    /// vertically so the top-down scene appears upright on-screen. Leave unset for
+    /// headless capture, which reads the framebuffer directly.
+    pub fn set_present_flipped(&mut self, flipped: bool) {
+        if self.present_flip != flipped {
+            self.present_flip = flipped;
+            // Presentation now needs (or no longer needs) an offscreen scene buffer
+            // to flip through — even with MSAA off — so (re)build accordingly.
+            self.build_msaa_buffers();
+        }
+    }
+
     /// Reads the default framebuffer back as top-down RGBA8 bytes (used by the
-    /// headless test harness to capture a rendered frame). GL is bottom-up, so
-    /// the rows are flipped.
+    /// headless test harness to capture a rendered frame). The scene is rendered
+    /// top-down, so glReadPixels row 0 is already Flash-top — no flip needed.
     pub fn read_framebuffer(&self) -> (u32, u32, Vec<u8>) {
         let w = self.renderbuffer_width.max(0) as u32;
         let h = self.renderbuffer_height.max(0) as u32;
@@ -1226,17 +1460,7 @@ impl GlRenderBackend {
                 glow::PixelPackData::Slice(Some(&mut pixels)),
             );
         }
-        // Flip vertically: GL row 0 is the bottom, images are top-down.
-        let stride = (w * 4) as usize;
-        if stride > 0 {
-            let mut flipped = vec![0u8; pixels.len()];
-            for y in 0..h as usize {
-                let src = y * stride;
-                let dst = (h as usize - 1 - y) * stride;
-                flipped[dst..dst + stride].copy_from_slice(&pixels[src..src + stride]);
-            }
-            pixels = flipped;
-        }
+        // Top-down render: glReadPixels row 0 is already Flash-top, no flip.
         (w, h, pixels)
     }
 
@@ -1377,11 +1601,17 @@ impl GlRenderBackend {
             );
             program.uniform4fv(&self.gl, ShaderUniform::MultColor, &[1.0, 1.0, 1.0, 1.0]);
             program.uniform4fv(&self.gl, ShaderUniform::AddColor, &[0.0, 0.0, 0.0, 0.0]);
-            program.uniform_matrix3fv(
-                &self.gl,
-                ShaderUniform::TextureMatrix,
-                &[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            );
+            // The scene is rendered top-down (Flash-top at framebuffer row 0), and
+            // the resolve texture inherits that (texel row 0 = Flash-top). Headless
+            // capture reads the framebuffer directly, so present straight (keep
+            // Flash-top at row 0). A real window scans row 0 at the bottom, so flip
+            // V there to present the movie upright (`present_flip`).
+            let texture_matrix = if self.present_flip {
+                [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 1.0, 1.0]]
+            } else {
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+            };
+            program.uniform_matrix3fv(&self.gl, ShaderUniform::TextureMatrix, &texture_matrix);
 
             // Bind the framebuffer texture.
             self.gl.active_texture(glow::TEXTURE0);
@@ -1460,6 +1690,7 @@ impl GlRenderBackend {
         let Some(key) = self.batch_bitmap_key else {
             self.batch_bitmap_vertices.clear();
             self.batch_bitmap_indices.clear();
+            self.batch_bitmap_handle = None;
             return;
         };
         self.apply_hw_blend(self.batch_blend);
@@ -1508,6 +1739,8 @@ impl GlRenderBackend {
         self.batch_bitmap_vertices.clear();
         self.batch_bitmap_indices.clear();
         self.batch_bitmap_key = None;
+        // The texture has been bound and drawn; the handle can be released now.
+        self.batch_bitmap_handle = None;
         self.active_program = std::ptr::null();
         self.mult_color = None;
         self.add_color = None;
@@ -1515,7 +1748,7 @@ impl GlRenderBackend {
 
     /// Appends a bitmap quad to the bitmap batch, flushing first if the colour
     /// batch is pending (draw order) or the batch key changes.
-    fn append_bitmap_draw(&mut self, key: BitmapBatchKey, matrix: Matrix) {
+    fn append_bitmap_draw(&mut self, key: BitmapBatchKey, matrix: Matrix, handle: BitmapHandle) {
         self.flush_color_batch();
         if !self.batch_bitmap_indices.is_empty()
             && (self.batch_bitmap_key != Some(key) || self.batch_blend != self.active_hw_blend)
@@ -1524,6 +1757,9 @@ impl GlRenderBackend {
         }
         self.batch_blend = self.active_hw_blend;
         self.batch_bitmap_key = Some(key);
+        // Hold the handle for this batch's texture (same texture for the whole
+        // pending batch, so one handle suffices) until it flushes.
+        self.batch_bitmap_handle = Some(handle);
 
         // The bitmap quad is [0,1]² with an identity texture matrix, so UV equals
         // the corner. Transform each corner by the world matrix on the CPU.
@@ -2475,8 +2711,9 @@ impl GlRenderBackend {
     /// Region-sized PixelBender-shader blend: isolates the group into a foreground
     /// texture, copies the framebuffer region as the background, runs the shader
     /// (input 0 = background, input 1 = foreground — matching wgpu) in Filter mode,
-    /// and replaces the region with its output. On-screen targets only; a nested
-    /// pass falls back to a plain draw.
+    /// and replaces the region with its output. Works in any target — screen, a
+    /// `Layer`, or an MSAA/single-sample offscreen pass — by reading the backdrop
+    /// from whichever is bound (see `draw_complex_blend`).
     fn draw_shader_blend(
         &mut self,
         commands: CommandList,
@@ -2509,17 +2746,64 @@ impl GlRenderBackend {
         let saved_mask = self.mask_state;
         let saved_num_masks = self.num_masks;
         let (ox, oy) = self.target_origin;
-        let view = region_view_matrix((rx + ox) as f32, (ry + oy) as f32, rw as f32, rh as f32);
+        // Match the target's Y orientation (see `draw_complex_blend`): a top-down
+        // on-screen framebuffer maps stage Y straight to the framebuffer row.
+        let flipped = self.view_matrix[1][1] < 0.0;
+        let view = if flipped {
+            region_view_matrix((rx + ox) as f32, (ry + oy) as f32, rw as f32, rh as f32)
+        } else {
+            region_view_matrix_unflipped((rx + ox) as f32, (ry + oy) as f32, rw as f32, rh as f32)
+        };
         let transparent = Color { r: 0, g: 0, b: 0, a: 0 };
         self.render_commands_to_texture(src_tex, rw, rh, Some(transparent), view, true, commands);
         self.mask_state = saved_mask;
         self.num_masks = saved_num_masks;
 
-        // Background: copy the framebuffer region into `dst_tex`.
-        let ry_fb = self.renderbuffer_height - (ry + rh);
+        // Background: copy the target region into `dst_tex`. The source depends on
+        // the current target — screen, an enclosing `Layer`, or an MSAA/
+        // single-sample offscreen pass (cacheAsBitmap, BitmapData.draw). Mirror
+        // `draw_complex_blend` so a shader blend works in every target, not just
+        // on-screen.
+        let ry_fb = if flipped {
+            self.renderbuffer_height - (ry + rh)
+        } else {
+            ry
+        };
         let gl = self.gl.clone();
+        let target_fbo = self.target_fbo;
         unsafe {
-            if let Some(msaa) = &self.msaa_buffers {
+            if let Some(layer) = target_fbo {
+                // A `Layer` offscreen is single-sample: copy its region directly.
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(layer));
+                gl.bind_texture(glow::TEXTURE_2D, Some(dst_tex));
+                gl.copy_tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, rx, ry_fb, rw, rh);
+            } else if self.in_offscreen && self.offscreen_msaa {
+                // Nested inside an MSAA offscreen pass: resolve the multisampled
+                // parent region, then copy it down to the region texture's origin.
+                gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.blend_msaa_fbo));
+                gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.blend_msaa_resolve_fbo));
+                gl.blit_framebuffer(
+                    rx, ry_fb, rx + rw, ry_fb + rh, rx, ry_fb, rx + rw, ry_fb + rh,
+                    glow::COLOR_BUFFER_BIT, glow::NEAREST,
+                );
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.blend_msaa_resolve_fbo));
+                gl.bind_texture(glow::TEXTURE_2D, Some(dst_tex));
+                gl.copy_tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, rx, ry_fb, rw, rh);
+            } else if let Some(off_tex) = self.offscreen_color {
+                // Nested inside a single-sample offscreen pass: the parent lives in
+                // the offscreen texture. The `src` render re-attached the shared FBO
+                // to its own texture, so re-attach the parent first.
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.offscreen_fbo));
+                gl.framebuffer_texture_2d(
+                    glow::FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(off_tex),
+                    0,
+                );
+                gl.bind_texture(glow::TEXTURE_2D, Some(dst_tex));
+                gl.copy_tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, rx, ry_fb, rw, rh);
+            } else if let Some(msaa) = &self.msaa_buffers {
                 gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(msaa.render_framebuffer));
                 gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(msaa.color_framebuffer));
                 gl.blit_framebuffer(
@@ -2553,9 +2837,18 @@ impl GlRenderBackend {
             &int_data,
         );
 
-        // Replace the region with the shader's output.
+        // Replace the region with the shader's output. Re-bind the draw target the
+        // same way the background was read (screen, `Layer`, or offscreen).
         unsafe {
-            if let Some(msaa) = &self.msaa_buffers {
+            if let Some(layer) = target_fbo {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(layer));
+            } else if self.in_offscreen && self.offscreen_msaa {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.blend_msaa_fbo));
+            } else if self.offscreen_color.is_some() {
+                // Already re-attached to the parent (offscreen) texture above; the
+                // shader draw used `scratch_fbo`, so `offscreen_fbo` still holds it.
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.offscreen_fbo));
+            } else if let Some(msaa) = &self.msaa_buffers {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(msaa.render_framebuffer));
             } else {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -2753,10 +3046,14 @@ impl GlRenderBackend {
         // Bound to the first image input (the filter source); overrides its arg.
         source_override: Option<(glow::Texture, f32, f32)>,
     ) {
+        let gl = self.gl.clone();
         let mut float_data = vec![0.0f32; pb.float_slots * 4];
         let mut int_data = vec![0i32; pb.int_slots * 4];
         // (input index, texture, width, height)
         let mut tex_bindings: Vec<(u8, glow::Texture, f32, f32)> = Vec::new();
+        // Temporary float-input textures (from `Vector.<Number>` ShaderJob inputs);
+        // deleted after the draw.
+        let mut temp_textures: Vec<glow::Texture> = Vec::new();
         let mut source_used = source_override.is_none();
         for arg in arguments {
             match arg {
@@ -2768,6 +3065,44 @@ impl GlRenderBackend {
                     } else if let Some(ImageInputTexture::Bitmap(h)) = texture.as_ref() {
                         let r = as_registry_data(h);
                         tex_bindings.push((*index, r.texture, r.width as f32, r.height as f32));
+                    } else if let Some(ImageInputTexture::Floats {
+                        width,
+                        height,
+                        data,
+                    }) = texture.as_ref()
+                    {
+                        // A `Vector.<Number>` image input (e.g. the shallow-water
+                        // fluid simulation's ping-pong buffers). Upload the floats
+                        // as an RGBA32F texture. The shader only reads the channels
+                        // it was compiled for, so padding 1/2-channel data to RGBA
+                        // is harmless and keeps a single (widely-supported) format.
+                        let padded = data.padded_data();
+                        let rgba: Vec<f32> = match data.channel_count() {
+                            1 => padded.iter().flat_map(|&r| [r, 0.0, 0.0, 0.0]).collect(),
+                            2 => padded
+                                .chunks_exact(2)
+                                .flat_map(|c| [c[0], c[1], 0.0, 0.0])
+                                .collect(),
+                            _ => padded.into_owned(), // Rgb is padded to Rgba, Rgba as-is
+                        };
+                        if let Ok(t) = unsafe { gl.create_texture() } {
+                            unsafe {
+                                gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                                gl.tex_image_2d(
+                                    glow::TEXTURE_2D,
+                                    0,
+                                    glow::RGBA32F as i32,
+                                    *width as i32,
+                                    *height as i32,
+                                    0,
+                                    glow::RGBA,
+                                    glow::FLOAT,
+                                    glow::PixelUnpackData::Slice(Some(bytemuck::cast_slice(&rgba))),
+                                );
+                            }
+                            temp_textures.push(t);
+                            tex_bindings.push((*index, t, *width as f32, *height as f32));
+                        }
                     }
                 }
                 PixelBenderShaderArgument::ValueInput { index, value } => {
@@ -2788,6 +3123,10 @@ impl GlRenderBackend {
             &float_data,
             &int_data,
         );
+
+        for t in temp_textures {
+            unsafe { gl.delete_texture(t) };
+        }
     }
 
     /// Binds a compiled PixelBender shader's params and image inputs (in the given
@@ -2866,7 +3205,7 @@ impl GlRenderBackend {
                 gl.vertex_attrib_pointer_f32(loc, 2, glow::FLOAT, false, 8, 0);
                 gl.enable_vertex_attrib_array(loc);
             }
-            gl.draw_arrays(glow::TRIANGLE_FAN, 0, 4);
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
 
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             gl.bind_vertex_array(None);
@@ -2932,7 +3271,8 @@ impl GlRenderBackend {
         self.target_fbo = Some(self.layer_fbo);
         self.target_texture = Some(layer_tex);
         self.target_origin = (stage_rx, stage_ry);
-        self.view_matrix = region_view_matrix(stage_rx as f32, stage_ry as f32, rw as f32, rh as f32);
+        self.view_matrix =
+            region_view_matrix_unflipped(stage_rx as f32, stage_ry as f32, rw as f32, rh as f32);
         self.renderbuffer_width = rw;
         self.renderbuffer_height = rh;
         self.mask_state = MaskState::NoMask;
@@ -2970,7 +3310,7 @@ impl GlRenderBackend {
         self.add_color = None;
 
         // Composite the layer over the parent target, restricted to the region.
-        let ry_fb = saved_h - (ry + rh);
+        let ry_fb = ry; // top-down
         unsafe {
             if let Some(p) = saved_target_fbo {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(p));
@@ -3262,6 +3602,7 @@ impl Drop for GlRenderBackend {
             self.gl.delete_program(self.color_program.program);
             self.gl.delete_program(self.bitmap_program.program);
             self.gl.delete_program(self.gradient_program.program);
+            self.gl.delete_texture(self.gradient_texture);
             self.gl.delete_program(self.batch_color_program.program);
             self.gl.delete_program(self.batch_bitmap_program.program);
             self.gl.delete_program(self.copy_program.program);
@@ -3327,6 +3668,10 @@ impl RenderBackend for GlRenderBackend {
     }
 
     fn is_offscreen_supported(&self) -> bool {
+        true
+    }
+
+    fn supports_perspective_triangles(&self) -> bool {
         true
     }
 
@@ -3787,12 +4132,13 @@ impl RenderBackend for GlRenderBackend {
     }
 
     fn set_viewport_dimensions(&mut self, dimensions: ViewportDimensions) {
-        // Build view matrix based on canvas size.
+        // Build view matrix based on canvas size. Top-down (Flash-top -> row 0)
+        // so the GPU top-left fill rule matches wgpu; the present flips it back.
         self.view_matrix = [
             [1.0 / (dimensions.width as f32 / 2.0), 0.0, 0.0, 0.0],
-            [0.0, -1.0 / (dimensions.height as f32 / 2.0), 0.0, 0.0],
+            [0.0, 1.0 / (dimensions.height as f32 / 2.0), 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
-            [-1.0, 1.0, 0.0, 1.0],
+            [-1.0, -1.0, 0.0, 1.0],
         ];
 
         // On the web, clamp to the actual drawing-buffer size (which reads zero
@@ -3811,7 +4157,7 @@ impl RenderBackend for GlRenderBackend {
         }
 
         // Recreate framebuffers with the new size.
-        let _ = self.build_msaa_buffers();
+        self.build_msaa_buffers();
         unsafe {
             self.gl
                 .viewport(0, 0, self.renderbuffer_width, self.renderbuffer_height);
@@ -4022,8 +4368,9 @@ impl RenderBackend for GlRenderBackend {
         let samples = context::recommended_msaa_samples(&self.caps, quality);
         if samples != self.msaa_sample_count {
             self.msaa_sample_count = samples;
-            // Rebuild MSAA buffers at the new sample count (no-op on WebGL1/GLES2).
-            let _ = self.build_msaa_buffers();
+            // Rebuild the scene buffers at the new sample count (no-op on
+            // WebGL1/GLES2). Also refreshes the present buffer for `present_flip`.
+            self.build_msaa_buffers();
         }
     }
 
@@ -4312,7 +4659,8 @@ impl CommandHandler for GlRenderBackend {
 
         // Apply the current mask state now so it's bound when the batch flushes.
         self.set_stencil_state();
-        self.append_bitmap_draw(key, matrix);
+        // Move the handle in so the batch keeps the GL texture alive until flush.
+        self.append_bitmap_draw(key, matrix, bitmap);
     }
 
     fn render_shape(&mut self, shape: ShapeHandle, transform: Transform) {
@@ -4370,6 +4718,7 @@ impl CommandHandler for GlRenderBackend {
                 DrawType::Color => &self.color_program,
                 DrawType::Gradient(_) => &self.gradient_program,
                 DrawType::Bitmap { .. } => &self.bitmap_program,
+                DrawType::PerspectiveBitmap { .. } => &self.perspective_bitmap_program,
             };
 
             if !std::ptr::eq(program, self.active_program) {
@@ -4406,12 +4755,6 @@ impl CommandHandler for GlRenderBackend {
                         ShaderUniform::GradientType,
                         gradient.gradient_type,
                     );
-                    program.uniform1fv(&self.gl, ShaderUniform::GradientRatios, &gradient.ratios);
-                    program.uniform4fv(
-                        &self.gl,
-                        ShaderUniform::GradientColors,
-                        bytemuck::cast_slice(&gradient.colors),
-                    );
                     program.uniform1i(
                         &self.gl,
                         ShaderUniform::GradientRepeatMode,
@@ -4427,6 +4770,48 @@ impl CommandHandler for GlRenderBackend {
                         ShaderUniform::GradientInterpolation,
                         (gradient.interpolation == swf::GradientInterpolation::LinearRgb) as i32,
                     );
+
+                    // Upload the baked ramp into the shared 256x1 texture and
+                    // bind it (unit 0). Sampled with linear filtering + clamp;
+                    // repeat/reflect is folded into `t` in the shader, so the
+                    // wrap mode is always clamp (WebGL1-safe, no NPOT concern).
+                    unsafe {
+                        self.gl.active_texture(glow::TEXTURE0);
+                        self.gl
+                            .bind_texture(glow::TEXTURE_2D, Some(self.gradient_texture));
+                        self.gl.tex_image_2d(
+                            glow::TEXTURE_2D,
+                            0,
+                            glow::RGBA as i32,
+                            GRADIENT_SIZE as i32,
+                            1,
+                            0,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelUnpackData::Slice(Some(&gradient.ramp[..])),
+                        );
+                        self.gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_MAG_FILTER,
+                            glow::LINEAR as i32,
+                        );
+                        self.gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_MIN_FILTER,
+                            glow::LINEAR as i32,
+                        );
+                        self.gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_WRAP_S,
+                            glow::CLAMP_TO_EDGE as i32,
+                        );
+                        self.gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_WRAP_T,
+                            glow::CLAMP_TO_EDGE as i32,
+                        );
+                        program.uniform1i(&self.gl, ShaderUniform::BitmapTexture, 0);
+                    }
                 }
                 DrawType::Bitmap(bitmap) => {
                     let texture = match &bitmap.handle {
@@ -4477,31 +4862,126 @@ impl CommandHandler for GlRenderBackend {
                             .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, wrap);
                     }
                 }
+                DrawType::PerspectiveBitmap(bitmap) => {
+                    let texture = match &bitmap.handle {
+                        Some(handle) => as_registry_data(handle).texture,
+                        None => {
+                            log::warn!("Tried to render a handleless perspective bitmap");
+                            continue;
+                        }
+                    };
+                    unsafe {
+                        self.gl.active_texture(glow::TEXTURE0);
+                        self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                        program.uniform1i(&self.gl, ShaderUniform::BitmapTexture, 0);
+                        let filter = if bitmap.is_smoothed {
+                            glow::LINEAR as i32
+                        } else {
+                            glow::NEAREST as i32
+                        };
+                        self.gl
+                            .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
+                        self.gl
+                            .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
+                        // NPOT + REPEAT is invalid on WebGL1/GLES2 (falls back to clamp).
+                        let wrap = if self.caps.supports_npot_repeat && bitmap.is_repeating {
+                            glow::REPEAT as i32
+                        } else {
+                            glow::CLAMP_TO_EDGE as i32
+                        };
+                        self.gl
+                            .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, wrap);
+                        self.gl
+                            .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, wrap);
+                    }
+                }
             }
 
-            // Draw the triangles.
+            // Draw the triangles. Perspective meshes are non-indexed (`num_indices`
+            // holds the vertex count); all other draws are indexed.
             unsafe {
-                self.gl
-                    .draw_elements(glow::TRIANGLES, num_indices, glow::UNSIGNED_INT, 0);
+                if let DrawType::PerspectiveBitmap(_) = &draw.draw_type {
+                    self.gl.draw_arrays(glow::TRIANGLES, 0, num_indices);
+                } else {
+                    self.gl
+                        .draw_elements(glow::TRIANGLES, num_indices, glow::UNSIGNED_INT, 0);
+                }
             }
         }
     }
 
     fn render_stage3d(&mut self, bitmap: BitmapHandle, transform: Transform) {
-        // The Stage3D back buffer is an ordinary registered texture; composite it
-        // onto the stage like a bitmap. (Context3D renders into it bottom-up, so
-        // the draw pipeline is responsible for presenting it Flash-top-down.)
-        let entry = as_registry_data(&bitmap);
-        let texture = entry.texture;
-        let matrix = transform.matrix * Matrix::scale(entry.width as f32, entry.height as f32);
-        let key = BitmapBatchKey {
-            texture,
-            smoothing: false,
-            mult: transform.color_transform.mult_rgba_normalized(),
-            add: transform.color_transform.add_rgba_normalized(),
+        // Present the Stage3D back buffer as an OPAQUE layer, matching Flash and
+        // wgpu's `bitmap_opaque` present: replace the stage's RGB with the back
+        // buffer's straight colour (raw passthrough — no alpha-over blend and no
+        // premultiply round-trip) and leave the stage's alpha untouched. The back
+        // buffer can be semi-transparent (e.g. vertex colours with alpha < 1); it
+        // is the bottom-most layer and must not blend with anything behind it, so
+        // a normal alpha-over composite would wash it out against the stage.
+        let (texture, width, height) = {
+            let entry = as_registry_data(&bitmap);
+            (entry.texture, entry.width as f32, entry.height as f32)
         };
+        let matrix = transform.matrix * Matrix::scale(width, height);
+
+        self.flush_batch();
         self.set_stencil_state();
-        self.append_bitmap_draw(key, matrix);
+
+        let world_matrix = [
+            [matrix.a, matrix.b, 0.0, 0.0],
+            [matrix.c, matrix.d, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [
+                matrix.tx.to_pixels() as f32,
+                matrix.ty.to_pixels() as f32,
+                0.0,
+                1.0,
+            ],
+        ];
+
+        // Raw passthrough (copy) program: no un-premultiply/re-premultiply, so a
+        // straight colour with rgb > a survives intact (the bitmap program would
+        // clamp it early and darken it).
+        let program = &self.copy_program;
+        let gl = self.gl.clone();
+        unsafe {
+            gl.use_program(Some(program.program));
+            gl.disable(glow::BLEND);
+            // Write RGB only, leaving the stage opaque (the back-buffer alpha must
+            // not make the layer transparent).
+            gl.color_mask(true, true, true, false);
+        }
+        program.uniform_matrix4fv(&self.gl, ShaderUniform::WorldMatrix, &world_matrix);
+        program.uniform_matrix4fv(&self.gl, ShaderUniform::ViewMatrix, &self.view_matrix);
+        program.uniform_matrix3fv(
+            &self.gl,
+            ShaderUniform::TextureMatrix,
+            &[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        );
+        unsafe {
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            // 1:1 present: sample the back buffer texel-for-texel (no filtering),
+            // otherwise stale sampler state can blur the copy.
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+            program.uniform1i(&self.gl, ShaderUniform::BitmapTexture, 0);
+            let quad = &self.bitmap_quad_draws;
+            self.bind_vertex_array(Some(quad[0].vao));
+            gl.bind_buffer(
+                glow::ELEMENT_ARRAY_BUFFER,
+                Some(quad[0].index_buffer.buffer),
+            );
+            gl.draw_elements(
+                glow::TRIANGLE_FAN,
+                quad[0].num_indices,
+                glow::UNSIGNED_INT,
+                0,
+            );
+            gl.color_mask(true, true, true, true);
+            gl.enable(glow::BLEND);
+        }
+        self.active_program = std::ptr::null();
     }
 
     fn draw_rect(&mut self, color: Color, matrix: Matrix) {
@@ -4574,7 +5054,17 @@ impl CommandHandler for GlRenderBackend {
         // once — drawing each child with the blend func instead composites them
         // against each other, which is wrong for overlapping content. Single-draw
         // groups keep the batchable path (e.g. hundreds of Multiply puffs).
-        if is_hw_blend(&blend, minmax_ok) && blend_group_is_single_draw(&commands) {
+        //
+        // Multiply is the exception when compositing onto a possibly-transparent
+        // target — any offscreen pass (BitmapData.draw, cacheAsBitmap, a Layer).
+        // Its fixed-function form yields nothing where an operand is transparent,
+        // but Flash multiplies the un-premultiplied colors, so there it must go
+        // through the complex blend shader (matching wgpu). On the opaque stage
+        // the fast path is exact, so keep it there.
+        let hw_blend = is_hw_blend(&blend, minmax_ok)
+            && !(self.in_offscreen
+                && matches!(blend, RenderBlendMode::Builtin(BlendMode::Multiply)));
+        if hw_blend && blend_group_is_single_draw(&commands) {
             self.push_blend_mode(blend);
             commands.execute(self);
             self.pop_blend_mode();
@@ -4592,13 +5082,17 @@ impl CommandHandler for GlRenderBackend {
             // Clone the handle's Arc so the borrow of the compiled shader is tied to
             // this local, leaving `self` free to mutate during the draw.
             let arc = handle.0.clone();
-            if !self.in_offscreen {
-                if let Some(pb) = <dyn Any>::downcast_ref::<GlPixelBenderShader>(&*arc) {
-                    if let Some((rx, ry, rw, rh)) = self.blend_region(&commands) {
-                        self.draw_shader_blend(commands, pb, rx, ry, rw, rh);
-                        return;
-                    }
-                }
+            // Runs on the screen, or inside an MSAA/single-sample offscreen pass
+            // (cacheAsBitmap, BitmapData.draw) where `draw_shader_blend` reads the
+            // parent region back — same gate as the complex-blend path below. A
+            // plain single-sample offscreen with no readable parent falls back to
+            // Normal.
+            if (!self.in_offscreen || self.offscreen_msaa || self.offscreen_color.is_some())
+                && let Some(pb) = <dyn Any>::downcast_ref::<GlPixelBenderShader>(&*arc)
+                && let Some((rx, ry, rw, rh)) = self.blend_region(&commands)
+            {
+                self.draw_shader_blend(commands, pb, rx, ry, rw, rh);
+                return;
             }
             self.push_blend_mode(RenderBlendMode::Builtin(BlendMode::Normal));
             commands.execute(self);
@@ -4675,12 +5169,19 @@ impl CommandHandler for GlRenderBackend {
     }
 }
 
+/// Number of texels in a baked gradient ramp. Must match wgpu's `GRADIENT_SIZE`
+/// so both backends quantize gradients identically.
+const GRADIENT_SIZE: usize = 256;
+
 #[derive(Clone)]
 struct Gradient {
     matrix: [[f32; 3]; 3],
     gradient_type: i32,
-    ratios: [f32; MAX_GRADIENT_COLORS],
-    colors: [[f32; 4]; MAX_GRADIENT_COLORS],
+    /// Baked `GRADIENT_SIZE`-texel RGBA8 ramp, uploaded to the shared ramp
+    /// texture and sampled with hardware linear filtering. Built with the exact
+    /// per-texel lerp + `as u8` quantization wgpu uses so the two backends are
+    /// bit-identical.
+    ramp: [u8; GRADIENT_SIZE * 4],
     repeat_mode: i32,
     focal_point: f32,
     interpolation: swf::GradientInterpolation,
@@ -4688,32 +5189,61 @@ struct Gradient {
 
 impl Gradient {
     fn new(gradient: TessGradient, matrix: [[f32; 3]; 3]) -> Self {
-        // TODO: Support more than MAX_GRADIENT_COLORS.
-        let num_colors = gradient.records.len().min(MAX_GRADIENT_COLORS);
-        let mut ratios = [0.0; MAX_GRADIENT_COLORS];
-        let mut colors = [[0.0; 4]; MAX_GRADIENT_COLORS];
-        for i in 0..num_colors {
-            let record = &gradient.records[i];
-            let mut color = [
-                f32::from(record.color.r) / 255.0,
-                f32::from(record.color.g) / 255.0,
-                f32::from(record.color.b) / 255.0,
-                f32::from(record.color.a) / 255.0,
-            ];
-            // Convert to linear color space if this is a linear-interpolated gradient.
-            match gradient.interpolation {
-                swf::GradientInterpolation::Rgb => {}
-                swf::GradientInterpolation::LinearRgb => srgb_to_linear(&mut color),
+        let ramp = if gradient.records.is_empty() {
+            [0u8; GRADIENT_SIZE * 4]
+        } else {
+            let mut ramp = [0u8; GRADIENT_SIZE * 4];
+            // sRGB->linear on a 0-255 channel value, matching wgpu's `convert`.
+            let convert = |c: f32| -> f32 {
+                match gradient.interpolation {
+                    swf::GradientInterpolation::Rgb => c,
+                    swf::GradientInterpolation::LinearRgb => srgb_to_linear_scalar(c / 255.0) * 255.0,
+                }
+            };
+            let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+
+            let mut last = 0;
+            for t in 0..GRADIENT_SIZE {
+                if last + 1 < gradient.records.len()
+                    && t > gradient.records[last + 1].ratio as usize
+                {
+                    last += 1;
+                }
+                let next = (last + 1).min(gradient.records.len() - 1);
+
+                let last_record = &gradient.records[last];
+                let next_record = &gradient.records[next];
+
+                let a = if t <= last_record.ratio as usize || last_record.ratio == next_record.ratio
+                {
+                    0.0
+                } else if t > next_record.ratio as usize {
+                    1.0
+                } else {
+                    (t as f32 - last_record.ratio as f32)
+                        / (next_record.ratio as f32 - last_record.ratio as f32)
+                };
+
+                ramp[t * 4] = lerp(
+                    convert(last_record.color.r as f32),
+                    convert(next_record.color.r as f32),
+                    a,
+                ) as u8;
+                ramp[t * 4 + 1] = lerp(
+                    convert(last_record.color.g as f32),
+                    convert(next_record.color.g as f32),
+                    a,
+                ) as u8;
+                ramp[t * 4 + 2] = lerp(
+                    convert(last_record.color.b as f32),
+                    convert(next_record.color.b as f32),
+                    a,
+                ) as u8;
+                ramp[t * 4 + 3] =
+                    lerp(last_record.color.a as f32, next_record.color.a as f32, a) as u8;
             }
-
-            colors[i] = color;
-            ratios[i] = f32::from(record.ratio) / 255.0;
-        }
-
-        for i in num_colors..MAX_GRADIENT_COLORS {
-            ratios[i] = ratios[i - 1];
-            colors[i] = colors[i - 1];
-        }
+            ramp
+        };
 
         Self {
             matrix,
@@ -4722,8 +5252,7 @@ impl Gradient {
                 GradientType::Radial => 1,
                 GradientType::Focal => 2,
             },
-            ratios,
-            colors,
+            ramp,
             repeat_mode: match gradient.repeat_mode {
                 swf::GradientSpread::Pad => 0,
                 swf::GradientSpread::Repeat => 1,
@@ -4738,6 +5267,15 @@ impl Gradient {
 #[derive(Clone)]
 struct BitmapDraw {
     matrix: [[f32; 3]; 3],
+    handle: Option<BitmapHandle>,
+    is_repeating: bool,
+    is_smoothed: bool,
+}
+
+/// Draw state for a perspective textured-triangle mesh — the per-vertex `(u, v, t)`
+/// lives in the VBO, so only the texture + sampler state is needed here.
+#[derive(Clone)]
+struct PerspectiveBitmapDraw {
     handle: Option<BitmapHandle>,
     is_repeating: bool,
     is_smoothed: bool,
@@ -4808,6 +5346,9 @@ enum DrawType {
     Color,
     Gradient(Box<Gradient>),
     Bitmap(BitmapDraw),
+    /// Perspective-correct textured triangles: `num_indices` is the vertex count
+    /// (drawn non-indexed via `draw_arrays`), the VBO holds `PerspectiveVertex`es.
+    PerspectiveBitmap(PerspectiveBitmapDraw),
 }
 
 struct MsaaBuffers {
@@ -4892,13 +5433,12 @@ impl GlSyncHandle {
     }
 }
 
-/// Converts an RGBA color from sRGB space to linear color space.
-fn srgb_to_linear(color: &mut [f32; 4]) {
-    for n in &mut color[..3] {
-        *n = if *n <= 0.04045 {
-            *n / 12.92
-        } else {
-            f32::powf((*n + 0.055) / 1.055, 2.4)
-        };
+/// Converts a single sRGB channel value (0-1) to linear. Matches wgpu's
+/// `srgb_to_linear` so baked gradient ramps quantize identically.
+fn srgb_to_linear_scalar(color: f32) -> f32 {
+    if color <= 0.04045 {
+        color / 12.92
+    } else {
+        f32::powf((color + 0.055) / 1.055, 2.4)
     }
 }

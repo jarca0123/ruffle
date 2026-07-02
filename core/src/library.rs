@@ -171,8 +171,18 @@ impl<'gc> MovieLibrary<'gc> {
         let obj = match character {
             Character::Bitmap(bitmap) => {
                 let avm2_class = bitmap.avm2_class();
-                let bitmap = bitmap.compressed().decode().unwrap();
-                let bitmap = Bitmap::new(mc, id, bitmap, movie);
+                // Share the symbol's decoded pixels (copy-on-write) across every
+                // placed instance rather than decoding a private copy each time.
+                let (pixels, transparency) = bitmap.shared_pixels().unwrap();
+                let size = bitmap.compressed().size();
+                let bitmap_data = crate::bitmap::bitmap_data::BitmapData::new_with_shared_pixels(
+                    mc,
+                    size.width,
+                    size.height,
+                    transparency,
+                    pixels,
+                );
+                let bitmap = Bitmap::new_with_bitmap_data(mc, id, bitmap_data, true, movie);
                 bitmap.set_avm2_bitmapdata_class(mc, avm2_class);
                 Some(bitmap.instantiate(mc))
             }

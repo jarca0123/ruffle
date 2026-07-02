@@ -56,6 +56,30 @@ impl ShapeTessellator {
         self.lyon_mesh = VertexBuffers::new();
 
         for path in shape.paths {
+            // Raw perspective triangles bypass lyon: flush any pending geometry
+            // (preserving draw order) and push a dedicated draw the backend fills.
+            if let DrawPath::PerspectiveBitmap {
+                bitmap_id,
+                is_smoothed,
+                is_repeating,
+                vertices,
+            } = path
+            {
+                self.flush_draw(DrawType::Color);
+                self.mesh.push(Draw {
+                    draw_type: DrawType::PerspectiveBitmap(PerspectiveBitmap {
+                        bitmap_id,
+                        is_smoothed,
+                        is_repeating,
+                        vertices,
+                    }),
+                    vertices: Vec::new(),
+                    indices: Vec::new(),
+                    mask_index_count: 0,
+                });
+                continue;
+            }
+
             let (fill_style, lyon_path, next_is_stroke) = match &path {
                 DrawPath::Fill {
                     style,
@@ -71,6 +95,7 @@ impl ShapeTessellator {
                     ruffle_path_to_lyon_path(commands, *is_closed),
                     true,
                 ),
+                DrawPath::PerspectiveBitmap { .. } => unreachable!("handled above"),
             };
 
             let (draw, color, needs_flush) = match fill_style {
@@ -222,6 +247,7 @@ impl ShapeTessellator {
                         &mut buffers_builder,
                     )
                 }
+                DrawPath::PerspectiveBitmap { .. } => unreachable!("handled above"),
             };
             match result {
                 Ok(_) => {
@@ -292,6 +318,10 @@ pub enum DrawType {
         gradient: usize,
     },
     Bitmap(Bitmap),
+    /// Raw perspective-correct textured triangles (3 vertices per triangle, no
+    /// indexing). The backend uploads `vertices` directly and renders them with a
+    /// perspective shader; the enclosing `Draw`'s `vertices`/`indices` are empty.
+    PerspectiveBitmap(PerspectiveBitmap),
 }
 
 impl DrawType {
@@ -300,8 +330,17 @@ impl DrawType {
             Self::Color => "Color",
             Self::Gradient { .. } => "Gradient",
             Self::Bitmap { .. } => "Bitmap",
+            Self::PerspectiveBitmap { .. } => "PerspectiveBitmap",
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct PerspectiveBitmap {
+    pub bitmap_id: u16,
+    pub is_smoothed: bool,
+    pub is_repeating: bool,
+    pub vertices: Vec<crate::shape_utils::PerspectiveVertex>,
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]

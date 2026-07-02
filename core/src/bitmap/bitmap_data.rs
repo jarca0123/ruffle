@@ -10,6 +10,7 @@ use ruffle_render::bitmap::{
 };
 use ruffle_render::commands::CommandList;
 use ruffle_render::quality::StageQuality;
+use std::rc::Rc;
 use ruffle_wstr::WStr;
 use std::cell::Ref;
 use std::fmt::Debug;
@@ -255,7 +256,20 @@ impl<'gc> BitmapData<'gc> {
         transparency: bool,
         pixels: Vec<Color>,
     ) -> Self {
-        let data = BitmapRawData::new_with_pixels(width, height, transparency, pixels);
+        Self::new_with_shared_pixels(mc, width, height, transparency, Rc::new(pixels))
+    }
+
+    /// Like [`Self::new_with_pixels`] but taking an existing (copy-on-write)
+    /// shared pixel buffer, so multiple instances of the same library bitmap
+    /// don't each hold a private copy.
+    pub fn new_with_shared_pixels(
+        mc: &Mutation<'gc>,
+        width: u32,
+        height: u32,
+        transparency: bool,
+        pixels: Rc<Vec<Color>>,
+    ) -> Self {
+        let data = BitmapRawData::new_with_shared_pixels(width, height, transparency, pixels);
         let data = BitmapRawDataWrapper::new(Gc::new(mc, data.into()));
 
         Self(data)
@@ -421,9 +435,13 @@ type PendingGpuCommands = (Vec<PendingBatch>, PixelRegion, StageQuality);
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct BitmapRawData<'gc> {
-    /// The pixels in the bitmap, stored as a array of pre-multiplied ARGB colour values
+    /// The pixels in the bitmap, stored as a array of pre-multiplied ARGB colour values.
+    ///
+    /// Shared (copy-on-write via `Rc::make_mut`) so that many `BitmapData`
+    /// instances decoded from the same library symbol — e.g. a texture reused
+    /// across a whole game — reference one buffer until one of them is mutated.
     #[collect(require_static)]
-    pixels: Vec<Color>,
+    pixels: Rc<Vec<Color>>,
 
     width: u32,
     height: u32,
@@ -493,6 +511,7 @@ mod wrapper {
     use ruffle_render::commands::{CommandHandler, CommandList};
     use ruffle_render::quality::StageQuality;
     use std::cell::Ref;
+    use std::rc::Rc;
 
     use super::{BitmapRawData, DirtyState, copy_pixels_to_bitmapdata};
 
@@ -541,7 +560,7 @@ mod wrapper {
             BitmapRawDataWrapper(Gc::new(
                 mc,
                 BitmapRawData {
-                    pixels: Vec::new(),
+                    pixels: Rc::new(Vec::new()),
                     width: 0,
                     height: 0,
                     transparency: false,
@@ -945,10 +964,10 @@ impl std::fmt::Debug for BitmapRawData<'_> {
 impl<'gc> BitmapRawData<'gc> {
     pub fn new(width: u32, height: u32, transparency: bool, fill_color: u32) -> Self {
         Self {
-            pixels: vec![
+            pixels: Rc::new(vec![
                 Color::bgra_u32(fill_color).to_premultiplied_alpha(transparency);
                 width as usize * height as usize
-            ],
+            ]),
             width,
             height,
             transparency,
@@ -968,6 +987,18 @@ impl<'gc> BitmapRawData<'gc> {
         height: u32,
         transparency: bool,
         pixels: Vec<Color>,
+    ) -> Self {
+        Self::new_with_shared_pixels(width, height, transparency, Rc::new(pixels))
+    }
+
+    /// Like [`Self::new_with_pixels`] but sharing an existing (copy-on-write)
+    /// pixel buffer — used to reuse a decoded library-symbol bitmap across
+    /// instances without copying.
+    pub fn new_with_shared_pixels(
+        width: u32,
+        height: u32,
+        transparency: bool,
+        pixels: Rc<Vec<Color>>,
     ) -> Self {
         Self {
             pixels,
@@ -992,7 +1023,7 @@ impl<'gc> BitmapRawData<'gc> {
     pub fn dispose(&mut self) {
         self.width = 0;
         self.height = 0;
-        self.pixels = Vec::new(); // free the CPU pixel buffer
+        self.pixels = Rc::new(Vec::new()); // free the CPU pixel buffer
         self.bitmap_handle = None;
         // There's no longer a handle to update
         self.dirty_state = DirtyState::Clean;
@@ -1078,11 +1109,11 @@ impl<'gc> BitmapRawData<'gc> {
     }
 
     pub fn pixels(&self) -> &[Color] {
-        &self.pixels
+        &self.pixels[..]
     }
 
     pub fn pixels_rgba(&self) -> &[u8] {
-        Color::slice_as_rgba(&self.pixels)
+        Color::slice_as_rgba(&self.pixels[..])
     }
 
     pub fn width(&self) -> u32 {
@@ -1098,20 +1129,20 @@ impl<'gc> BitmapRawData<'gc> {
 
     #[inline]
     pub fn set_pixel32_raw(&mut self, x: u32, y: u32, color: Color) {
-        self.pixels[(x + y * self.width) as usize] = color;
+        Rc::make_mut(&mut self.pixels)[(x + y * self.width) as usize] = color;
     }
 
     #[inline]
     pub fn set_pixel32_row_raw(&mut self, x1: u32, x2: u32, y: u32, color: Color) {
         let p1 = (x1 + y * self.width) as usize;
         let p2 = (x2 + y * self.width) as usize;
-        let slice = &mut self.pixels[p1..p2];
+        let slice = &mut Rc::make_mut(&mut self.pixels)[p1..p2];
         slice.fill(color);
     }
 
     #[inline]
     pub fn fill(&mut self, color: Color) {
-        self.pixels.fill(color);
+        Rc::make_mut(&mut self.pixels).fill(color);
     }
 
     #[inline]
@@ -1120,11 +1151,11 @@ impl<'gc> BitmapRawData<'gc> {
     }
 
     pub fn raw_pixels_mut(&mut self) -> &mut Vec<Color> {
-        &mut self.pixels
+        Rc::make_mut(&mut self.pixels)
     }
 
     pub fn raw_pixels(&self) -> &[Color] {
-        &self.pixels
+        &self.pixels[..]
     }
 
     // Updates the data stored with our `BitmapHandle` if this `BitmapRawData`

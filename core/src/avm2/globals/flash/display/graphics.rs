@@ -1061,15 +1061,6 @@ pub fn draw_triangles<'gc>(
                 .ok_or_else(|| make_error_2004(activation, Error2004Type::ArgumentError))?
         };
 
-        // FIXME Triangles should be drawn using non-zero winding rule.
-        //   When fixed, update output.expected.png of avm2/graphics_draw_triangles.
-        avm2_stub_method!(
-            activation,
-            "flash.display.Graphics",
-            "drawTriangles",
-            "winding behavior"
-        );
-
         draw_triangles_internal(
             activation,
             &mut drawing,
@@ -1302,10 +1293,10 @@ fn draw_triangles_internal<'gc>(
         }) = drawing.current_fill_style().cloned()
         && let Some(size) = drawing.bitmap_size(id)
     {
-        // UV coordinates are normalized; scale into bitmap-pixel space (the space
-        // a `FillStyle::Bitmap` matrix maps from). The `t` component (perspective)
-        // is ignored — Flash only uses it for perspective-correct mapping, which we
-        // approximate affinely.
+        // UV coordinates are normalized; scale into bitmap-pixel space (the space a
+        // `FillStyle::Bitmap` matrix maps from). A third `t` component per vertex
+        // (`uvtData` stride 3) requests perspective-correct mapping, handled by
+        // subdivision below; stride 2 is a plain affine map per triangle.
         let uv_storage = uvt.as_vector_storage().expect("uvtData is not a Vector");
         let uvs = uv_storage.storage();
         let num_vertices = data.num_vertices();
@@ -1321,6 +1312,58 @@ fn draw_triangles_internal<'gc>(
                     uvs[i * stride + 1].as_f64() * size.height as f64,
                 )
             };
+            // A third `t` value per vertex (stride 3) asks for perspective-correct
+            // mapping. A GPU-capable backend renders the raw triangles exactly in a
+            // shader (`draw_perspective_triangle`); others fall back to CPU affine
+            // subdivision (each small sub-triangle converges to perspective-correct).
+            // Stride 2 stays a plain affine map.
+            if stride >= 3 {
+                let t_of = |i: usize| uvs[i * stride + 2].as_f64();
+                if activation.context.renderer.supports_perspective_triangles() {
+                    use ruffle_render::shape_utils::PerspectiveVertex;
+                    // Normalized UVs (the shader samples [0,1]); positions in pixels.
+                    let vert = |p: Point<Twips>, i: usize| PerspectiveVertex {
+                        x: p.x.to_pixels() as f32,
+                        y: p.y.to_pixels() as f32,
+                        u: uvs[i * stride].as_f64() as f32,
+                        v: uvs[i * stride + 1].as_f64() as f32,
+                        t: t_of(i) as f32,
+                    };
+                    for (tri, [i0, i1, i2]) in data.iter_triangles_with_uv_indices() {
+                        if culling.cull(tri) {
+                            continue;
+                        }
+                        drawing.draw_perspective_triangle(
+                            id,
+                            is_smoothed,
+                            is_repeating,
+                            [vert(tri[0], i0), vert(tri[1], i1), vert(tri[2], i2)],
+                        );
+                    }
+                    return Ok(());
+                }
+                for (tri, [i0, i1, i2]) in data.iter_triangles_with_uv_indices() {
+                    if culling.cull(tri) {
+                        continue;
+                    }
+                    let (u0, v0) = bitmap_px(i0);
+                    let (u1, v1) = bitmap_px(i1);
+                    let (u2, v2) = bitmap_px(i2);
+                    emit_perspective_triangle(
+                        drawing,
+                        (id, is_smoothed, is_repeating),
+                        [
+                            (tri[0], u0, v0, t_of(i0)),
+                            (tri[1], u1, v1, t_of(i1)),
+                            (tri[2], u2, v2, t_of(i2)),
+                        ],
+                        // Safety cap; the deviation/screen-size guards terminate
+                        // well before this for any on-screen triangle.
+                        12,
+                    );
+                }
+                return Ok(());
+            }
             for (tri, [i0, i1, i2]) in data.iter_triangles_with_uv_indices() {
                 if culling.cull(tri) {
                     continue;
@@ -1345,6 +1388,10 @@ fn draw_triangles_internal<'gc>(
         }
     }
 
+    // Flash fills the whole triangle set under the non-zero winding rule, so
+    // overlapping triangles union instead of cancelling into holes (even-odd). All
+    // triangles share the current fill, so set it once here.
+    drawing.set_fill_rule(Some(FillRule::NonZero));
     for [a, b, c] in data.iter_triangles().filter(|&tri| !culling.cull(tri)) {
         drawing.draw_command(DrawCommand::MoveTo(a));
         drawing.draw_command(DrawCommand::LineTo(b));
@@ -1397,6 +1444,101 @@ fn solve_uv_matrix(uv: [(f64, f64); 3], pos: [Point<Twips>; 3]) -> Option<Matrix
         tx: Twips::new(tx as i32),
         ty: Twips::new(ty as i32),
     })
+}
+
+/// Subdivides a triangle so an affine bitmap fill approximates Flash's
+/// perspective-correct `drawTriangles` mapping. Each corner is `(screen position,
+/// bitmap-pixel u, v, t)`, where `t` is the `uvtData` third component (`1/w` — Flash
+/// interpolates `u*t, v*t, t` linearly and divides). A corner's `(u, v)` is already
+/// perspective-correct; within a small enough sub-triangle an affine fill is
+/// visually exact, so recurse until the depth ratio is near-uniform (or the cap is
+/// hit) and emit affine leaves. Gated to stride-3 `uvtData`, so plain affine
+/// (stride-2) triangles are unaffected.
+fn emit_perspective_triangle(
+    drawing: &mut Drawing,
+    fill: (u16, bool, bool),
+    verts: [(Point<Twips>, f64, f64, f64); 3],
+    depth: u32,
+) {
+    type Vert = (Point<Twips>, f64, f64, f64);
+
+    // For an edge, how far its affine (linear) midpoint UV diverges from the
+    // perspective-correct one, in bitmap pixels — this is the visible affine
+    // "swim". Also return the edge's screen length (twips) so we can stop once a
+    // sub-triangle is only a pixel or two wide (the residual is then sub-pixel,
+    // which is what keeps the horizon — where `t` -> 0 and the ratio explodes —
+    // from subdividing without bound).
+    let edge = |a: Vert, b: Vert| -> (f64, f64) {
+        let dx = (a.0.x.get() - b.0.x.get()) as f64;
+        let dy = (a.0.y.get() - b.0.y.get()) as f64;
+        let len = (dx * dx + dy * dy).sqrt();
+        let denom = a.3 + b.3;
+        if denom <= 0.0 {
+            return (0.0, len);
+        }
+        let pu = (a.1 * a.3 + b.1 * b.3) / denom;
+        let pv = (a.2 * a.3 + b.2 * b.3) / denom;
+        let au = (a.1 + b.1) * 0.5;
+        let av = (a.2 + b.2) * 0.5;
+        (((pu - au).powi(2) + (pv - av).powi(2)).sqrt(), len)
+    };
+    let e01 = edge(verts[0], verts[1]);
+    let e12 = edge(verts[1], verts[2]);
+    let e20 = edge(verts[2], verts[0]);
+
+    // Worst edge by deviation, with its opposite corner.
+    let (worst, a, b, c) = if e01.0 >= e12.0 && e01.0 >= e20.0 {
+        (e01, verts[0], verts[1], verts[2])
+    } else if e12.0 >= e20.0 {
+        (e12, verts[1], verts[2], verts[0])
+    } else {
+        (e20, verts[2], verts[0], verts[1])
+    };
+
+    // Leaf: recursion cap, small enough deviation (< ~1 texel of affine swim), or
+    // the worst edge is already ~3px on screen so bisecting it further costs draws
+    // for little visible gain. These two thresholds trade quality for speed — the
+    // road is heavy because every leaf is its own bitmap fill (no batching).
+    if depth == 0 || worst.0 < 1.0 || worst.1 < 60.0 {
+        let (id, is_smoothed, is_repeating) = fill;
+        let pos = [verts[0].0, verts[1].0, verts[2].0];
+        let uv = [
+            (verts[0].1, verts[0].2),
+            (verts[1].1, verts[1].2),
+            (verts[2].1, verts[2].2),
+        ];
+        if let Some(matrix) = solve_uv_matrix(uv, pos) {
+            drawing.set_fill_style(Some(FillStyle::Bitmap {
+                id,
+                matrix,
+                is_smoothed,
+                is_repeating,
+            }));
+            drawing.draw_command(DrawCommand::MoveTo(pos[0]));
+            drawing.draw_command(DrawCommand::LineTo(pos[1]));
+            drawing.draw_command(DrawCommand::LineTo(pos[2]));
+            drawing.draw_command(DrawCommand::LineTo(pos[0]));
+        }
+        return;
+    }
+
+    // Bisect the worst edge at its perspective-correct midpoint (screen position
+    // and `t` interpolate linearly; `(u, v)` are `t`-weighted and re-divided),
+    // giving two sub-triangles that share the new vertex with the opposite corner.
+    // Splitting only the steepest edge needs far fewer triangles than a uniform
+    // 4-way split, so we can subdivide deeply enough to resolve the horizon.
+    let denom = a.3 + b.3;
+    let m: Vert = (
+        Point {
+            x: Twips::new((a.0.x.get() + b.0.x.get()) / 2),
+            y: Twips::new((a.0.y.get() + b.0.y.get()) / 2),
+        },
+        (a.1 * a.3 + b.1 * b.3) / denom,
+        (a.2 * a.3 + b.2 * b.3) / denom,
+        denom / 2.0,
+    );
+    emit_perspective_triangle(drawing, fill, [a, m, c], depth - 1);
+    emit_perspective_triangle(drawing, fill, [m, b, c], depth - 1);
 }
 
 /// Implements `Graphics.drawGraphicsData`
@@ -1732,14 +1874,6 @@ fn handle_graphics_triangle_path<'gc>(
         .as_object();
 
     if let Some(vertices) = vertices {
-        // FIXME Triangles should be drawn using non-zero winding rule.
-        avm2_stub_method!(
-            activation,
-            "flash.display.Graphics",
-            "drawGraphicsData",
-            "GraphicsTrianglePath winding behavior"
-        );
-
         if uvt_data.is_some() {
             avm2_stub_method!(
                 activation,

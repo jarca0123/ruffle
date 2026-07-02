@@ -110,6 +110,20 @@ pub fn calculate_shape_bounds(shape_records: &[swf::ShapeRecord]) -> swf::Rectan
     bounds
 }
 
+/// A single vertex of a perspective-correct textured triangle (see
+/// [`DrawPath::PerspectiveBitmap`]). `x`/`y` are in pixels (shape space, matching
+/// the tessellated mesh); `u`/`v` are normalized texture coordinates; `t` is the
+/// perspective factor `1/w` from a `Graphics.drawTriangles` 3-component `uvtData`.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
+pub struct PerspectiveVertex {
+    pub x: f32,
+    pub y: f32,
+    pub u: f32,
+    pub v: f32,
+    pub t: f32,
+}
+
 /// `DrawPath` represents a solid fill or a stroke.
 /// Fills are always closed paths, while strokes may be open or closed.
 /// Closed paths will have the first point equal to the last point.
@@ -125,6 +139,18 @@ pub enum DrawPath<'a> {
         style: &'a FillStyle,
         commands: Vec<DrawCommand>,
         winding_rule: FillRule,
+    },
+    /// Perspective-correct textured triangles from `Graphics.drawTriangles` with a
+    /// 3-component `uvtData`, kept as a raw vertex list (3 vertices per triangle,
+    /// no indexing) for the backend to render with a perspective shader instead of
+    /// an affine bitmap fill. Only produced when the renderer reports
+    /// `supports_perspective_triangles()`; otherwise the core subdivides into
+    /// ordinary affine `Fill`s.
+    PerspectiveBitmap {
+        bitmap_id: u16,
+        is_smoothed: bool,
+        is_repeating: bool,
+        vertices: Vec<PerspectiveVertex>,
     },
 }
 

@@ -1,7 +1,9 @@
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell, RefCell};
+use std::rc::{Rc, Weak};
 
 use crate::backend::audio::SoundHandle;
 use crate::binary_data::BinaryData;
+use crate::bitmap::bitmap_data::Color;
 use crate::display_object::{
     Avm1Button, Avm2Button, BitmapClass, EditText, Graphic, MorphShape, MovieClip, Text, Video,
 };
@@ -10,7 +12,7 @@ use gc_arena::barrier::unlock;
 use gc_arena::lock::Lock;
 use gc_arena::{Collect, Gc, Mutation};
 use ruffle_render::backend::RenderBackend;
-use ruffle_render::bitmap::{Bitmap as RenderBitmap, BitmapHandle, BitmapSize};
+use ruffle_render::bitmap::{Bitmap as RenderBitmap, BitmapFormat, BitmapHandle, BitmapSize};
 use ruffle_render::error::Error as RenderError;
 use swf::DefineBitsLossless;
 
@@ -42,6 +44,16 @@ pub struct BitmapCharacter<'gc> {
     /// The bitmap class set by `SymbolClass` - this is used when we instantaite
     /// a `Bitmap` displayobject.
     avm2_class: Lock<BitmapClass<'gc>>,
+    /// Weak reference to the most recently decoded CPU pixel buffer, shared
+    /// (copy-on-write) across every `BitmapData` instantiated from this symbol.
+    /// It's `Weak`, so once all instances drop the buffer is freed — a
+    /// pathological SWF with thousands of distinct one-shot bitmaps never keeps
+    /// them all decoded at once. `decoded_transparent` caches the format's
+    /// transparency so a cache hit doesn't have to re-decode to learn it.
+    #[collect(require_static)]
+    decoded_pixels: RefCell<Weak<Vec<Color>>>,
+    #[collect(require_static)]
+    decoded_transparent: Cell<Option<bool>>,
 }
 
 impl<'gc> BitmapCharacter<'gc> {
@@ -50,11 +62,30 @@ impl<'gc> BitmapCharacter<'gc> {
             compressed,
             handle: OnceCell::default(),
             avm2_class: Lock::new(BitmapClass::NoSubclass),
+            decoded_pixels: RefCell::new(Weak::new()),
+            decoded_transparent: Cell::new(None),
         }
     }
 
     pub fn compressed(&self) -> &CompressedBitmap {
         &self.compressed
+    }
+
+    /// Returns this symbol's decoded CPU pixels as a shared, copy-on-write
+    /// buffer plus whether the source has an alpha channel. Instances built from
+    /// the same symbol share one buffer (see `decoded_pixels`); the first call
+    /// (or the first after all instances were dropped) decodes, later ones just
+    /// clone the `Rc`.
+    pub fn shared_pixels(&self) -> Result<(Rc<Vec<Color>>, bool), RenderError> {
+        if let Some(pixels) = self.decoded_pixels.borrow().upgrade() {
+            return Ok((pixels, self.decoded_transparent.get().unwrap_or(true)));
+        }
+        let decoded = self.compressed.decode()?;
+        let transparent = matches!(decoded.format(), BitmapFormat::Rgba);
+        let pixels: Rc<Vec<Color>> = Rc::new(decoded.as_colors().map(Color::from).collect());
+        *self.decoded_pixels.borrow_mut() = Rc::downgrade(&pixels);
+        self.decoded_transparent.set(Some(transparent));
+        Ok((pixels, transparent))
     }
 
     pub fn avm2_class(&self) -> BitmapClass<'gc> {

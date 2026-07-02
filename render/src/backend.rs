@@ -93,6 +93,14 @@ pub trait RenderBackend: Any {
         false
     }
 
+    /// Whether this backend can render `DrawPath::PerspectiveBitmap` (raw
+    /// perspective-correct textured triangles from `Graphics.drawTriangles` with a
+    /// 3-component `uvtData`). When false, the core subdivides such triangles into
+    /// ordinary affine bitmap fills instead.
+    fn supports_perspective_triangles(&self) -> bool {
+        false
+    }
+
     /// Copies a rectangular region from one GPU texture to another without
     /// CPU readback or blending. Returns a `SyncHandle` the caller can use
     /// to mark the destination `GpuModified`. Backends without GPU support

@@ -107,6 +107,12 @@ impl PendingDraw {
             TessDrawType::Bitmap(bitmap) => {
                 PendingDrawType::bitmap(bitmap, shape_id, draw_id, source, backend, uniform_buffer)?
             }
+            // The wgpu backend does not report `supports_perspective_triangles`, so
+            // the core subdivides perspective triangles into affine `Bitmap` fills
+            // and this variant never reaches here.
+            TessDrawType::PerspectiveBitmap(_) => {
+                unreachable!("wgpu does not enable perspective triangles")
+            }
         };
         Some(PendingDraw {
             draw_type,

@@ -37,13 +37,17 @@ use ruffle_core::backend::ui::{
     MouseCursor, MultiDialogResultFuture, NullUiBackend, UiBackend,
 };
 use ruffle_core::compatibility_rules::CompatibilityRules;
+use ruffle_core::config::Letterbox;
 use ruffle_core::events::{MouseButton as RuffleMouseButton, MouseWheelDelta, PlayerEvent};
 use ruffle_core::font::{DefaultFont, FontFileData, FontQuery};
 use ruffle_core::limits::ExecutionLimit;
 use ruffle_core::tag_utils::SwfMovie;
-use ruffle_core::{FloatDuration, Player, PlayerBuilder};
+use ruffle_core::{
+    FloatDuration, LoadBehavior, Player, PlayerBuilder, PlayerRuntime, StageAlign, StageScaleMode,
+};
 use ruffle_frontend_utils::backends::audio::CpalAudioBackend;
 use ruffle_frontend_utils::backends::navigator::{ExternalNavigatorBackend, NavigatorInterface};
+use ruffle_frontend_utils::backends::storage::DiskStorageBackend;
 use ruffle_frontend_utils::content::{ContentDescriptor, PlayingContent};
 use ruffle_render::backend::ViewportDimensions;
 use ruffle_render::quality::StageQuality;
@@ -139,10 +143,13 @@ impl GlApp {
         height: u32,
         loader: impl Fn(&str) -> *const std::ffi::c_void,
     ) -> Result<Arc<Mutex<Player>>, Error> {
-        let backend = unsafe {
+        let mut backend = unsafe {
             GlRenderBackend::new_from_loader_function(loader, false, StageQuality::High)
         }
         .map_err(|e| anyhow!("failed to create GL render backend: {e}"))?;
+        // Presenting to a real window: flip the top-down scene upright on-screen
+        // (headless capture reads the framebuffer directly and leaves this unset).
+        backend.set_present_flipped(true);
 
         let descriptor = if self.movie_url.scheme() == "file" {
             let path = self
@@ -176,18 +183,42 @@ impl GlApp {
         font_database.load_system_fonts();
         let font_database = Rc::new(font_database);
 
+        // Persist SharedObjects to the same location as the main desktop app.
+        let save_directory = dirs::data_local_dir()
+            .map(|d| d.join("ruffle").join("SharedObjects"))
+            .unwrap_or_else(|| std::path::PathBuf::from("SharedObjects"));
+
         let mut builder = PlayerBuilder::new()
             .with_renderer(backend)
             .with_navigator(navigator)
             .with_ui(GlUiBackend::new(font_database.clone()))
+            .with_storage(Box::new(DiskStorageBackend::new(save_directory)))
             .with_viewport_dimensions(width, height, 1.0)
             .with_autoplay(true)
             .with_compatibility_rules(CompatibilityRules::default())
-            .with_spoofed_url(self.spoof_url.clone());
+            .with_letterbox(Letterbox::On)
+            .with_max_execution_duration(Duration::MAX)
+            .with_quality(StageQuality::High)
+            .with_align(StageAlign::default(), false)
+            .with_scale_mode(StageScaleMode::default(), false)
+            .with_fullscreen(false)
+            .with_load_behavior(LoadBehavior::Streaming)
+            .with_spoofed_url(self.spoof_url.clone())
+            .with_page_url(self.spoof_url.clone())
+            .with_player_version(None)
+            .with_player_runtime(PlayerRuntime::default())
+            .with_frame_rate(None);
 
         match CpalAudioBackend::new(None) {
             Ok(audio) => builder = builder.with_audio(audio),
             Err(e) => tracing::error!("Unable to create audio device: {e}"),
+        }
+
+        // Video (SWF `DefineVideoStream`) via the software decoder.
+        #[cfg(feature = "software_video")]
+        {
+            builder =
+                builder.with_video(ruffle_video_software::backend::SoftwareVideoBackend::new());
         }
 
         let player = builder.build();
