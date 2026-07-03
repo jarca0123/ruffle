@@ -736,6 +736,23 @@ impl<'gc> Object<'gc> {
         std::ptr::eq(a.as_ptr(), b.as_ptr())
     }
 
+    /// Raw address of the backing `Gc` allocation, for pointer-tagging schemes
+    /// such as a NaN-boxed `Value`. Round-trips with [`Object::from_gc_ptr`].
+    #[inline]
+    pub(crate) fn as_gc_ptr(self) -> *const () {
+        Gc::as_ptr(self.0).cast()
+    }
+
+    /// Reconstruct an `Object` from a pointer obtained via [`Object::as_gc_ptr`].
+    ///
+    /// # Safety
+    /// `ptr` must have come from `as_gc_ptr` on an `Object` of the same `'gc`
+    /// arena that has not been collected.
+    #[inline]
+    pub(crate) unsafe fn from_gc_ptr(ptr: *const ()) -> Self {
+        Object(unsafe { Gc::from_ptr(ptr.cast()) })
+    }
+
     impl_downcast_methods! {
         pub fn as_script_object for ScriptObject;
         pub fn as_class_object for ClassObject;

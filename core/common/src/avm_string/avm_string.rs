@@ -59,6 +59,24 @@ impl<'gc> AvmString<'gc> {
         Gc::as_ref(self.0).as_wstr()
     }
 
+    /// Raw address of the backing `Gc` allocation, for pointer-tagging schemes
+    /// such as a NaN-boxed `Value`. Round-trips with [`AvmString::from_gc_ptr`].
+    #[inline]
+    pub fn as_gc_ptr(self) -> *const () {
+        Gc::as_ptr(self.0).cast()
+    }
+
+    /// Reconstruct an `AvmString` from a pointer obtained via
+    /// [`AvmString::as_gc_ptr`].
+    ///
+    /// # Safety
+    /// `ptr` must have come from `as_gc_ptr` on an `AvmString` of the same `'gc`
+    /// arena that has not been collected.
+    #[inline]
+    pub unsafe fn from_gc_ptr(ptr: *const ()) -> Self {
+        Self(unsafe { Gc::from_ptr(ptr.cast()) })
+    }
+
     pub fn as_interned(&self) -> Option<AvmAtom<'gc>> {
         if self.0.is_interned() {
             Some(AvmAtom(self.0))

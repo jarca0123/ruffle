@@ -18,6 +18,8 @@ use gc_arena::Collect;
 use num_bigint::BigInt;
 use num_traits::{ToPrimitive, Zero};
 use ruffle_macros::istr;
+use gc_arena::Gc;
+use std::marker::PhantomData;
 use std::mem::size_of;
 use swf::avm2::types::DefaultValue as AbcDefaultValue;
 
@@ -59,6 +61,267 @@ pub enum Value<'gc> {
 
 // This type is used very frequently, so make sure it doesn't unexpectedly grow.
 const _: () = assert!(size_of::<Value<'_>>() <= 16);
+
+/// NaN-boxed representation of [`Value`], packing every case into a single
+/// `u64` instead of the 16-byte enum (`Number(f64)` + a discriminant forces the
+/// enum to 16). Built and unit-tested alongside the enum; the migration renames
+/// this to `Value` and the enum to `ValueEnum`, with call sites going through
+/// [`PackedValue::unpack`] / the typed constructors.
+///
+/// # Encoding (64-bit targets with ≤48-bit pointers: x86-64, aarch64; and wasm32
+/// where pointers are 32-bit, trivially fitting)
+///
+/// ```text
+///   number : the f64 bit pattern, every NaN canonicalized to CANON_NAN
+///   boxed  : [63..=51 all 1 = BOX_MARK] [50..=48 = tag] [47..=0 = payload]
+/// ```
+///
+/// A "boxed" word has the sign bit, all 11 exponent bits, and the quiet-NaN bit
+/// set. No finite/inf double matches that (they lack the quiet bit or an
+/// exponent bit), and canonicalizing NaNs on the way in guarantees no `Number`
+/// ever does either — so `is_number` is a single mask/compare. `tag` selects the
+/// variant; `payload` is a 48-bit pointer (String/Object) or a zero-extended
+/// immediate (bool/int).
+#[derive(Clone, Copy)]
+pub struct PackedValue<'gc> {
+    bits: u64,
+    /// Brand the value with the arena's `'gc` (invariant), matching `Gc`.
+    _marker: PhantomData<Gc<'gc, ()>>,
+}
+
+// Sign + exponent + quiet-NaN bit: the marker that a word is boxed, not a double.
+const BOX_MARK: u64 = 0xFFF8_0000_0000_0000;
+const TAG_SHIFT: u32 = 48;
+const PAYLOAD_MASK: u64 = (1 << 48) - 1;
+/// The single NaN bit pattern stored for `Number(NaN)`; distinct from every box
+/// pattern (sign bit clear), so canonicalized NaNs read back as numbers.
+const CANON_NAN: u64 = 0x7FF8_0000_0000_0000;
+
+const TAG_UNDEFINED: u64 = 0;
+const TAG_NULL: u64 = 1;
+const TAG_BOOL: u64 = 2;
+const TAG_INT: u64 = 3;
+const TAG_STRING: u64 = 4;
+const TAG_OBJECT: u64 = 5;
+
+// The packed value must be exactly pointer-sized — that's the whole point.
+const _: () = assert!(size_of::<PackedValue<'_>>() == 8);
+
+impl<'gc> PackedValue<'gc> {
+    #[inline]
+    fn boxed(tag: u64, payload: u64) -> Self {
+        debug_assert!(
+            payload & !PAYLOAD_MASK == 0,
+            "payload {payload:#x} does not fit in 48 bits (non-canonical pointer?)"
+        );
+        Self {
+            bits: BOX_MARK | (tag << TAG_SHIFT) | (payload & PAYLOAD_MASK),
+            _marker: PhantomData,
+        }
+    }
+
+    /// True when the word is a real `f64` rather than a boxed value.
+    #[inline]
+    fn is_number(self) -> bool {
+        self.bits & BOX_MARK != BOX_MARK
+    }
+
+    #[inline]
+    fn tag(self) -> u64 {
+        (self.bits >> TAG_SHIFT) & 0x7
+    }
+
+    #[inline]
+    fn payload(self) -> u64 {
+        self.bits & PAYLOAD_MASK
+    }
+
+    /// Pack a `Value` into the single-word representation.
+    #[inline]
+    pub fn pack(value: Value<'gc>) -> Self {
+        match value {
+            Value::Undefined => Self::boxed(TAG_UNDEFINED, 0),
+            Value::Null => Self::boxed(TAG_NULL, 0),
+            Value::Bool(b) => Self::boxed(TAG_BOOL, b as u64),
+            Value::Integer(i) => Self::boxed(TAG_INT, i as u32 as u64),
+            Value::Number(n) => {
+                // Canonicalize NaNs so no number ever collides with a box pattern.
+                let bits = if n.is_nan() { CANON_NAN } else { n.to_bits() };
+                Self {
+                    bits,
+                    _marker: PhantomData,
+                }
+            }
+            // Pointers are exposed so the address→pointer round-trip in `unpack`
+            // is sound under strict provenance.
+            Value::String(s) => Self::boxed(TAG_STRING, s.as_gc_ptr().expose_provenance() as u64),
+            Value::Object(o) => Self::boxed(TAG_OBJECT, o.as_gc_ptr().expose_provenance() as u64),
+        }
+    }
+
+    /// Unpack back into the wide `Value` enum for matching.
+    #[inline]
+    pub fn unpack(self) -> Value<'gc> {
+        if self.is_number() {
+            return Value::Number(f64::from_bits(self.bits));
+        }
+        match self.tag() {
+            TAG_UNDEFINED => Value::Undefined,
+            TAG_NULL => Value::Null,
+            TAG_BOOL => Value::Bool(self.payload() != 0),
+            TAG_INT => Value::Integer(self.payload() as u32 as i32),
+            // SAFETY: this word was produced by `pack` from a live `String`/
+            // `Object` of this `'gc`; we are inside the arena callback, so the
+            // pointee is still allocated. `with_exposed_provenance` recovers the
+            // provenance exposed in `pack`.
+            TAG_STRING => Value::String(unsafe {
+                AvmString::from_gc_ptr(std::ptr::with_exposed_provenance(self.payload() as usize))
+            }),
+            TAG_OBJECT => Value::Object(unsafe {
+                Object::from_gc_ptr(std::ptr::with_exposed_provenance(self.payload() as usize))
+            }),
+            other => unreachable!("invalid PackedValue tag {other}"),
+        }
+    }
+}
+
+// SAFETY: the only Gc pointers a PackedValue can hold are the String/Object
+// payloads, which `trace` decodes and forwards. PackedValue is `Copy` with no
+// `Drop`, so `no_drop`'s requirement (no Drop impl touching Gc pointers) holds.
+unsafe impl<'gc> Collect<'gc> for PackedValue<'gc> {
+    #[inline]
+    fn trace<T: gc_arena::collect::Trace<'gc>>(&self, cc: &mut T) {
+        // Immediates and numbers hold no pointers.
+        match self.unpack() {
+            Value::String(s) => cc.trace(&s),
+            Value::Object(o) => cc.trace(&o),
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod packed_value_tests {
+    use super::*;
+    use gc_arena::arena::rootless_mutate;
+
+    /// Round-trip every immediate/number case through pack→unpack.
+    #[test]
+    fn immediates_round_trip() {
+        fn check(v: Value<'_>) {
+            let packed = PackedValue::pack(v);
+            match (v, packed.unpack()) {
+                (Value::Undefined, Value::Undefined)
+                | (Value::Null, Value::Null) => {}
+                (Value::Bool(a), Value::Bool(b)) => assert_eq!(a, b),
+                (Value::Integer(a), Value::Integer(b)) => assert_eq!(a, b),
+                (Value::Number(a), Value::Number(b)) => {
+                    assert!(a == b || (a.is_nan() && b.is_nan()), "{a} != {b}");
+                }
+                (a, b) => panic!("variant changed: {a:?} -> {b:?}"),
+            }
+        }
+
+        check(Value::Undefined);
+        check(Value::Null);
+        check(Value::Bool(true));
+        check(Value::Bool(false));
+        for i in [0i32, 1, -1, i32::MIN, i32::MAX, -12345, 0x7FFF_FFFF] {
+            check(Value::Integer(i));
+        }
+        for n in [
+            0.0f64,
+            -0.0,
+            1.0,
+            -1.0,
+            f64::MIN,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MIN_POSITIVE,
+            5e-324,        // smallest subnormal
+            std::f64::consts::PI,
+        ] {
+            check(Value::Number(n));
+        }
+    }
+
+    /// Every NaN bit pattern must pack to a value that unpacks back to *a* NaN
+    /// (canonicalized), and never be misread as a boxed value.
+    #[test]
+    fn nan_canonicalizes_and_stays_number() {
+        for raw in [
+            f64::NAN.to_bits(),
+            0x7FF8_0000_0000_0001, // signalling-ish / payloaded qNaN
+            0xFFF8_0000_0000_0000, // negative qNaN — same bits as boxed Undefined!
+            0xFFFF_FFFF_FFFF_FFFF, // all-ones NaN
+            0x7FF0_0000_0000_0001, // sNaN
+        ] {
+            let n = f64::from_bits(raw);
+            assert!(n.is_nan());
+            let packed = PackedValue::pack(Value::Number(n));
+            match packed.unpack() {
+                Value::Number(u) => assert!(u.is_nan(), "raw {raw:#x} unpacked to {u}"),
+                other => panic!("NaN {raw:#x} misdecoded as {other:?}"),
+            }
+        }
+    }
+
+    /// Hazard #3: the manual `Collect` impl must actually keep a boxed pointer
+    /// alive across a GC cycle. Root N strings *only* as NaN-boxed PackedValues,
+    /// force collection, and confirm they weren't swept — then confirm clearing
+    /// the root does free them (so the metric is meaningful, not stuck high).
+    #[test]
+    fn traced_pointers_survive_collection() {
+        use gc_arena::{Arena, Rootable};
+
+        // Plain `Vec` root (gc_arena has no general `Collect` for std `RefCell`;
+        // `mutate_root` already grants `&mut` access, so we don't need one).
+        let mut arena: Arena<Rootable![Vec<PackedValue<'_>>]> = Arena::new(|_mc| Vec::new());
+
+        const N: usize = 500;
+        arena.mutate_root(|mc, root| {
+            for i in 0..N {
+                let s = AvmString::new_utf8(mc, format!("survivor-{i}"));
+                root.push(PackedValue::pack(Value::String(s)));
+            }
+        });
+        arena.finish_cycle();
+        let rooted = arena.metrics().total_gc_allocation();
+
+        // Drop every root; nothing references the strings now.
+        arena.mutate_root(|_mc, root| root.clear());
+        arena.finish_cycle();
+        let cleared = arena.metrics().total_gc_allocation();
+
+        // A broken `trace` would have freed the strings in the first
+        // `collect_all`, leaving `rooted == cleared`.
+        assert!(
+            rooted > cleared + N * 16,
+            "boxed strings were not kept alive by tracing: rooted={rooted}, cleared={cleared}"
+        );
+    }
+
+    /// Pointer round-trip via a real arena (exercises the same machinery Object
+    /// uses): pack an AvmString, unpack it, confirm identity and contents.
+    #[test]
+    fn string_pointer_round_trips() {
+        rootless_mutate(|mc| {
+            let s = AvmString::new_utf8(mc, "hello NaN-box");
+            let packed = PackedValue::pack(Value::String(s));
+            assert!(!packed.is_number());
+            assert_eq!(packed.tag(), TAG_STRING);
+            match packed.unpack() {
+                Value::String(s2) => {
+                    // Same allocation, same bytes.
+                    assert_eq!(s2.as_gc_ptr(), s.as_gc_ptr());
+                    assert_eq!(&*s2, &*s);
+                }
+                other => panic!("string unpacked as {other:?}"),
+            }
+        });
+    }
+}
 
 impl<'gc> From<AvmString<'gc>> for Value<'gc> {
     #[inline(always)]
