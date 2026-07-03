@@ -13,8 +13,8 @@ pub fn upload_from_byte_array<'gc>(
     if let Some(vertex_buffer) = this.as_vertex_buffer() {
         let byte_array = args.get_object(activation, 0, "data")?;
 
-        let byte_array = byte_array
-            .as_bytearray()
+        let mut byte_array = byte_array
+            .as_bytearray_mut()
             .expect("Parameter must be a ByteArray");
 
         let byte_offset = args.get_u32(1);

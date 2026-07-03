@@ -5,9 +5,7 @@ package flash.system {
     [API("682")]
     [Ruffle(Abstract)]
     public final class Worker extends EventDispatcher {
-        public static function get isSupported():Boolean {
-            return false;
-        }
+        public static native function get isSupported():Boolean;
 
         public static native function get current():Worker;
 

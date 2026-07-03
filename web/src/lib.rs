@@ -9,6 +9,7 @@ mod log_adapter;
 mod navigator;
 mod storage;
 mod ui;
+mod worker_host;
 mod zip;
 
 use crate::builder::RuffleInstanceBuilder;

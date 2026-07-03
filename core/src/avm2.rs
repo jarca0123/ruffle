@@ -77,6 +77,7 @@ mod stubs;
 mod traits;
 mod value;
 pub mod vector;
+pub mod worker_shared;
 mod verify;
 mod vtable;
 
@@ -282,6 +283,12 @@ impl<'gc> Avm2<'gc> {
     /// owned by a background worker thread this is that worker.
     ///
     /// Panics if called before AVM2 initialization is complete.
+    /// Override the `Worker` this `Avm2` represents. Used when a spawned worker
+    /// thread installs its own identity so `Worker.current` resolves to it.
+    pub fn set_current_worker(&mut self, worker: WorkerObject<'gc>) {
+        self.current_worker = Some(worker);
+    }
+
     pub fn current_worker(&self) -> WorkerObject<'gc> {
         self.current_worker
             .expect("current worker should be initialized before any AVM2 code runs")

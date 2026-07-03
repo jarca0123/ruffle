@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Ruffle wasm-threads smoke test</title>
+  </head>
+  <body>
+    <h1>wasm-threads smoke test</h1>
+    <p>Open the devtools console. Expected sequence:</p>
+    <pre>
+[main]   start(); spawning worker thread
+[worker] started; blocking on shared cell (Atomics.wait)
+[main]   stored 42 and notified worker (woke 1)
+[worker] woke up; shared cell = 42
+    </pre>
+    <p>
+      <code>crossOriginIsolated</code> must be <b>true</b> (shown below) or
+      SharedArrayBuffer is unavailable — check the COOP/COEP headers.
+    </p>
+    <script type="module">
+      document.body.insertAdjacentHTML(
+        "beforeend",
+        `<p>crossOriginIsolated = <b>${self.crossOriginIsolated}</b></p>`,
+      );
+      // `--target web` with threads: the generated init creates the shared
+      // memory; `wasm_thread` reuses it when spawning workers.
+      import init from "./pkg/thread_smoke.js";
+      await init();
+    </script>
+  </body>
+</html>

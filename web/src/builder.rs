@@ -708,6 +708,12 @@ impl RuffleInstanceBuilder {
             .with_navigator(self.create_navigator(log_subscriber.clone()))
             .with_storage(self.create_storage_backend());
 
+        // Real Flash workers, only in a threaded (cross-origin-isolated) build.
+        #[cfg(feature = "threads")]
+        {
+            builder = builder.with_worker_host(crate::worker_host::WasmWorkerHost);
+        }
+
         // Create the external interface.
         if self.allow_script_access && self.allow_networking == NetworkingAccessMode::All {
             let interface = Box::new(JavascriptInterface::new(js_player.clone()));

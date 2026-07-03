@@ -1,0 +1,5 @@
+mutex isSupported = false
+tryLock (recursive) = true
+tryLock after release = true
+condition isSupported = false
+ok

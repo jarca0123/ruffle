@@ -1,0 +1,26 @@
+# Standalone spike: de-risks the wasm-threads infra for Ruffle Path A workers.
+# Detached from the ruffle workspace (own [workspace]) so it doesn't churn the
+# root lockfile.
+[package]
+name = "thread-smoke"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasm-bindgen = "=0.2.120"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+wasm_thread = { version = "0.3", features = ["es_modules"] }
+
+[dependencies.web-sys]
+version = "0.3"
+features = ["console", "Window"]
+
+[profile.release]
+opt-level = "s"

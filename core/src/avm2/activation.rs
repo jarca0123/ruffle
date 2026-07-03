@@ -935,6 +935,20 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                         tracing::warn!("Caught exception: {}", stringified);
                     }
 
+                    // TEMP: throttled dump of caught exceptions to find the
+                    // thunked lstat failure behind the worker livelock.
+                    {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static N: AtomicU64 = AtomicU64::new(0);
+                        if N.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
+                            let stringified = original_error.to_string(self);
+                            tracing::info!(
+                                "CAUGHT t{:?}: {stringified}",
+                                std::thread::current().id()
+                            );
+                        }
+                    }
+
                     self.reset_stack();
                     self.push_stack(error);
 
@@ -2754,11 +2768,11 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let val = self.pop_stack().coerce_to_i32(self)? as i8;
         let mut dm = self.domain_memory().storage_mut();
 
-        if address >= dm.len() {
+        if address >= dm.dm_len() {
             return Err(make_error_1506(self));
         }
 
-        dm.set_nongrowing(address, val as u8);
+        dm.dm_set(address, val as u8);
 
         Ok(())
     }
@@ -2773,10 +2787,10 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let val = self.pop_stack().coerce_to_i32(self)? as i16;
         let mut dm = self.domain_memory().storage_mut();
 
-        if address > dm.len() - 2 {
+        if address > dm.dm_len() - 2 {
             return Err(make_error_1506(self));
         }
-        dm.write_at_nongrowing(&val.to_le_bytes(), address)
+        dm.dm_write(address, &val.to_le_bytes())
             .map_err(|e| e.to_avm(self))?;
 
         Ok(())
@@ -2792,10 +2806,10 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let val = self.pop_stack().coerce_to_i32(self)?;
         let mut dm = self.domain_memory().storage_mut();
 
-        if address > dm.len() - 4 {
+        if address > dm.dm_len() - 4 {
             return Err(make_error_1506(self));
         }
-        dm.write_at_nongrowing(&val.to_le_bytes(), address)
+        dm.dm_write(address, &val.to_le_bytes())
             .map_err(|e| e.to_avm(self))?;
 
         Ok(())
@@ -2811,10 +2825,10 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let val = self.pop_stack().coerce_to_number(self)? as f32;
         let mut dm = self.domain_memory().storage_mut();
 
-        if address > dm.len() - 4 {
+        if address > dm.dm_len() - 4 {
             return Err(make_error_1506(self));
         }
-        dm.write_at_nongrowing(&val.to_le_bytes(), address)
+        dm.dm_write(address, &val.to_le_bytes())
             .map_err(|e| e.to_avm(self))?;
 
         Ok(())
@@ -2830,10 +2844,10 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let val = self.pop_stack().coerce_to_number(self)?;
         let mut dm = self.domain_memory().storage_mut();
 
-        if address > dm.len() - 8 {
+        if address > dm.dm_len() - 8 {
             return Err(make_error_1506(self));
         }
-        dm.write_at_nongrowing(&val.to_le_bytes(), address)
+        dm.dm_write(address, &val.to_le_bytes())
             .map_err(|e| e.to_avm(self))?;
 
         Ok(())
@@ -2848,7 +2862,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
         let dm = self.domain_memory().storage();
 
-        let val = dm.get(address);
+        let val = dm.dm_get(address);
 
         if let Some(val) = val {
             self.push_stack(val);
@@ -2868,12 +2882,13 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
         let dm = self.domain_memory().storage();
 
-        if address > dm.len() - 2 {
+        if address > dm.dm_len() - 2 {
             return Err(make_error_1506(self));
         }
 
-        let val = dm.read_at(2, address).map_err(|e| e.to_avm(self))?;
-        self.push_stack(u16::from_le_bytes(val.try_into().unwrap()));
+        let val = dm.dm_read::<2>(address).ok_or_else(|| make_error_1506(self))?;
+        let value = u16::from_le_bytes(val);
+        self.push_stack(value);
 
         Ok(())
     }
@@ -2887,12 +2902,12 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
         let dm = self.domain_memory().storage();
 
-        if address > dm.len() - 4 {
+        if address > dm.dm_len() - 4 {
             return Err(make_error_1506(self));
         }
 
-        let val = dm.read_at(4, address).map_err(|e| e.to_avm(self))?;
-        self.push_stack(i32::from_le_bytes(val.try_into().unwrap()));
+        let val = dm.dm_read::<4>(address).ok_or_else(|| make_error_1506(self))?;
+        self.push_stack(i32::from_le_bytes(val));
         Ok(())
     }
 
@@ -2905,12 +2920,12 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
         let dm = self.domain_memory().storage();
 
-        if address > dm.len() - 4 {
+        if address > dm.dm_len() - 4 {
             return Err(make_error_1506(self));
         }
 
-        let val = dm.read_at(4, address).map_err(|e| e.to_avm(self))?;
-        self.push_stack(f32::from_le_bytes(val.try_into().unwrap()));
+        let val = dm.dm_read::<4>(address).ok_or_else(|| make_error_1506(self))?;
+        self.push_stack(f32::from_le_bytes(val));
 
         Ok(())
     }
@@ -2924,12 +2939,12 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
         let dm = self.domain_memory().storage();
 
-        if address > dm.len() - 8 {
+        if address > dm.dm_len() - 8 {
             return Err(make_error_1506(self));
         }
 
-        let val = dm.read_at(8, address).map_err(|e| e.to_avm(self))?;
-        self.push_stack(f64::from_le_bytes(val.try_into().unwrap()));
+        let val = dm.dm_read::<8>(address).ok_or_else(|| make_error_1506(self))?;
+        self.push_stack(f64::from_le_bytes(val));
         Ok(())
     }
 

@@ -1,0 +1,9 @@
+cas1 returned = 100
+value now = 200
+cas2 returned = 200
+value still = 200
+range error caught
+caslen1 returned = 16
+length now = 32
+caslen2 returned = 32
+length still = 32

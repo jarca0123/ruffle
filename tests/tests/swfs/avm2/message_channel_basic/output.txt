@@ -1,0 +1,6 @@
+available (empty) = false
+available = true
+recv1 = 42
+recv2 = hi
+available (drained) = false
+recv empty = null

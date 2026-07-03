@@ -101,6 +101,20 @@ impl<'gc> OptValue<'gc> {
         matches!(self.constant_value, Some(ConstantValue::Null))
     }
 
+    /// Whether this is the lattice top (`*` / fully-unknown, i.e. `OptValue::any()`).
+    ///
+    /// Top absorbs everything: `merged_with(top, x) == top` for all `x`, so a
+    /// merge that starts from top can never change and can be skipped entirely.
+    /// This is the dominant case for FlasCC's huge methods, whose many locals
+    /// saturate to top after the first couple of fixpoint iterations.
+    pub fn is_any(self) -> bool {
+        self.class.is_none()
+            && !self.contains_valid_integer
+            && !self.contains_valid_unsigned
+            && !self.not_null
+            && self.constant_value.is_none()
+    }
+
     // Returns true if the value is guaranteed to be neither Null nor Undefined.
     pub fn not_null(self) -> bool {
         if self.not_null {
@@ -527,7 +541,18 @@ impl<'gc> AbstractState<'gc> {
 
         for i in 0..self.locals.len() {
             let our_local = self.locals.at(i);
+            // Lattice top absorbs everything; the merge can't change it. Skip
+            // before even loading `other` — this is the common case once locals
+            // saturate, and it's what made this loop ~34% of OpenTTD's runtime.
+            if our_local.is_any() {
+                continue;
+            }
+
             let other_local = other.locals.at(i);
+            // Merge is idempotent, so equal inputs produce no change.
+            if our_local == other_local {
+                continue;
+            }
 
             let merged = our_local.merged_with(activation, other_local);
             self.locals.set(i, merged);
@@ -547,7 +572,14 @@ impl<'gc> AbstractState<'gc> {
 
         for i in 0..self.stack.len() {
             let our_entry = self.stack.at(i);
+            if our_entry.is_any() {
+                continue;
+            }
+
             let other_entry = other.stack.at(i);
+            if our_entry == other_entry {
+                continue;
+            }
 
             let merged = our_entry.merged_with(activation, other_entry);
             self.stack.set(i, merged);
@@ -571,6 +603,12 @@ impl<'gc> AbstractState<'gc> {
 
             if our_scope.1 != other_scope.1 {
                 return Err(make_error_1068(activation));
+            }
+
+            // The depth-type check above must always run, but the value merge
+            // itself can be skipped when it can't change anything.
+            if our_scope.0.is_any() || our_scope.0 == other_scope.0 {
+                continue;
             }
 
             let merged = our_scope.0.merged_with(activation, other_scope.0);

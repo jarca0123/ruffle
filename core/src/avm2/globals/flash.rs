@@ -1,5 +1,6 @@
 //! `flash` namespace
 
+pub mod concurrent;
 pub mod crypto;
 pub mod display;
 #[expect(non_snake_case)]

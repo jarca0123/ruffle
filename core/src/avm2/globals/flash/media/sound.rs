@@ -277,7 +277,7 @@ pub fn load_compressed_data_from_byte_array<'gc>(
 
     let bytearray = args.get_object(activation, 0, "bytes")?;
     let bytes_length = args.get_u32(1);
-    let bytearray = bytearray.as_bytearray().unwrap();
+    let mut bytearray = bytearray.as_bytearray_mut().unwrap();
 
     let bytes = if let Ok(bytes) = bytearray.read_bytes(bytes_length as usize) {
         bytes

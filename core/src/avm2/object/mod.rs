@@ -73,6 +73,8 @@ mod texture_object;
 mod vector_object;
 mod vertex_buffer_3d_object;
 mod worker_domain_object;
+mod condition_object;
+mod mutex_object;
 mod worker_object;
 mod xml_list_object;
 mod xml_object;
@@ -144,6 +146,8 @@ pub use crate::avm2::object::texture_object::TextureObject;
 pub use crate::avm2::object::vector_object::{VectorObject, vector_allocator};
 pub use crate::avm2::object::vertex_buffer_3d_object::VertexBuffer3DObject;
 pub use crate::avm2::object::worker_domain_object::WorkerDomainObject;
+pub use crate::avm2::object::condition_object::{ConditionObject, condition_allocator};
+pub use crate::avm2::object::mutex_object::{MutexObject, mutex_allocator};
 pub use crate::avm2::object::worker_object::WorkerObject;
 pub use crate::avm2::object::xml_list_object::{E4XOrXml, XmlListObject, xml_list_allocator};
 pub use crate::avm2::object::xml_object::{NotificationCommand, XmlObject, xml_allocator};
@@ -216,6 +220,8 @@ pub(crate) unsafe trait ObjectVariant<'gc>: Copy {
         SoundTransformObject(SoundTransformObject<'gc>),
         StyleSheetObject(StyleSheetObject<'gc>),
         WorkerObject(WorkerObject<'gc>),
+        MutexObject(MutexObject<'gc>),
+        ConditionObject(ConditionObject<'gc>),
         WorkerDomainObject(WorkerDomainObject<'gc>),
         MessageChannelObject(MessageChannelObject<'gc>),
         SecurityDomainObject(SecurityDomainObject<'gc>),
@@ -772,6 +778,9 @@ impl<'gc> Object<'gc> {
         pub fn as_sound_transform for SoundTransformObject;
         pub fn as_style_sheet for StyleSheetObject;
         pub fn as_worker_object for WorkerObject;
+        pub fn as_mutex_object for MutexObject;
+        pub fn as_condition_object for ConditionObject;
+        pub fn as_message_channel_object for MessageChannelObject;
         pub fn as_content_element_object for ContentElementObject;
         pub fn as_element_format_object for ElementFormatObject;
         pub fn as_font_description_object for FontDescriptionObject;

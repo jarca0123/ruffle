@@ -1,12 +1,14 @@
 package flash.concurrent {
     [API("684")]
+    [Ruffle(InstanceAllocator)]
     public final class Mutex {
-        public static function get isSupported():Boolean {
-            return false;
-        }
+        public static native function get isSupported():Boolean;
 
         public function Mutex() {
-            throw new Error("Error #1520: Mutex cannot be initialized.", 1520);
         }
+
+        public native function lock():void;
+        public native function tryLock():Boolean;
+        public native function unlock():void;
     }
 }

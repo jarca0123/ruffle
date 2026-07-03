@@ -302,6 +302,11 @@ impl ActivePlayer {
         builder = builder
             .with_navigator(navigator)
             .with_renderer(renderer)
+            .with_worker_host(ruffle_core::worker_host::ThreadWorkerHost)
+            // TEST: force a sane frame rate. FlasCC content declares ~0.12 FPS
+            // (≈8.5s/frame) and drives itself via frames/timers, so the low rate
+            // makes the whole thing glacial (and starves worker busy-waits).
+            .with_frame_rate(Some(60.0))
             .with_storage(preferences.storage_backend().create_backend(&opt))
             .with_notification_sender(notification_sender)
             .with_fs_commands(Box::new(DesktopFSCommandProvider {

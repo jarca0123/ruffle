@@ -1,21 +1,11 @@
 package flash.utils {
-    import __ruffle__.stub_setter;
-
     [Ruffle(InstanceAllocator)]
     public class ByteArray implements IDataInput2, IDataOutput2 {
-        private var _shareable:Boolean = false;
+        [API("684")]
+        public native function set shareable(value:Boolean):void;
 
         [API("684")]
-        public function set shareable(shareable:Boolean):void {
-            stub_setter("flash.utils.ByteArray", "shareable");
-
-            this._shareable = shareable;
-        }
-
-        [API("684")]
-        public function get shareable():Boolean {
-            return this._shareable;
-        }
+        public native function get shareable():Boolean;
 
         public static native function get defaultObjectEncoding():uint;
         public static native function set defaultObjectEncoding(encoding:uint):void;
@@ -81,6 +71,12 @@ package flash.utils {
         public native function writeUTF(value:String):void;
         public native function writeUTFBytes(value:String):void;
         public native function writeObject(object:*):void;
+
+        [API("682")]
+        public native function atomicCompareAndSwapIntAt(byteIndex:int, expectedValue:int, newValue:int):int;
+
+        [API("682")]
+        public native function atomicCompareAndSwapLength(expectedLength:int, newLength:int):int;
 
         prototype.toJSON = function(k:String):* {
             return "ByteArray";

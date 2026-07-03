@@ -43,16 +43,24 @@ function cargoBuild({
     features,
     rustFlags,
     extensions,
+    threads,
 }: {
     profile?: string;
     features?: string[];
     rustFlags?: string[];
     extensions?: boolean;
+    threads?: boolean;
 }) {
     let args = ["build", "--locked", "--target", "wasm32-unknown-unknown"];
-    if (!extensions) {
+    // The threaded build recompiles std with `+atomics`; the plain (non-extensions)
+    // build also uses build-std for the MVP target-cpu.
+    if (!extensions || threads) {
         args.push("-Z");
         args.push("build-std=std,panic_abort");
+    }
+    // Real Flash workers (FlasCC) via wasm threads / Web Workers over shared memory.
+    if (threads) {
+        features = (features || []).concat(["threads"]);
     }
 
     if (profile) {
@@ -105,6 +113,7 @@ function buildWasm(
     optimise: boolean,
     extensions: boolean,
     wasmSource: string,
+    threads: boolean = false,
 ) {
     const rustFlags = [
         "--cfg=web_sys_unstable_apis",
@@ -113,8 +122,35 @@ function buildWasm(
     ];
     const wasmBindgenFlags = [];
     const wasmOptFlags = [];
-    const flavor = extensions ? "extensions" : "vanilla";
-    if (extensions) {
+    const flavor = threads ? "threads" : extensions ? "extensions" : "vanilla";
+    if (threads) {
+        // Shared-memory threaded build for real Flash workers (FlasCC runs the
+        // worker SWF on a Web Worker over a shared WebAssembly.Memory). Mirrors
+        // web/thread-smoke/build.sh: `+atomics` + shared/imported memory + the
+        // TLS/heap exports wasm-bindgen's thread bootstrap needs. Kept simd- and
+        // reference-types-free so the shared-memory module stays wasm-bindgen and
+        // wasm-opt friendly. Requires a cross-origin-isolated page (COOP/COEP).
+        rustFlags.push(
+            "-C",
+            "target-feature=+atomics,+bulk-memory,+mutable-globals",
+            "-C",
+            "link-arg=--shared-memory",
+            "-C",
+            "link-arg=--import-memory",
+            "-C",
+            "link-arg=--max-memory=2147483648",
+            "-C",
+            "link-arg=--export=__heap_base",
+            "-C",
+            "link-arg=--export=__wasm_init_tls",
+            "-C",
+            "link-arg=--export=__tls_base",
+            "-C",
+            "link-arg=--export=__tls_size",
+            "-C",
+            "link-arg=--export=__tls_align",
+        );
+    } else if (extensions) {
         rustFlags.push(
             "-C",
             "target-feature=+bulk-memory,+simd128,+nontrapping-fptoint,+sign-ext,+reference-types",
@@ -131,6 +167,7 @@ function buildWasm(
             profile,
             rustFlags,
             extensions,
+            threads,
         });
         originalWasmPath = `../../../target/wasm32-unknown-unknown/${profile}/ruffle_web.wasm`;
         if (wasmSource === "cargo_and_store") {
@@ -150,12 +187,16 @@ function buildWasm(
         dir: "dist",
         flags: wasmBindgenFlags,
     });
-    if (optimise) {
+    if (optimise && !threads) {
         console.log(`Running wasm-opt on ${flavor}...`);
         runWasmOpt({
             path: `dist/${filename}_bg.wasm`,
             flags: wasmOptFlags,
         });
+    } else if (threads) {
+        // Skip wasm-opt for the shared-memory build: its DCE can strip the
+        // __tls_*/__heap_base exports the thread bootstrap relies on.
+        console.log("Skipping wasm-opt for threaded (shared-memory) build.");
     }
 }
 function detectWasmOpt() {
@@ -178,13 +219,28 @@ if (wasmSource === "cargo_and_store") {
     rmSync("../../dist", { recursive: true, force: true });
     mkdirSync("../../dist");
 }
-buildWasm("web-wasm-extensions", "ruffle_web", hasWasmOpt, true, wasmSource);
-if (buildWasmMvp) {
+// Threaded (shared-memory) build: emits `ruffle_web` so the demo loads it as the
+// primary module. Only works on a cross-origin-isolated page (COOP/COEP). Enable
+// with `BUILD_WASM_THREADS=true`.
+const buildWasmThreads = !!process.env["BUILD_WASM_THREADS"];
+if (buildWasmThreads) {
     buildWasm(
         "web-wasm-mvp",
-        "ruffle_web-wasm_mvp",
+        "ruffle_web",
         hasWasmOpt,
         false,
         wasmSource,
+        true,
     );
+} else {
+    buildWasm("web-wasm-extensions", "ruffle_web", hasWasmOpt, true, wasmSource);
+    if (buildWasmMvp) {
+        buildWasm(
+            "web-wasm-mvp",
+            "ruffle_web-wasm_mvp",
+            hasWasmOpt,
+            false,
+            wasmSource,
+        );
+    }
 }

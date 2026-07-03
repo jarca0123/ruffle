@@ -14,6 +14,7 @@ use swf::TagCode;
 
 mod __ruffle__;
 mod array;
+mod avm2;
 mod avmplus;
 mod boolean;
 mod class;
@@ -177,6 +178,8 @@ pub struct SystemClasses<'gc> {
     pub worker: ClassObject<'gc>,
     pub workerdomain: ClassObject<'gc>,
     pub messagechannel: ClassObject<'gc>,
+    pub mutex: ClassObject<'gc>,
+    pub condition: ClassObject<'gc>,
     pub securitydomain: ClassObject<'gc>,
 }
 
@@ -355,6 +358,8 @@ impl<'gc> SystemClasses<'gc> {
             worker: object,
             workerdomain: object,
             messagechannel: object,
+            mutex: object,
+            condition: object,
             securitydomain: object,
         }
     }
@@ -749,6 +754,8 @@ pub fn init_native_system_classes(activation: &mut Activation<'_, '_>) {
             ("flash.utils", "Dictionary", dictionary),
             ("flash.system", "ApplicationDomain", application_domain),
             ("flash.system", "MessageChannel", messagechannel),
+            ("flash.concurrent", "Mutex", mutex),
+            ("flash.concurrent", "Condition", condition),
             ("flash.system", "SecurityDomain", securitydomain),
             ("flash.system", "Worker", worker),
             ("flash.system", "WorkerDomain", workerdomain),

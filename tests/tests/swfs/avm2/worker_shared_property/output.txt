@@ -1,0 +1,8 @@
+unset = undefined
+num = 42
+str = hello
+num overwritten = 99
+ba same object = true
+w missing = undefined
+w wkey = 7
+primordial wkey = undefined

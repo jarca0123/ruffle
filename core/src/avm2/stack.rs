@@ -110,40 +110,65 @@ impl<'a, 'gc> StackFrame<'a, 'gc> {
         }
     }
 
+    // The accessors below index `data` with verifier-guaranteed offsets and so
+    // use `get_unchecked` to avoid a bounds-check branch on every operand-stack
+    // op (this loop is ~50% of a compute-heavy SWF's runtime). The invariant:
+    // the frame is sized `num_locals + max_stack`, and the type-aware verifier
+    // proves every local index is `< num_locals` and that the operand stack
+    // never grows past `max_stack` (nor pops when empty). Every caller is an
+    // already-verified interpreter op. A `debug_assert!` re-checks each index so
+    // any hole in that invariant is still caught in debug/test builds.
+
     /// Push a value onto the operand stack.
     #[inline(always)]
     pub fn push(&self, value: Value<'gc>) {
-        self.data[self.stack_pointer.get()].set(value);
-        self.stack_pointer.set(self.stack_pointer.get() + 1);
+        let sp = self.stack_pointer.get();
+        debug_assert!(sp < self.data.len(), "operand stack overflowed max_stack");
+        // SAFETY: verification bounds the stack depth by `max_stack`; see above.
+        unsafe { self.data.get_unchecked(sp) }.set(value);
+        self.stack_pointer.set(sp + 1);
     }
 
     /// Retrieve the top-most value on the operand stack.
     #[inline(always)]
     pub fn pop(&self) -> Value<'gc> {
-        self.stack_pointer.set(self.stack_pointer.get() - 1);
-
-        self.data[self.stack_pointer.get()].get()
+        let sp = self.stack_pointer.get() - 1;
+        debug_assert!(sp < self.data.len(), "operand stack underflow");
+        self.stack_pointer.set(sp);
+        // SAFETY: verification guarantees a matching push precedes every pop.
+        unsafe { self.data.get_unchecked(sp) }.get()
     }
 
     /// Peek the n-th value from the end of the operand stack.
     #[inline(always)]
     pub fn peek(&self, index: usize) -> Value<'gc> {
-        self.data[self.stack_pointer.get() - index - 1].get()
+        let i = self.stack_pointer.get() - index - 1;
+        debug_assert!(i < self.data.len(), "operand stack peek out of bounds");
+        // SAFETY: verification guarantees the stack holds at least `index + 1`
+        // entries wherever this op runs.
+        unsafe { self.data.get_unchecked(i) }.get()
     }
 
     #[inline(always)]
     pub fn stack_top(&self) -> &'a Cell<Value<'gc>> {
-        &self.data[self.stack_pointer.get() - 1]
+        let i = self.stack_pointer.get() - 1;
+        debug_assert!(i < self.data.len(), "operand stack is empty");
+        // SAFETY: verification guarantees a non-empty stack here.
+        unsafe { self.data.get_unchecked(i) }
     }
 
     #[inline(always)]
     pub fn value_at(&self, index: usize) -> Value<'gc> {
-        self.data[index].get()
+        debug_assert!(index < self.data.len(), "local register out of bounds");
+        // SAFETY: verification guarantees `index < num_locals <= data.len()`.
+        unsafe { self.data.get_unchecked(index) }.get()
     }
 
     #[inline(always)]
     pub fn set_value_at(&self, index: usize, value: Value<'gc>) {
-        self.data[index].set(value);
+        debug_assert!(index < self.data.len(), "local register out of bounds");
+        // SAFETY: verification guarantees `index < num_locals <= data.len()`.
+        unsafe { self.data.get_unchecked(index) }.set(value);
     }
 
     #[inline(always)]
@@ -153,7 +178,13 @@ impl<'a, 'gc> StackFrame<'a, 'gc> {
 
         self.set_stack_pointer(base);
 
-        &self.data[base..base + arg_count]
+        debug_assert!(
+            base + arg_count <= self.data.len(),
+            "operand stack args out of bounds"
+        );
+        // SAFETY: verification guarantees these `arg_count` values were pushed,
+        // so `base..base + arg_count` is within the frame.
+        unsafe { self.data.get_unchecked(base..base + arg_count) }
     }
 
     #[inline(always)]

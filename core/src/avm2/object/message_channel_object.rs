@@ -2,6 +2,7 @@ use crate::avm2::activation::Activation;
 use crate::avm2::object::TObject;
 use crate::avm2::object::kind;
 use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::worker_shared::SharedMessageChannel;
 use core::fmt;
 use gc_arena::{Collect, Gc};
 use ruffle_common::utils::HasPrefixField;
@@ -24,6 +25,11 @@ impl fmt::Debug for MessageChannelObject<'_> {
 pub struct MessageChannelObjectData<'gc> {
     /// Base script object
     base: ScriptObjectData<'gc, kind::MessageChannelObject>,
+
+    /// The shared, arena-external message queue. Both endpoints (both workers)
+    /// hold a clone of the same channel.
+    #[collect(require_static)]
+    channel: SharedMessageChannel,
 }
 
 impl<'gc> TObject<'gc> for MessageChannelObject<'gc> {
@@ -34,8 +40,24 @@ impl<'gc> TObject<'gc> for MessageChannelObject<'gc> {
 
 impl<'gc> MessageChannelObject<'gc> {
     pub fn new(activation: &mut Activation<'_, 'gc>) -> Self {
+        Self::from_shared(activation, SharedMessageChannel::new())
+    }
+
+    /// Build a `MessageChannel` object wrapping an existing shared channel (used
+    /// when a channel crosses the worker boundary by reference).
+    pub fn from_shared(
+        activation: &mut Activation<'_, 'gc>,
+        channel: SharedMessageChannel,
+    ) -> Self {
         let class = activation.avm2().classes().messagechannel;
         let base = ScriptObjectData::new(class);
-        MessageChannelObject(Gc::new(activation.gc(), MessageChannelObjectData { base }))
+        MessageChannelObject(Gc::new(
+            activation.gc(),
+            MessageChannelObjectData { base, channel },
+        ))
+    }
+
+    pub fn channel(self) -> SharedMessageChannel {
+        self.0.channel.clone()
     }
 }

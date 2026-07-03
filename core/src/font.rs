@@ -224,16 +224,39 @@ impl std::fmt::Debug for FontFileData {
 }
 
 /// Represents a raw font file (ie .ttf).
-/// This should be shared and reused where possible, and it's reparsed every time a new glyph is required.
+/// This should be shared and reused where possible.
 ///
-/// Parsing of a font is near-free (according to [ttf_parser::Face::parse]), but the storage isn't.
+/// The parsed [`ttf_parser::Face`] is cached (see [`FontFace::face`]) rather than
+/// re-parsed on every glyph lookup: despite the "near-free" note in ttf_parser's
+/// own docs, re-parsing the table directory per glyph accounted for ~9% of
+/// OpenTTD's runtime (a very text-heavy SWF).
 ///
 /// Font files may contain multiple individual font faces, but those font faces may reuse the same
 /// Glyph from the same file. For this reason, glyphs are reused where possible.
 #[derive(Debug)]
 pub struct FontFace {
+    /// The raw font bytes. Kept alive for `face`, which borrows from it.
+    ///
+    /// MUST stay declared *after* `face` so it is dropped last (Rust drops
+    /// fields in declaration order), and MUST never be mutated — see the safety
+    /// note on `face`. Read only via `face`'s borrow, so it looks dead to the
+    /// compiler even though dropping it would dangle `face`.
+    #[expect(dead_code, reason = "keep-alive backing store borrowed by `face`")]
     data: FontFileData,
+
+    /// The parsed face, self-referentially borrowing `data`'s bytes.
+    ///
+    /// SAFETY: the `'static` here is a lie standing in for "borrows `data`".
+    /// It is sound because `data` is a [`FontFileData`] (an `Arc<dyn AsRef<[u8]>>`),
+    /// so its bytes live at a stable heap address and are immutable — `face`'s
+    /// internal pointers stay valid even when this struct (hence the `Arc`
+    /// *handle*) is moved, because the pointed-to bytes never move. We only ever
+    /// hand out `&Face` borrows tied to `&self`, and `face` is dropped before
+    /// `data`, so the borrow can never outlive the bytes.
+    face: ttf_parser::Face<'static>,
+
     glyphs: Vec<OnceCell<Option<Glyph>>>,
+    #[expect(dead_code, reason = "kept for parity/debugging; face is pre-parsed")]
     font_index: u32,
 
     ascender: i32,
@@ -268,8 +291,15 @@ impl FontFace {
             })
             .unwrap_or_default();
 
+        // SAFETY: extend the borrow to `'static` so we can store `face` next to
+        // the `data` it borrows. `face` points into `data`'s Arc-backed, immutable
+        // bytes, which stay put when `data` is moved into the struct below and for
+        // as long as the struct lives. See the field docs on `face`/`data`.
+        let face: ttf_parser::Face<'static> = unsafe { std::mem::transmute(face) };
+
         Ok(Self {
             data,
+            face,
             font_index,
             glyphs,
             ascender,
@@ -281,8 +311,7 @@ impl FontFace {
     }
 
     pub fn get_glyph(&self, character: char) -> Option<&Glyph> {
-        let face = ttf_parser::Face::parse(&self.data, self.font_index)
-            .expect("Font was already checked to be valid");
+        let face = &self.face;
         if let Some(glyph_id) = face.glyph_index(character) {
             return self.glyphs[glyph_id.0 as usize]
                 .get_or_init(|| {
@@ -325,8 +354,7 @@ impl FontFace {
     }
 
     pub fn get_kerning_offset(&self, left: char, right: char) -> Twips {
-        let face = ttf_parser::Face::parse(&self.data, self.font_index)
-            .expect("Font was already checked to be valid");
+        let face = &self.face;
 
         if let Some(kern) = face.tables().kern
             && let (Some(left_glyph), Some(right_glyph)) =

@@ -12,8 +12,8 @@ pub fn upload_from_byte_array<'gc>(
 
     if let Some(index_buffer) = this.as_index_buffer() {
         let byte_array = args.get_object(activation, 0, "byteArray")?;
-        let byte_array = byte_array
-            .as_bytearray()
+        let mut byte_array = byte_array
+            .as_bytearray_mut()
             .expect("Parameter must be a ByteArray");
 
         let byte_offset = args.get_u32(1);

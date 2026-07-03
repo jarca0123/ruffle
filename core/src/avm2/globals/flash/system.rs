@@ -6,6 +6,7 @@ pub mod capabilities;
 pub mod security;
 pub mod security_domain;
 pub mod system;
+pub mod message_channel;
 pub mod worker;
 pub mod worker_domain;
 

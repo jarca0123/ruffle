@@ -58,6 +58,8 @@ pub mod debug_ui;
 pub mod external;
 pub mod i18n;
 pub mod stub;
+pub mod worker_host;
+pub mod worker_runtime;
 
 pub use context_menu::ContextMenuItem;
 pub use events::PlayerEvent;

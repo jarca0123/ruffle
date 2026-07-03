@@ -4,12 +4,20 @@ use crate::avm2::error::make_error_3732;
 use crate::avm2::object::TObject;
 use crate::avm2::object::kind;
 use crate::avm2::object::script_object::ScriptObjectData;
+use crate::avm2::value::Value;
+use crate::avm2::worker_shared::SharedProperties;
 use crate::context::UpdateContext;
+use crate::string::AvmString;
 use core::fmt;
-use gc_arena::{Collect, Gc};
+use fnv::FnvHashMap;
+use gc_arena::barrier::unlock;
+use gc_arena::lock::RefLock;
+use gc_arena::{Collect, Gc, Mutation};
 use ruffle_common::utils::HasPrefixField;
 use ruffle_macros::Avm2Enum;
 use std::cell::Cell;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Collect, Copy)]
 #[collect(no_drop)]
@@ -31,6 +39,25 @@ pub struct WorkerObjectData<'gc> {
     base: ScriptObjectData<'gc, kind::WorkerObject>,
 
     kind: WorkerKind,
+
+    /// Values set via `Worker.setSharedProperty`, retrievable with
+    /// `getSharedProperty`. In real Flash these cross the worker boundary (by
+    /// AMF copy, or by reference for shareable `ByteArray`/`Mutex`/`Condition`);
+    /// in Ruffle's single-context cooperative model they are simply stored on
+    /// the target worker.
+    shared_properties: RefLock<FnvHashMap<AvmString<'gc>, Value<'gc>>>,
+
+    /// `Send` mirror of the shared properties, so a spawned worker thread (with
+    /// its own arena) can read what the creator set. Populated for values that
+    /// can cross the thread boundary (shareable ByteArray by reference; other
+    /// values by AMF copy).
+    #[collect(require_static)]
+    shared_send: SharedProperties,
+
+    /// Set to request this worker's runtime stop; carried into the worker's
+    /// [`WorkerConfig`](crate::worker_runtime::WorkerConfig).
+    #[collect(require_static)]
+    terminate: Arc<AtomicBool>,
 }
 
 impl<'gc> TObject<'gc> for WorkerObject<'gc> {
@@ -73,11 +100,77 @@ impl<'gc> WorkerObject<'gc> {
         Self::new(context, WorkerKind::Primordial)
     }
 
+    /// The `Worker.current` object for a spawned worker's own runtime: already
+    /// `Running`, and backed by the `Send` shared-property store the creating
+    /// thread populated.
+    pub fn new_worker_runtime(
+        context: &mut UpdateContext<'gc>,
+        shared_send: SharedProperties,
+    ) -> Self {
+        let class = context.avm2.classes().worker;
+        let base = ScriptObjectData::new(class);
+        Self(Gc::new(
+            context.gc(),
+            WorkerObjectData {
+                base,
+                kind: WorkerKind::Spawned {
+                    state: Cell::new(WorkerState::Running),
+                },
+                shared_properties: RefLock::new(FnvHashMap::default()),
+                shared_send,
+                terminate: Arc::default(),
+            },
+        ))
+    }
+
     fn new(context: &mut UpdateContext<'gc>, kind: WorkerKind) -> Self {
         let class = context.avm2.classes().worker;
         let base = ScriptObjectData::new(class);
 
-        Self(Gc::new(context.gc(), WorkerObjectData { base, kind }))
+        Self(Gc::new(
+            context.gc(),
+            WorkerObjectData {
+                base,
+                kind,
+                shared_properties: RefLock::new(FnvHashMap::default()),
+                shared_send: Arc::default(),
+                terminate: Arc::default(),
+            },
+        ))
+    }
+
+    /// Stable identity of this worker (its GC pointer), used as a worker id
+    /// across the thread boundary.
+    pub fn id(self) -> u64 {
+        Gc::as_ptr(self.0) as u64
+    }
+
+    /// The `Send` shared-property store shared with this worker's thread.
+    pub fn shared_send(self) -> SharedProperties {
+        self.0.shared_send.clone()
+    }
+
+    /// The termination flag handed to this worker's runtime.
+    pub fn terminate_flag(self) -> Arc<AtomicBool> {
+        self.0.terminate.clone()
+    }
+
+    /// Retrieves a value stored with `setSharedProperty`, or `undefined` if the
+    /// key was never set.
+    pub fn get_shared_property(self, key: AvmString<'gc>) -> Value<'gc> {
+        self.0
+            .shared_properties
+            .borrow()
+            .get(&key)
+            .copied()
+            .unwrap_or(Value::Undefined)
+    }
+
+    /// Stores a value under `key`, retrievable with `getSharedProperty`.
+    pub fn set_shared_property(self, mc: &Mutation<'gc>, key: AvmString<'gc>, value: Value<'gc>) {
+        unlock!(Gc::write(mc, self.0), WorkerObjectData, shared_properties)
+            .borrow_mut()
+            .insert(key, value);
     }
 
     pub fn is_primordial(self) -> bool {

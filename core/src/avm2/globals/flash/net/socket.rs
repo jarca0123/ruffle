@@ -603,20 +603,18 @@ pub fn write_bytes<'gc>(
         let offset = args.get_u32(1) as usize;
         let length = args.get_u32(2) as usize;
 
-        let ba_read = bytearray
-            .as_bytearray()
+        let mut ba_read = bytearray
+            .as_bytearray_mut()
             .expect("Parameter must be a bytearray!");
 
+        // If length is 0, read the remaining bytes from the supplied offset.
+        let read_len = if length != 0 {
+            length
+        } else {
+            ba_read.len().saturating_sub(offset)
+        };
         let to_write = ba_read
-            .read_at(
-                // If length is 0, lets read the remaining bytes of ByteArray from the supplied offset
-                if length != 0 {
-                    length
-                } else {
-                    ba_read.len().saturating_sub(offset)
-                },
-                offset,
-            )
+            .read_at(read_len, offset)
             .map_err(|e| e.to_avm(activation))?;
 
         socket.write_bytes(to_write);

@@ -35,7 +35,7 @@ pub fn do_copy<'gc>(
             let width = texture.handle().width();
             let height = texture.handle().height();
 
-            let bytearray = data.as_bytearray().unwrap();
+            let mut bytearray = data.as_bytearray_mut().unwrap();
 
             let colors: Vec<_> = bytearray
                 .read_at((4 * width * height) as usize, byte_array_offset as usize)

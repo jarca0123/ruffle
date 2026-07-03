@@ -53,6 +53,7 @@ use crate::socket::Sockets;
 use crate::streams::StreamManager;
 use crate::string::{AvmStringInterner, StringContext};
 use crate::stub::StubCollection;
+use crate::worker_host::{NullWorkerHost, WorkerHost};
 use crate::system_properties::SystemProperties;
 use crate::tag_utils::SwfMovie;
 use crate::timer::Timers;
@@ -325,6 +326,7 @@ pub struct Player {
     log: Box<dyn LogBackend>,
     ui: Box<dyn UiBackend>,
     video: Box<dyn VideoBackend>,
+    worker_host: Box<dyn WorkerHost>,
 
     transform_stack: TransformStack,
 
@@ -1982,6 +1984,13 @@ impl Player {
             {
                 let was_root_movie_loaded = root.loaded_bytes() as i32 == root.total_bytes();
                 did_finish = root.preload(context, limit);
+                tracing::debug!(
+                    "preload: total_bytes={}, loaded_bytes={}, frames_loaded={}/{}, did_finish={did_finish}",
+                    root.total_bytes(),
+                    root.loaded_bytes(),
+                    root.frames_loaded(),
+                    root.header_frames(),
+                );
 
                 if let Some(loader_info) = root.loader_info().filter(|_| !was_root_movie_loaded) {
                     let mut activation = Avm2Activation::from_nothing(context);
@@ -2237,6 +2246,22 @@ impl Player {
         }
     }
 
+    /// Install a spawned worker's identity into this (headless) player's AVM2:
+    /// `Worker.current` becomes a running worker backed by the given shared
+    /// property store. Called once by [`crate::worker_runtime::run_worker`].
+    pub fn install_worker_context(
+        &mut self,
+        worker_id: u64,
+        shared: crate::avm2::worker_shared::SharedProperties,
+    ) {
+        self.mutate_with_update_context(|context| {
+            let worker =
+                crate::avm2::object::WorkerObject::new_worker_runtime(context, shared);
+            context.avm2.set_current_worker(worker);
+        });
+        tracing::info!("worker {worker_id} context installed");
+    }
+
     /// Runs the closure `f` with an `UpdateContext`.
     /// This takes cares of populating the `UpdateContext` struct, avoiding borrow issues.
     pub fn mutate_with_update_context<F, R>(&mut self, f: F) -> R
@@ -2298,6 +2323,7 @@ impl Player {
                 storage: this.storage.deref_mut(),
                 log: this.log.deref_mut(),
                 video: this.video.deref_mut(),
+                worker_host: &*this.worker_host,
                 avm1_shared_objects,
                 avm2_shared_objects,
                 unbound_text_fields,
@@ -2601,6 +2627,7 @@ pub struct PlayerBuilder {
     storage: Option<Box<dyn StorageBackend>>,
     ui: Option<Box<dyn UiBackend>>,
     video: Option<Box<dyn VideoBackend>>,
+    worker_host: Option<Box<dyn WorkerHost>>,
 
     // Notifications
     notification_sender: Option<Sender<PlayerNotification>>,
@@ -2650,6 +2677,7 @@ impl PlayerBuilder {
             audio: None,
             log: None,
             navigator: None,
+            worker_host: None,
             renderer: None,
             storage: None,
             ui: None,
@@ -2761,6 +2789,14 @@ impl PlayerBuilder {
     #[inline]
     pub fn with_video(mut self, video: impl 'static + VideoBackend) -> Self {
         self.video = Some(Box::new(video));
+        self
+    }
+
+    /// Sets the worker host, used to spawn background `flash.system.Worker`
+    /// runtimes. Without one, worker creation is unsupported.
+    #[inline]
+    pub fn with_worker_host(mut self, worker_host: impl 'static + WorkerHost) -> Self {
+        self.worker_host = Some(Box::new(worker_host));
         self
     }
 
@@ -3010,6 +3046,9 @@ impl PlayerBuilder {
         let video = self
             .video
             .unwrap_or_else(|| Box::new(null::NullVideoBackend::new()));
+        let worker_host = self
+            .worker_host
+            .unwrap_or_else(|| Box::new(NullWorkerHost));
 
         let player_version = self.player_version.unwrap_or(DEFAULT_PLAYER_VERSION);
         let language = ui.language();
@@ -3027,6 +3066,7 @@ impl PlayerBuilder {
                 storage,
                 ui,
                 video,
+                worker_host,
 
                 // SWF info
                 swf_version: player_version,

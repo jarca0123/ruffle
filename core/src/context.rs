@@ -35,6 +35,7 @@ use crate::streams::StreamManager;
 use crate::string::HasStringContext;
 use crate::string::{AvmString, StringContext};
 use crate::stub::StubCollection;
+use crate::worker_host::WorkerHost;
 use crate::system_properties::SystemProperties;
 use crate::tag_utils::{SwfMovie, SwfSlice};
 use crate::timer::Timers;
@@ -122,6 +123,9 @@ pub struct UpdateContext<'gc> {
 
     /// The video backend, used for video decoding
     pub video: &'gc mut dyn VideoBackend,
+
+    /// Spawns background worker execution threads for `flash.system.Worker`.
+    pub worker_host: &'gc dyn WorkerHost,
 
     /// The RNG, used by the AVM `RandomNumber` opcode, `Math.random(),` and `random()`.
     pub rng: &'gc mut AvmRng,

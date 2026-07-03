@@ -4,7 +4,7 @@ use crate::avm2::Avm2StrRepresentable;
 use crate::avm2::Error;
 use crate::avm2::activation::Activation;
 use crate::avm2::bytearray::{CompressionAlgorithm, Endian, ObjectEncoding};
-use crate::avm2::error::{make_error_2008, make_error_2058};
+use crate::avm2::error::{Error2006Type, make_error_2006, make_error_2008, make_error_2058};
 use crate::avm2::object::Object;
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
@@ -80,19 +80,17 @@ pub fn write_bytes<'gc>(
         // The ByteArray we are reading from is different than the ByteArray we are writing to,
         // so we are allowed to borrow both at the same time without worrying about a panic
 
-        let ba_read = bytearray
-            .as_bytearray()
+        let mut ba_read = bytearray
+            .as_bytearray_mut()
             .expect("Parameter must be a bytearray");
+        // If length is 0, read the remaining bytes from the supplied offset.
+        let read_len = if length != 0 {
+            length
+        } else {
+            ba_read.len().saturating_sub(offset)
+        };
         let to_write = ba_read
-            .read_at(
-                // If length is 0, lets read the remaining bytes of ByteArray from the supplied offset
-                if length != 0 {
-                    length
-                } else {
-                    ba_read.len().saturating_sub(offset)
-                },
-                offset,
-            )
+            .read_at(read_len, offset)
             .map_err(|e| e.to_avm(activation))?;
 
         if let Some(mut bytearray) = this.as_bytearray_mut() {
@@ -129,16 +127,15 @@ pub fn read_bytes<'gc>(
     let length = args.get_u32(2) as usize;
 
     if !Object::ptr_eq(this, bytearray) {
-        if let Some(bytearray_read) = this.as_bytearray() {
+        if let Some(mut bytearray_read) = this.as_bytearray_mut() {
+            // If length is 0, read the remaining bytes of the ByteArray.
+            let read_len = if length != 0 {
+                length
+            } else {
+                bytearray_read.bytes_available()
+            };
             let to_write = bytearray_read
-                .read_bytes(
-                    // If length is 0, lets read the remaining bytes of ByteArray
-                    if length != 0 {
-                        length
-                    } else {
-                        bytearray_read.bytes_available()
-                    },
-                )
+                .read_bytes(read_len)
                 .map_err(|e| e.to_avm(activation))?;
 
             let mut ba_write = bytearray
@@ -192,7 +189,7 @@ pub fn read_utf<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
 
-    if let Some(bytearray) = this.as_bytearray() {
+    if let Some(mut bytearray) = this.as_bytearray_mut() {
         return Ok(AvmString::new_utf8_bytes(
             activation.gc(),
             bytearray.read_utf().map_err(|e| e.to_avm(activation))?,
@@ -322,6 +319,82 @@ pub fn set_length<'gc>(
     if let Some(mut bytearray) = this.as_bytearray_mut() {
         let len = args.get_u32(0) as usize;
         bytearray.set_length(len);
+    }
+
+    Ok(Value::Undefined)
+}
+
+pub fn get_shareable<'gc>(
+    _activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    let this = this.as_object().unwrap();
+
+    if let Some(bytearray) = this.as_bytearray() {
+        return Ok(bytearray.is_shareable().into());
+    }
+
+    Ok(Value::Undefined)
+}
+
+pub fn set_shareable<'gc>(
+    _activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    let this = this.as_object().unwrap();
+
+    if let Some(mut bytearray) = this.as_bytearray_mut() {
+        // Flash only allows turning `shareable` on; once shared it stays shared.
+        if args.get_bool(0) {
+            bytearray.make_shareable();
+        }
+    }
+
+    Ok(Value::Undefined)
+}
+
+pub fn atomic_compare_and_swap_int_at<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    let this = this.as_object().unwrap();
+
+    if let Some(mut bytearray) = this.as_bytearray_mut() {
+        let byte_index = args.get_i32(0);
+        let expected_value = args.get_i32(1);
+        let new_value = args.get_i32(2);
+
+        if byte_index < 0 {
+            return Err(make_error_2006(activation, Error2006Type::RangeError));
+        }
+
+        let old = bytearray
+            .atomic_compare_and_swap_int_at(byte_index as usize, expected_value, new_value)
+            .map_err(|e| e.to_avm(activation))?;
+
+        return Ok(old.into());
+    }
+
+    Ok(Value::Undefined)
+}
+
+pub fn atomic_compare_and_swap_length<'gc>(
+    _activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    let this = this.as_object().unwrap();
+
+    if let Some(mut bytearray) = this.as_bytearray_mut() {
+        let expected_length = args.get_i32(0).max(0) as usize;
+        let new_length = args.get_i32(1).max(0) as usize;
+
+        let old = bytearray.atomic_compare_and_swap_length(expected_length, new_length);
+
+        return Ok(Value::from_usize_lossy(old));
     }
 
     Ok(Value::Undefined)
@@ -474,7 +547,7 @@ pub fn read_boolean<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
 
-    if let Some(bytearray) = this.as_bytearray() {
+    if let Some(mut bytearray) = this.as_bytearray_mut() {
         return Ok(bytearray
             .read_boolean()
             .map_err(|e| e.to_avm(activation))?
@@ -508,7 +581,7 @@ pub fn read_utf_bytes<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
 
-    if let Some(bytearray) = this.as_bytearray() {
+    if let Some(mut bytearray) = this.as_bytearray_mut() {
         let len = args.get_u32(0);
         return Ok(AvmString::new_utf8_bytes(
             activation.gc(),
@@ -685,7 +758,7 @@ pub fn read_multi_byte<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
 
-    if let Some(bytearray) = this.as_bytearray() {
+    if let Some(mut bytearray) = this.as_bytearray_mut() {
         let len = args.get_u32(0);
         let charset_label = args.get_string_non_null(activation, 1, "charSet")?;
         let bytes = bytearray
@@ -785,12 +858,18 @@ pub fn read_object<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
 
-    if let Some(bytearray) = this.as_bytearray() {
+    if let Some(mut bytearray) = this.as_bytearray_mut() {
+        let avail = bytearray.bytes_available();
+        let pos = bytearray.position();
+        let encoding = bytearray.object_encoding();
+        // Owned copy so the borrow of `bytearray` ends before we touch it again.
         let bytes = bytearray
-            .read_at(bytearray.bytes_available(), bytearray.position())
-            .map_err(|e| e.to_avm(activation))?;
+            .read_at(avail, pos)
+            .map_err(|e| e.to_avm(activation))?
+            .to_vec();
+        let bytes = bytes.as_slice();
 
-        let (bytes_left, value) = match bytearray.object_encoding() {
+        let (bytes_left, value) = match encoding {
             ObjectEncoding::Amf0 => {
                 let mut decoder = AMF0Decoder::default();
                 let (extra, amf) = decoder

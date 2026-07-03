@@ -1976,15 +1976,30 @@ pub fn set_pixels_from_byte_array<'gc>(
     let mut write = target.borrow_mut(mc);
 
     if region.width() > 0 && region.height() > 0 {
+        // Hoist the copy-on-write out of the pixel loop: `set_pixel32_raw` calls
+        // `Rc::make_mut` *per pixel*, which for a full-framebuffer upload (e.g.
+        // OpenTTD blitting ~900k px/frame) is a refcount check — and a possible
+        // whole-buffer clone — on every pixel. Do it once, then index the row.
+        let bmp_width = write.width();
+        let pixels = write.raw_pixels_mut();
         for y in region.y_min..region.y_max {
+            let row_base = (y * bmp_width) as usize;
             for x in region.x_min..region.x_max {
                 // Copy data from bytearray until EOFError or finished
                 let color = bytearray.read_unsigned_int()?;
-                write.set_pixel32_raw(
-                    x,
-                    y,
-                    Color::from(color).to_premultiplied_alpha(transparency),
-                );
+                // In bounds: `region` was clamped to the target's dimensions above.
+                pixels[row_base + x as usize] = if transparency {
+                    Color::from(color).to_premultiplied_alpha(true)
+                } else {
+                    // Opaque target: premultiply-by-alpha reduces to "force
+                    // alpha to 255, leave RGB untouched" (the multiply/divide
+                    // per channel is exactly identity when a==255). Colors are
+                    // BGRA-little-endian `u32`s, so alpha is the high byte.
+                    // Skipping the arithmetic matters: this is a full-framebuffer
+                    // upload every frame for opaque SWFs like OpenTTD. The
+                    // `transparency` test is loop-invariant, so LLVM unswitches it.
+                    Color::from(color | 0xFF00_0000)
+                };
             }
         }
 
