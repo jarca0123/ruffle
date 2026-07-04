@@ -13,7 +13,7 @@ use crate::avm2::globals::{
     SystemClassDefs, SystemClasses, init_builtin_system_class_defs, init_builtin_system_classes,
     init_native_system_classes,
 };
-use crate::avm2::method::{Method, NativeMethodImpl};
+use crate::avm2::method::NativeMethodImpl;
 use crate::avm2::object::{FunctionObject, WorkerObject};
 use crate::avm2::scope::ScopeChain;
 use crate::avm2::script::{Script, TranslationUnit};
@@ -28,6 +28,7 @@ use fnv::FnvHashMap;
 use gc_arena::lock::GcRefLock;
 use gc_arena::{Collect, Gc, Mutation};
 use ruffle_wstr::WStr;
+use std::rc::Rc;
 use swf::DoAbc2Flag;
 use swf::avm2::read::Reader;
 
@@ -56,6 +57,7 @@ mod filters;
 mod flv;
 mod function;
 pub mod globals;
+pub mod jit;
 mod metadata;
 mod method;
 mod multiname;
@@ -88,6 +90,9 @@ pub use crate::avm2::class::Class;
 #[allow(unused)] // For debug_ui
 pub use crate::avm2::domain::{Domain, DomainPtr};
 pub use crate::avm2::error::Error;
+pub use crate::avm2::jit::{JitBackend, NullJit};
+pub use crate::avm2::method::Method;
+pub use crate::avm2::op::Op;
 pub use crate::avm2::flv::FlvValueAvm2Ext;
 pub use crate::avm2::function::FunctionArgs;
 pub use crate::avm2::globals::flash::ui::context_menu::make_context_menu_state;
@@ -198,6 +203,12 @@ pub struct Avm2<'gc> {
     pub debug_output: bool,
 
     pub optimizer_enabled: bool,
+
+    /// The active JIT / method-compiler backend (default [`NullJit`]: always
+    /// interpret). Held behind `Rc` so `run_actions` can clone it out and invoke
+    /// it without conflicting with the `&mut Avm2` borrow held during execution.
+    #[collect(require_static)]
+    jit: Rc<dyn JitBackend>,
 }
 
 impl<'gc> Avm2<'gc> {
@@ -249,6 +260,7 @@ impl<'gc> Avm2<'gc> {
             debug_output: false,
 
             optimizer_enabled: true,
+            jit: Rc::new(NullJit),
         }
     }
 
@@ -696,6 +708,18 @@ impl<'gc> Avm2<'gc> {
 
     pub fn set_optimizer_enabled(&mut self, value: bool) {
         self.optimizer_enabled = value;
+    }
+
+    /// Installs a JIT / method-compiler backend (replacing the default
+    /// interpret-only [`NullJit`]).
+    pub fn set_jit_backend(&mut self, backend: Rc<dyn JitBackend>) {
+        self.jit = backend;
+    }
+
+    /// The active JIT backend, cloned so the caller can invoke it without holding
+    /// a borrow of `self`.
+    pub(crate) fn jit_backend(&self) -> Rc<dyn JitBackend> {
+        self.jit.clone()
     }
 
     // Report an uncaught AVM2 error.

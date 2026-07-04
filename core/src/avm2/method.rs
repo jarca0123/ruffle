@@ -154,6 +154,13 @@ impl core::fmt::Debug for Method<'_> {
 }
 
 impl<'gc> Method<'gc> {
+    /// A stable, process-unique identity for this method: the address of its
+    /// GC allocation. gc-arena is non-moving, so this is stable for the
+    /// method's lifetime — usable as a cache key (e.g. by a JIT backend).
+    pub fn as_ptr(self) -> *const () {
+        Gc::as_ptr(self.0).cast()
+    }
+
     /// Construct a `Method` from an `AbcFile` and method index.
     pub fn from_method_index(
         txunit: TranslationUnit<'gc>,

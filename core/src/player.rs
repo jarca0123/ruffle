@@ -724,6 +724,15 @@ impl Player {
         });
     }
 
+    /// Installs an AVM2 JIT backend (see [`crate::avm2::JitBackend`]). By default
+    /// AVM2 runs entirely on the interpreter; a backend may compile eligible hot
+    /// methods and run them instead, declining the rest.
+    pub fn set_avm2_jit_backend(&mut self, backend: std::rc::Rc<dyn crate::avm2::JitBackend>) {
+        self.enter_arena_mut(|_, gc_root, _| {
+            gc_root.avm2.set_jit_backend(backend);
+        });
+    }
+
     pub fn run_context_menu_callback(&mut self, index: usize) {
         self.mutate_with_update_context(|context| {
             let menu = &context.current_context_menu;

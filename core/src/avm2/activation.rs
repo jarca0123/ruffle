@@ -652,6 +652,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     pub fn run_actions(&mut self, method: Method<'gc>) -> Result<Value<'gc>, Error<'gc>> {
         // The method must be verified at this point
 
+        // Offer the method to the active JIT backend first; `None` (the default
+        // NullJit, or a method it doesn't support / can't compile) falls through
+        // to the interpreter below. `Method` is `Copy`, so `method` is still usable
+        // afterwards.
+        let jit = self.avm2().jit_backend();
+        if let Some(result) = jit.try_run(self, method) {
+            return result;
+        }
+
         let verified_info = method.get_verified_info();
         let opcodes = verified_info.parsed_code.as_slice();
 
