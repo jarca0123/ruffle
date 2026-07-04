@@ -13,6 +13,7 @@ use crate::avm2::globals::slots::flash_geom_rectangle as rectangle_slots;
 use crate::avm2::object::{Object, TObject as _};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 use crate::avm2::{ArrayObject, ArrayStorage};
 use crate::avm2::{ClassObject, Error};
 use crate::context::UpdateContext;
@@ -1122,10 +1123,10 @@ pub fn set_opaque_background<'gc>(
 
     if let Some(dobj) = this.as_display_object() {
         let value = args.get_value(0);
-        let color = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(Color::from_rgb(value.coerce_to_u32(activation)?, 255)),
+        let color = match value.unpack() {
+            ValueEnum::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueEnum::Null => None,
+            _ => Some(Color::from_rgb(value.coerce_to_u32(activation)?, 255)),
         };
         dobj.set_opaque_background(color);
     }

@@ -1,5 +1,5 @@
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::{Activation, Error, Value};
+use crate::avm2::{Activation, Error, Value, ValueEnum};
 use ruffle_render::backend::Context3DProfile;
 
 const PROFILES_HIGH_TO_LOW: &[(&[u8], Context3DProfile)] = [
@@ -41,7 +41,7 @@ pub fn request_context3d_internal<'gc>(
             profiles
                 .iter()
                 .any(|p| {
-                    if let Value::String(p) = p {
+                    if let ValueEnum::String(p) = p.unpack() {
                         &*p == *profile
                     } else {
                         unreachable!()

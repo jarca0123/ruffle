@@ -10,6 +10,7 @@ use crate::avm2::object::script_object::{ScriptObject, ScriptObjectData};
 use crate::avm2::object::{ClassObject, Object, TObject};
 use crate::avm2::scope::ScopeChain;
 use crate::avm2::value::Value;
+use crate::avm2::value::ValueEnum;
 use crate::context::UpdateContext;
 use crate::string::AvmString;
 use core::fmt;
@@ -129,7 +130,7 @@ impl<'gc> FunctionObject<'gc> {
 
         // If the constructor returns an object, use that instead of the created instance
         // TODO: avmplus returns null here if the constructor returns null
-        if let Value::Object(obj) = result {
+        if let ValueEnum::Object(obj) = result.unpack() {
             Ok(obj)
         } else {
             Ok(instance)

@@ -11,6 +11,7 @@ use crate::avm2::globals::array::{
 use crate::avm2::object::{ClassObject, Object, TObject as _, VectorObject};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 use crate::avm2::vector::VectorStorage;
 use crate::avm2::{Error, Multiname, QName};
 use crate::string::{AvmString, WStr};
@@ -218,7 +219,7 @@ pub fn join<'gc>(
         let mut accum = Vec::with_capacity(vector.length());
 
         for item in vector.iter() {
-            if matches!(item, Value::Undefined) || matches!(item, Value::Null) {
+            if matches!(item.unpack(), ValueEnum::Undefined) || matches!(item.unpack(), ValueEnum::Null) {
                 accum.push(istr!("null"));
             } else {
                 accum.push(item.coerce_to_string(activation)?);

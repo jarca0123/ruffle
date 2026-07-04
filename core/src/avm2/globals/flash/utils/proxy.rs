@@ -2,6 +2,7 @@ use crate::avm2::Error;
 use crate::avm2::activation::Activation;
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 
 pub use crate::avm2::object::proxy_allocator;
 
@@ -10,7 +11,7 @@ pub fn is_attribute<'gc>(
     _this: Value<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    if let Value::Object(o) = args.get_value(0)
+    if let ValueEnum::Object(o) = args.get_value(0).unpack()
         && let Some(qname_object) = o.as_qname_object()
     {
         return Ok(qname_object.name().is_attribute().into());

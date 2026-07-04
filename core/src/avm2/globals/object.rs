@@ -4,7 +4,7 @@ use crate::avm2::activation::Activation;
 use crate::avm2::error;
 use crate::avm2::object::{Object, ScriptObject, TObject};
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueEnum};
 use crate::avm2::{Error, Multiname};
 use crate::string::AvmString;
 
@@ -15,7 +15,7 @@ pub fn object_constructor<'gc>(
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     if let Some(arg) = args.get_optional(0)
-        && !matches!(arg, Value::Undefined | Value::Null)
+        && !matches!(arg.unpack(), ValueEnum::Undefined | ValueEnum::Null)
     {
         return Ok(arg);
     }
@@ -68,7 +68,7 @@ pub fn is_prototype_of<'gc>(
         let target_proto = args.get_value(0);
 
         // `null` and `undefined` have no prototype
-        if matches!(target_proto, Value::Undefined | Value::Null) {
+        if matches!(target_proto.unpack(), ValueEnum::Undefined | ValueEnum::Null) {
             return Ok(false.into());
         }
 

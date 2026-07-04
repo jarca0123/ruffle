@@ -3,7 +3,7 @@ use crate::avm2::error::{make_error_2037, make_error_2097, make_error_2174};
 use crate::avm2::globals::slots::flash_net_file_filter as file_filter_slots;
 use crate::avm2::object::{ByteArrayObject, DateObject, FileReference};
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::{Activation, Avm2, Error, EventObject, TObject as _, Value};
+use crate::avm2::{Activation, Avm2, Error, EventObject, TObject as _, Value, ValueEnum};
 use crate::backend::ui::FileFilter;
 use crate::string::AvmString;
 
@@ -148,7 +148,9 @@ pub fn browse<'gc>(
         && let Some(array_storage) = obj.as_array_storage()
     {
         for filter in array_storage.iter() {
-            if let Some(Value::Object(obj)) = filter {
+            if let Some(filter) = filter
+                && let ValueEnum::Object(obj) = filter.unpack()
+            {
                 let filefilter = activation
                     .avm2()
                     .classes()
@@ -163,12 +165,12 @@ pub fn browse<'gc>(
                 let mac_type = obj.get_slot(file_filter_slots::_MAC_TYPE);
 
                 // The description and extension must be non-empty strings.
-                match (description, extension) {
-                    (Value::String(description), Value::String(extension))
+                match (description.unpack(), extension.unpack()) {
+                    (ValueEnum::String(description), ValueEnum::String(extension))
                         if !description.is_empty() && !extension.is_empty() =>
                     {
-                        let mac_type = match mac_type {
-                            Value::String(mac_type) if !mac_type.is_empty() => {
+                        let mac_type = match mac_type.unpack() {
+                            ValueEnum::String(mac_type) if !mac_type.is_empty() => {
                                 Some(mac_type.to_string())
                             }
                             _ => None,

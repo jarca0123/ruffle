@@ -11,7 +11,7 @@ use crate::avm2::object::kind;
 use crate::avm2::object::script_object::ScriptObjectData;
 use crate::avm2::object::{ClassObject, NamespaceObject, Object, TObject, XmlListObject};
 use crate::avm2::value::Value;
-use crate::avm2::{Error, Multiname};
+use crate::avm2::{Error, Multiname, ValueEnum};
 use crate::string::AvmString;
 use core::fmt;
 use gc_arena::barrier::unlock;
@@ -260,7 +260,7 @@ impl<'gc> XmlObject<'gc> {
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<bool, Error<'gc>> {
         // 3.a. If both x and y are the same type (XML)
-        if let Value::Object(obj) = other
+        if let ValueEnum::Object(obj) = other.unpack()
             && let Some(xml_obj) = obj.as_xml_object()
         {
             // 3.a.i. If ((x.[[Class]] ∈ {"text", "attribute"}) and (y.hasSimpleContent())
@@ -381,7 +381,7 @@ impl<'gc> TObject<'gc> for XmlObject<'gc> {
         // If the method doesn't exist on the prototype, and we have simple content,
         // then coerce this XML to a string and call the method on that.
         // This lets things like `new XML("<p>Hello world</p>").split(" ")` work.
-        if matches!(method, Value::Undefined) {
+        if matches!(method.unpack(), ValueEnum::Undefined) {
             // Checking if we have a child with the same name as the method is probably
             // unnecessary - if we had such a child, then we wouldn't have simple content,
             // so we already would bail out before calling the method. Nevertheless,

@@ -7,6 +7,7 @@ use crate::avm2::error::make_error_2109;
 use crate::avm2::object::ArrayObject;
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 use crate::display_object::{MovieClip, Scene};
 use crate::string::{AvmString, WString};
 
@@ -399,10 +400,11 @@ pub fn goto_frame<'gc>(
     }
     .unwrap_or(0) as i32;
 
-    let frame = match frame_or_label.normalize() {
-        Value::Integer(i) => i + scene,
-        frame_or_label => {
-            let frame_or_label = frame_or_label.coerce_to_string(activation)?;
+    let normalized = frame_or_label.normalize();
+    let frame = match normalized.unpack() {
+        ValueEnum::Integer(i) => i + scene,
+        _ => {
+            let frame_or_label = normalized.coerce_to_string(activation)?;
             let frame = crate::avm2::value::string_to_int(&frame_or_label, 10, true);
             if !frame.is_nan() {
                 (frame as i32)

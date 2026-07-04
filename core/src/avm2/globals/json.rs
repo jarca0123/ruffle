@@ -8,7 +8,7 @@ use crate::avm2::function::FunctionArgs;
 use crate::avm2::globals::array::ArrayIter;
 use crate::avm2::object::{ArrayObject, FunctionObject, Object, ScriptObject, TObject};
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueEnum};
 use crate::ecma_conversions::f64_to_wrapping_i32;
 use crate::string::{AvmString, Units};
 use ruffle_macros::istr;
@@ -48,7 +48,7 @@ fn deserialize_json_inner<'gc>(
                     }
                 };
 
-                if matches!(mapped_val, Value::Undefined) {
+                if matches!(mapped_val.unpack(), ValueEnum::Undefined) {
                     obj.delete_dynamic_property(key, activation.gc());
                 } else {
                     obj.set_dynamic_property(key, mapped_val, activation.gc());
@@ -170,7 +170,7 @@ impl<'gc> AvmSerializer<'gc> {
                 let key = item.coerce_to_string(activation)?;
                 let value = Value::from(obj).get_public_property(key, activation)?;
                 let mapped = self.map_value(activation, || key, value)?;
-                if !matches!(mapped, Value::Undefined) {
+                if !matches!(mapped.unpack(), ValueEnum::Undefined) {
                     js_obj.insert(
                         key.to_utf8_lossy().into_owned(),
                         self.serialize_value(activation, mapped)?,
@@ -180,7 +180,7 @@ impl<'gc> AvmSerializer<'gc> {
         } else {
             for (name, val) in obj.public_vtable_properties(activation)? {
                 let mapped = self.map_value(activation, || name, val)?;
-                if !matches!(mapped, Value::Undefined) {
+                if !matches!(mapped.unpack(), ValueEnum::Undefined) {
                     js_obj.insert(
                         name.to_utf8_lossy().into_owned(),
                         self.serialize_value(activation, mapped)?,
@@ -188,13 +188,13 @@ impl<'gc> AvmSerializer<'gc> {
                 }
             }
             for i in 1.. {
-                match obj.get_enumerant_name(i, activation)? {
-                    Value::Null => break,
+                match obj.get_enumerant_name(i, activation)?.unpack() {
+                    ValueEnum::Null => break,
                     name_val => {
-                        let name = name_val.coerce_to_string(activation)?;
+                        let name = Value::from(name_val).coerce_to_string(activation)?;
                         let value = obj.get_enumerant_value(i, activation)?;
                         let mapped = self.map_value(activation, || name, value)?;
-                        if !matches!(mapped, Value::Undefined) {
+                        if !matches!(mapped.unpack(), ValueEnum::Undefined) {
                             js_obj.insert(
                                 name.to_utf8_lossy().into_owned(),
                                 self.serialize_value(activation, mapped)?,
@@ -230,14 +230,14 @@ impl<'gc> AvmSerializer<'gc> {
         activation: &mut Activation<'_, 'gc>,
         value: Value<'gc>,
     ) -> Result<JsonValue, Error<'gc>> {
-        Ok(match value.normalize() {
-            Value::Null => JsonValue::Null,
-            Value::Undefined => JsonValue::Null,
-            Value::Integer(i) => JsonValue::from(i),
-            Value::Number(n) => JsonValue::from(n),
-            Value::Bool(b) => JsonValue::from(b),
-            Value::String(s) => JsonValue::from(s.to_utf8_lossy().deref()),
-            Value::Object(obj) => {
+        Ok(match value.normalize().unpack() {
+            ValueEnum::Null => JsonValue::Null,
+            ValueEnum::Undefined => JsonValue::Null,
+            ValueEnum::Integer(i) => JsonValue::from(i),
+            ValueEnum::Number(n) => JsonValue::from(n),
+            ValueEnum::Bool(b) => JsonValue::from(b),
+            ValueEnum::String(s) => JsonValue::from(s.to_utf8_lossy().deref()),
+            ValueEnum::Object(obj) => {
                 if self.obj_stack.contains(&obj) {
                     return Err(make_error_1129(activation));
                 }
@@ -299,7 +299,7 @@ pub fn stringify<'gc>(
     let spaces = args.get_value(2);
 
     // If the replacer is None, that means it was either undefined or null.
-    if replacer.is_none() && !matches!(args.get_value(1), Value::Null) {
+    if replacer.is_none() && !matches!(args.get_value(1).unpack(), ValueEnum::Null) {
         return Err(make_error_1131(activation));
     }
 
@@ -316,12 +316,15 @@ pub fn stringify<'gc>(
         .transpose()?;
 
     // NOTE: We do not coerce to a string or to a number, the value must already be a string or number.
-    let indent = if let Value::String(s) = &spaces {
+    let indent = if let ValueEnum::String(s) = spaces.unpack() {
         if s.is_empty() {
             None
         } else {
             // We can only use the first 10 characters.
-            let indent = &s[..s.len().min(10)];
+            // Use `as_wstr()` (which yields a `&'gc WStr`) rather than `&s[..]`
+            // (whose `Deref` borrow is tied to the local `s` bound from the
+            // `unpack()` temporary and would not live long enough).
+            let indent = &s.as_wstr()[..s.len().min(10)];
             let indent_bytes = match indent.units() {
                 Units::Bytes(units) => Cow::Borrowed(units),
                 Units::Wide(_) => Cow::Owned(indent.to_utf8_lossy().into_owned().into_bytes()),

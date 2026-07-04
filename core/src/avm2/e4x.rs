@@ -5,7 +5,7 @@ use crate::avm2::error::{
 use crate::avm2::function::FunctionArgs;
 use crate::avm2::multiname::NamespaceSet;
 use crate::avm2::object::{E4XOrXml, FunctionObject, NamespaceObject};
-use crate::avm2::{Activation, Error, Multiname, Namespace, Value};
+use crate::avm2::{Activation, Error, Multiname, Namespace, Value, ValueEnum};
 use crate::string::{AvmString, StringContext, WStr, WString};
 
 use gc_arena::barrier::unlock;
@@ -782,15 +782,15 @@ impl<'gc> E4XNode<'gc> {
         ignore_processing_instructions: bool,
         ignore_white: bool,
     ) -> Result<Vec<Self>, Error<'gc>> {
-        let string = match &value {
+        let string = match value.unpack() {
             // The docs claim that this throws a TypeError, but it actually doesn't
-            Value::Null | Value::Undefined => istr!(""),
+            ValueEnum::Null | ValueEnum::Undefined => istr!(""),
             // The docs claim that only String, Number or Boolean are accepted, but that's also a lie
-            val => {
-                if let Some(obj) = val.as_object()
+            _ => {
+                if let Some(obj) = value.as_object()
                     && (obj.as_xml_object().is_some() || obj.as_xml_list_object().is_some())
                 {
-                    value = val.call_public_property(
+                    value = value.call_public_property(
                         istr!("toXMLString"),
                         FunctionArgs::empty(),
                         activation,
@@ -1734,11 +1734,11 @@ pub fn name_to_multiname<'gc>(
     name: Value<'gc>,
     force_attribute: bool,
 ) -> Result<Multiname<'gc>, Error<'gc>> {
-    if matches!(name, Value::Undefined | Value::Null) {
+    if matches!(name.unpack(), ValueEnum::Undefined | ValueEnum::Null) {
         return Err(make_error_1010(activation, None));
     }
 
-    if let Value::Object(o) = name
+    if let ValueEnum::Object(o) = name.unpack()
         && let Some(qname) = o.as_qname_object()
     {
         let mut name = qname.name().clone();

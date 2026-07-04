@@ -8,7 +8,7 @@ use crate::avm2::object::{
     ArrayObject as Avm2ArrayObject, FunctionObject as Avm2FunctionObject,
     ScriptObject as Avm2ScriptObject, TObject as _,
 };
-use crate::avm2::{Avm2, FunctionArgs, Value as Avm2Value};
+use crate::avm2::{Avm2, FunctionArgs, Value as Avm2Value, ValueEnum as Avm2ValueEnum};
 use crate::context::UpdateContext;
 use crate::display_object::TDisplayObject;
 use crate::string::AvmString;
@@ -196,14 +196,14 @@ impl Value {
         activation: &mut Avm2Activation<'_, 'gc>,
         value: Avm2Value<'gc>,
     ) -> Result<Value, Avm2Error<'gc>> {
-        Ok(match value {
-            Avm2Value::Undefined => Value::Undefined,
-            Avm2Value::Null => Value::Null,
-            Avm2Value::Bool(value) => value.into(),
-            Avm2Value::Number(value) => value.into(),
-            Avm2Value::Integer(value) => value.into(),
-            Avm2Value::String(value) => Value::String(value.to_string()),
-            Avm2Value::Object(obj) => {
+        Ok(match value.unpack() {
+            Avm2ValueEnum::Undefined => Value::Undefined,
+            Avm2ValueEnum::Null => Value::Null,
+            Avm2ValueEnum::Bool(value) => value.into(),
+            Avm2ValueEnum::Number(value) => value.into(),
+            Avm2ValueEnum::Integer(value) => value.into(),
+            Avm2ValueEnum::String(value) => Value::String(value.to_string()),
+            Avm2ValueEnum::Object(obj) => {
                 if let Some(array) = obj.as_array_storage() {
                     let length = array.length();
                     let values = (0..length)

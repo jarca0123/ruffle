@@ -6,6 +6,7 @@ use crate::avm2::method::Method;
 use crate::avm2::multiname::Multiname;
 use crate::avm2::object::{ClassObject, ErrorObject};
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 use crate::string::{AvmString, WString};
 
 use naga_agal::AgalError;
@@ -127,7 +128,7 @@ pub fn make_null_or_undefined_error<'gc>(
     value: Value<'gc>,
     name: Option<&Multiname<'gc>>,
 ) -> Error<'gc> {
-    if matches!(value, Value::Undefined) {
+    if matches!(value.unpack(), ValueEnum::Undefined) {
         make_error_1010(activation, name)
     } else {
         let mut msg = "Error #1009: Cannot access a property or method of a null object reference."

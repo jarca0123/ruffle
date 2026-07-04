@@ -8,6 +8,7 @@ use crate::avm2::function::FunctionArgs;
 use crate::avm2::object::{ArrayObject, Object, TObject};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 use crate::string::AvmString;
 use bitflags::bitflags;
 use ruffle_macros::istr;
@@ -161,7 +162,7 @@ pub fn join<'gc>(
     let separator = args.get_value(0);
 
     if let Some(array) = this.as_array_storage() {
-        let string_separator = if matches!(separator, Value::Undefined) {
+        let string_separator = if matches!(separator.unpack(), ValueEnum::Undefined) {
             istr!(",")
         } else {
             separator.coerce_to_string(activation)?
@@ -172,7 +173,7 @@ pub fn join<'gc>(
         for (i, item) in array.iter().enumerate() {
             let item = resolve_array_hole(activation, this, i, item)?;
 
-            if matches!(item, Value::Undefined) || matches!(item, Value::Null) {
+            if matches!(item.unpack(), ValueEnum::Undefined) || matches!(item.unpack(), ValueEnum::Null) {
                 accum.push(istr!(""));
             } else {
                 accum.push(item.coerce_to_string(activation)?);
@@ -773,12 +774,14 @@ where
         let unresolved_a = *a;
         let unresolved_b = *b;
 
-        if matches!(unresolved_a, Value::Undefined) && matches!(unresolved_b, Value::Undefined) {
+        if matches!(unresolved_a.unpack(), ValueEnum::Undefined)
+            && matches!(unresolved_b.unpack(), ValueEnum::Undefined)
+        {
             unique_sort_satisfied = false;
             return Ok(Ordering::Equal);
-        } else if matches!(unresolved_a, Value::Undefined) {
+        } else if matches!(unresolved_a.unpack(), ValueEnum::Undefined) {
             return Ok(Ordering::Greater);
-        } else if matches!(unresolved_b, Value::Undefined) {
+        } else if matches!(unresolved_b.unpack(), ValueEnum::Undefined) {
             return Ok(Ordering::Less);
         }
 
@@ -940,7 +943,7 @@ pub fn compare_numeric<'gc, const COMPAT: bool>(
     if COMPAT {
         // See <https://bugzilla.mozilla.org/show_bug.cgi?id=524122>
         // See <https://github.com/adobe/avmplus/blob/858d034a3bd3a54d9b70909386435cf4aec81d21/core/ArrayClass.cpp#L498>
-        if let (Value::Integer(a), Value::Integer(b)) = (a.normalize(), b.normalize()) {
+        if let (ValueEnum::Integer(a), ValueEnum::Integer(b)) = (a.normalize().unpack(), b.normalize().unpack()) {
             // The following expression corresponds to atomFromIntptrValue,
             // see <https://github.com/adobe-flash/avmplus/blob/master/core/atom-inlines.h#L82>
             let a = (a << 3) | 6;
@@ -990,7 +993,7 @@ fn sort_postprocess<'gc>(
                     .map(|(src, v)| {
                         if let Some(old_value) = old_array.get(*src) {
                             Some(old_value)
-                        } else if !matches!(v, Value::Undefined) {
+                        } else if !matches!((*v).unpack(), ValueEnum::Undefined) {
                             Some(*v)
                         } else {
                             None
@@ -1171,7 +1174,7 @@ fn extract_field_names<'gc>(
             out.push(value.coerce_to_string(activation)?);
         }
         Ok(out)
-    } else if let Value::String(s) = value {
+    } else if let ValueEnum::String(s) = value.unpack() {
         Ok(vec![s])
     } else {
         Ok(vec![])

@@ -6,6 +6,7 @@ use crate::avm2::activation::Activation;
 use crate::avm2::error::{Error, make_error_1052};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 use crate::string::{AvmString, WStr, WString};
 use ruffle_wstr::Integer;
 use std::fmt::Write;
@@ -87,7 +88,7 @@ pub fn is_xml_name<'gc>(
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
     let name = args.get_value(0);
-    if matches!(name, Value::Undefined | Value::Null) {
+    if matches!(name.unpack(), ValueEnum::Undefined | ValueEnum::Null) {
         return Ok(false.into());
     }
 

@@ -11,6 +11,7 @@ use crate::avm2::object::{
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
 use crate::avm2::worker_shared::SharedValue;
+use crate::avm2::ValueEnum;
 use crate::avm2_stub_method;
 use crate::string::AvmString;
 use crate::worker_runtime::{WorkerConfig, run_worker};
@@ -77,14 +78,14 @@ fn shared_kind(v: &SharedValue) -> &'static str {
 /// Convert an AS3 value into the `Send` form stored for cross-thread sharing.
 /// Returns `None` for values that cannot currently cross the boundary.
 pub(crate) fn value_to_shared(value: Value<'_>) -> Option<SharedValue> {
-    match value {
-        Value::Undefined => Some(SharedValue::Undefined),
-        Value::Null => Some(SharedValue::Null),
-        Value::Bool(b) => Some(SharedValue::Bool(b)),
-        Value::Integer(i) => Some(SharedValue::Int(i)),
-        Value::Number(n) => Some(SharedValue::Number(n)),
-        Value::String(s) => Some(SharedValue::Str(s.to_string())),
-        Value::Object(o) => {
+    match value.unpack() {
+        ValueEnum::Undefined => Some(SharedValue::Undefined),
+        ValueEnum::Null => Some(SharedValue::Null),
+        ValueEnum::Bool(b) => Some(SharedValue::Bool(b)),
+        ValueEnum::Integer(i) => Some(SharedValue::Int(i)),
+        ValueEnum::Number(n) => Some(SharedValue::Number(n)),
+        ValueEnum::String(s) => Some(SharedValue::Str(s.to_string())),
+        ValueEnum::Object(o) => {
             if let Some(ba) = o.as_bytearray() {
                 // A `shareable` ByteArray crosses by reference; otherwise it is
                 // copied by value.
@@ -180,7 +181,7 @@ pub fn get_shared_property<'gc>(
 
     // Prefer the same-arena value (preserves object identity for the owner).
     let local = worker.get_shared_property(key);
-    if !matches!(local, Value::Undefined) {
+    if !matches!(local.unpack(), ValueEnum::Undefined) {
         return Ok(local);
     }
 

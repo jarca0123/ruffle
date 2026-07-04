@@ -9,6 +9,7 @@ use crate::avm2::function::FunctionArgs;
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::regexp::{RegExp, RegExpFlags};
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 use crate::avm2::{ArrayObject, ArrayStorage};
 use crate::avm2::{Error, TObject};
 use crate::string::{AvmString, WString};
@@ -42,7 +43,7 @@ pub fn get_length<'gc>(
     this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    if let Value::String(s) = this {
+    if let ValueEnum::String(s) = this.unpack() {
         return Ok(Value::from_usize_lossy(s.len()));
     }
 
@@ -55,7 +56,7 @@ pub fn char_at<'gc>(
     this: Value<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    if let Value::String(s) = this {
+    if let ValueEnum::String(s) = this.unpack() {
         // This function takes Number, so if we use get_i32 instead of get_f64, the value may overflow.
         let n = args.get_f64(0);
 
@@ -81,7 +82,7 @@ pub fn char_code_at<'gc>(
     this: Value<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    if let Value::String(s) = this {
+    if let ValueEnum::String(s) = this.unpack() {
         // This function takes Number, so if we use coerce_to_i32 instead of coerce_to_number, the value may overflow.
         let n = args.get_f64(0);
 
@@ -191,8 +192,8 @@ pub fn locale_compare<'gc>(
     let other_value = args.get_value(0);
 
     if activation.caller_movie_or_root().version() < 11 {
-        match other_value {
-            Value::Null | Value::Undefined => {
+        match other_value.unpack() {
+            ValueEnum::Null | ValueEnum::Undefined => {
                 if this.is_empty() {
                     return Ok(Value::Integer(1));
                 } else {
@@ -420,9 +421,10 @@ pub fn split<'gc>(
 
     let delimiter = args.get_value(0);
 
-    let limit = match args.get_value(1) {
-        Value::Undefined => usize::MAX,
-        limit => limit.coerce_to_u32(activation)? as usize,
+    let limit_arg = args.get_value(1);
+    let limit = match limit_arg.unpack() {
+        ValueEnum::Undefined => usize::MAX,
+        _ => limit_arg.coerce_to_u32(activation)? as usize,
     };
 
     let Some(limit) = NonZero::new(limit) else {

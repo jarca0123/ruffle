@@ -4,6 +4,7 @@ use crate::avm2::error::{make_error_2007, make_error_2008};
 use crate::avm2::object::ArrayObject;
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 use crate::ecma_conversions::round_to_even;
 use crate::html::TextDisplay;
 use crate::string::{AvmString, WStr};
@@ -93,10 +94,10 @@ pub fn set_block_indent<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.block_indent = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(round_to_even(value.coerce_to_number(activation)?).into()),
+        text_format.block_indent = match value.unpack() {
+            ValueEnum::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueEnum::Null => None,
+            _ => Some(round_to_even(value.coerce_to_number(activation)?).into()),
         };
     }
 
@@ -129,10 +130,10 @@ pub fn set_bold<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.bold = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(value.coerce_to_boolean()),
+        text_format.bold = match value.unpack() {
+            ValueEnum::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueEnum::Null => None,
+            _ => Some(value.coerce_to_boolean()),
         };
     }
 
@@ -165,10 +166,10 @@ pub fn set_bullet<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.bullet = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(value.coerce_to_boolean()),
+        text_format.bullet = match value.unpack() {
+            ValueEnum::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueEnum::Null => None,
+            _ => Some(value.coerce_to_boolean()),
         };
     }
 
@@ -201,10 +202,10 @@ pub fn set_color<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.color = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(swf::Color::from_rgba(value.coerce_to_u32(activation)?)),
+        text_format.color = match value.unpack() {
+            ValueEnum::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueEnum::Null => None,
+            _ => Some(swf::Color::from_rgba(value.coerce_to_u32(activation)?)),
         };
     }
 
@@ -241,10 +242,10 @@ pub fn set_display<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        let value = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => return Err(make_error_2007(activation, "display")),
-            value => value.coerce_to_string(activation)?,
+        let value = match value.unpack() {
+            ValueEnum::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueEnum::Null => return Err(make_error_2007(activation, "display")),
+            _ => value.coerce_to_string(activation)?,
         };
 
         text_format.display = if &value == b"block" {
@@ -287,10 +288,10 @@ pub fn set_font<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.font = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => {
+        text_format.font = match value.unpack() {
+            ValueEnum::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueEnum::Null => None,
+            _ => {
                 let font = value.coerce_to_string(activation)?;
                 Some(font.slice(0..64).unwrap_or(&font).to_owned())
             }
@@ -326,10 +327,10 @@ pub fn set_indent<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.indent = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(round_to_even(value.coerce_to_number(activation)?).into()),
+        text_format.indent = match value.unpack() {
+            ValueEnum::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueEnum::Null => None,
+            _ => Some(round_to_even(value.coerce_to_number(activation)?).into()),
         };
     }
 
@@ -362,10 +363,10 @@ pub fn set_italic<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.italic = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(value.coerce_to_boolean()),
+        text_format.italic = match value.unpack() {
+            ValueEnum::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueEnum::Null => None,
+            _ => Some(value.coerce_to_boolean()),
         };
     }
 
@@ -398,10 +399,10 @@ pub fn set_kerning<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.kerning = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(value.coerce_to_boolean()),
+        text_format.kerning = match value.unpack() {
+            ValueEnum::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueEnum::Null => None,
+            _ => Some(value.coerce_to_boolean()),
         };
     }
 
@@ -434,10 +435,10 @@ pub fn set_leading<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.leading = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(round_to_even(value.coerce_to_number(activation)?).into()),
+        text_format.leading = match value.unpack() {
+            ValueEnum::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueEnum::Null => None,
+            _ => Some(round_to_even(value.coerce_to_number(activation)?).into()),
         };
     }
 
@@ -470,10 +471,10 @@ pub fn set_left_margin<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.left_margin = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(round_to_even(value.coerce_to_number(activation)?).into()),
+        text_format.left_margin = match value.unpack() {
+            ValueEnum::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueEnum::Null => None,
+            _ => Some(round_to_even(value.coerce_to_number(activation)?).into()),
         };
     }
 
@@ -506,10 +507,10 @@ pub fn set_letter_spacing<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.letter_spacing = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(value.coerce_to_number(activation)?),
+        text_format.letter_spacing = match value.unpack() {
+            ValueEnum::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueEnum::Null => None,
+            _ => Some(value.coerce_to_number(activation)?),
         };
     }
 
@@ -542,10 +543,10 @@ pub fn set_right_margin<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.right_margin = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(round_to_even(value.coerce_to_number(activation)?).into()),
+        text_format.right_margin = match value.unpack() {
+            ValueEnum::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueEnum::Null => None,
+            _ => Some(round_to_even(value.coerce_to_number(activation)?).into()),
         };
     }
 
@@ -578,10 +579,10 @@ pub fn set_size<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.size = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(round_to_even(value.coerce_to_number(activation)?).into()),
+        text_format.size = match value.unpack() {
+            ValueEnum::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueEnum::Null => None,
+            _ => Some(round_to_even(value.coerce_to_number(activation)?).into()),
         };
     }
 
@@ -695,10 +696,10 @@ pub fn set_underline<'gc>(
 
     if let Some(mut text_format) = this.as_text_format_mut() {
         let value = args.get_value(0);
-        text_format.underline = match value {
-            Value::Undefined => unreachable!("Object parameter is never Undefined"),
-            Value::Null => None,
-            value => Some(value.coerce_to_boolean()),
+        text_format.underline = match value.unpack() {
+            ValueEnum::Undefined => unreachable!("Object parameter is never Undefined"),
+            ValueEnum::Null => None,
+            _ => Some(value.coerce_to_boolean()),
         };
     }
 

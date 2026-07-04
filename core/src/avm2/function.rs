@@ -6,6 +6,7 @@ use crate::avm2::object::{ClassObject, FunctionObject};
 use crate::avm2::scope::ScopeChain;
 use crate::avm2::traits::TraitKind;
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 use crate::string::WString;
 use gc_arena::{Collect, Gc};
 use std::borrow::Cow;
@@ -62,7 +63,7 @@ impl<'gc> BoundMethod<'gc> {
     ) -> Result<Value<'gc>, Error<'gc>> {
         let receiver = if let Some(receiver) = self.bound_receiver {
             receiver
-        } else if matches!(unbound_receiver, Value::Null | Value::Undefined) {
+        } else if matches!(unbound_receiver.unpack(), ValueEnum::Null | ValueEnum::Undefined) {
             self.scope
                 .get(0)
                 .expect("No global scope for function call")

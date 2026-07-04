@@ -9,6 +9,7 @@ use crate::avm2::globals::slots::flash_text_engine_text_line as line_slots;
 use crate::avm2::object::{Object, TObject};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 use crate::avm2_stub_method;
 use crate::display_object::{EditText, TDisplayObject, TextLine};
 use crate::fte::FontLookupValue;
@@ -31,7 +32,7 @@ pub fn create_text_line<'gc>(
 
     let content = this.get_slot(block_slots::_CONTENT);
 
-    let content = if matches!(content, Value::Null) {
+    let content = if matches!(content.unpack(), ValueEnum::Null) {
         return Ok(Value::Null);
     } else {
         content
@@ -55,7 +56,7 @@ pub fn create_text_line<'gc>(
                 .call_method(element_methods::GET_TEXT, &[], activation)
                 .unwrap_or_else(|_| istr!("").into());
 
-            if matches!(txt, Value::Null) {
+            if matches!(txt.unpack(), ValueEnum::Null) {
                 // FP returns a null TextLine when `o` is null- note that
                 // `o` is already coerced to a String because of the AS bindings.
                 return Ok(Value::Null);

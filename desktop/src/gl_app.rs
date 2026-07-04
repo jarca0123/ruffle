@@ -191,6 +191,10 @@ impl GlApp {
         let mut builder = PlayerBuilder::new()
             .with_renderer(backend)
             .with_navigator(navigator)
+            // Real background workers (flash.system.Worker) — matches the main
+            // desktop harness; without it the gl-native path gets a NullWorkerHost
+            // and worker-based content (e.g. Z2) stalls.
+            .with_worker_host(ruffle_core::worker_host::ThreadWorkerHost)
             .with_ui(GlUiBackend::new(font_database.clone()))
             .with_storage(Box::new(DiskStorageBackend::new(save_directory)))
             .with_viewport_dimensions(width, height, 1.0)

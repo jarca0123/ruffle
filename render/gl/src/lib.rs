@@ -440,6 +440,15 @@ fn color_to_rgba(c: Color) -> [f32; 4] {
     ]
 }
 
+/// `round(c * a / 255)` for `u8` operands, with integers. Exact for all 256×256
+/// inputs and bit-identical to `(c as f32 * a as f32 / 255.0).round()` (the
+/// product `c*a` never lands on an exact half), but with no per-channel `roundf`.
+#[inline]
+fn mul_div255_round(c: u8, a: u8) -> u8 {
+    let t = c as u32 * a as u32 + 128;
+    ((t + (t >> 8)) >> 8) as u8
+}
+
 /// Like [`color_to_rgba`], but premultiplied by alpha. Bevel composites in
 /// premultiplied space (matching wgpu's bevel filter).
 fn premultiplied_rgba(c: Color) -> [f32; 4] {
@@ -1804,55 +1813,68 @@ impl GlRenderBackend {
         let tx = matrix.tx.to_pixels() as f32;
         let ty = matrix.ty.to_pixels() as f32;
         let (a, b, c, d) = (matrix.a, matrix.b, matrix.c, matrix.d);
-        self.batch_vertices.reserve(geom.vertices.len());
 
         // The common case is no color transform (mult identity, add zero), where
         // baking reduces to premultiplying the source color — skip the per-channel
-        // mult/add/clamp entirely.
+        // mult/add/clamp entirely. Both branches build the vertices with a single
+        // `extend` over a `TrustedLen` slice-map: one capacity check for the whole
+        // draw (vs one per `push`), and a store loop LLVM can vectorize.
         let identity_color = mult == [1.0, 1.0, 1.0, 1.0] && add == [0.0, 0.0, 0.0, 0.0];
         if identity_color {
-            for v in &geom.vertices {
-                let x = v.position[0];
-                let y = v.position[1];
-                let [cr, cg, cb, ca] = v.color.to_le_bytes();
-                let af = ca as f32 / 255.0;
-                let color = u32::from_le_bytes([
-                    (cr as f32 * af).round() as u8,
-                    (cg as f32 * af).round() as u8,
-                    (cb as f32 * af).round() as u8,
-                    ca,
-                ]);
-                self.batch_vertices.push(Vertex {
-                    position: [a * x + c * y + tx, b * x + d * y + ty],
-                    color,
-                });
-            }
+            // A tessellated fill is usually one solid colour across all its
+            // vertices, so memoize the last raw->premultiplied mapping and skip the
+            // premultiply for runs of the same colour.
+            let mut cache: Option<(u32, u32)> = None;
+            self.batch_vertices
+                .extend(geom.vertices.iter().map(|v| {
+                    let x = v.position[0];
+                    let y = v.position[1];
+                    let color = match cache {
+                        Some((raw, premul)) if raw == v.color => premul,
+                        _ => {
+                            let [cr, cg, cb, ca] = v.color.to_le_bytes();
+                            let premul = u32::from_le_bytes([
+                                mul_div255_round(cr, ca),
+                                mul_div255_round(cg, ca),
+                                mul_div255_round(cb, ca),
+                                ca,
+                            ]);
+                            cache = Some((v.color, premul));
+                            premul
+                        }
+                    };
+                    Vertex {
+                        position: [a * x + c * y + tx, b * x + d * y + ty],
+                        color,
+                    }
+                }));
         } else {
-            for v in &geom.vertices {
-                let x = v.position[0];
-                let y = v.position[1];
-                let [cr, cg, cb, ca] = v.color.to_le_bytes();
-                // frag_color = clamp(color * mult + add), then premultiply (matches
-                // the per-draw color shader, done here on the CPU instead).
-                let r = (cr as f32 / 255.0 * mult[0] + add[0]).clamp(0.0, 1.0);
-                let g = (cg as f32 / 255.0 * mult[1] + add[1]).clamp(0.0, 1.0);
-                let bl = (cb as f32 / 255.0 * mult[2] + add[2]).clamp(0.0, 1.0);
-                let al = (ca as f32 / 255.0 * mult[3] + add[3]).clamp(0.0, 1.0);
-                let color = u32::from_le_bytes([
-                    (r * al * 255.0).round() as u8,
-                    (g * al * 255.0).round() as u8,
-                    (bl * al * 255.0).round() as u8,
-                    (al * 255.0).round() as u8,
-                ]);
-                self.batch_vertices.push(Vertex {
-                    position: [a * x + c * y + tx, b * x + d * y + ty],
-                    color,
-                });
-            }
+            self.batch_vertices
+                .extend(geom.vertices.iter().map(|v| {
+                    let x = v.position[0];
+                    let y = v.position[1];
+                    let [cr, cg, cb, ca] = v.color.to_le_bytes();
+                    // frag_color = clamp(color * mult + add), then premultiply
+                    // (matches the per-draw color shader, done here on the CPU).
+                    let r = (cr as f32 / 255.0 * mult[0] + add[0]).clamp(0.0, 1.0);
+                    let g = (cg as f32 / 255.0 * mult[1] + add[1]).clamp(0.0, 1.0);
+                    let bl = (cb as f32 / 255.0 * mult[2] + add[2]).clamp(0.0, 1.0);
+                    let al = (ca as f32 / 255.0 * mult[3] + add[3]).clamp(0.0, 1.0);
+                    let color = u32::from_le_bytes([
+                        (r * al * 255.0).round() as u8,
+                        (g * al * 255.0).round() as u8,
+                        (bl * al * 255.0).round() as u8,
+                        (al * 255.0).round() as u8,
+                    ]);
+                    Vertex {
+                        position: [a * x + c * y + tx, b * x + d * y + ty],
+                        color,
+                    }
+                }));
         }
-        for &i in &geom.indices[..num_indices] {
-            self.batch_indices.push(base + i);
-        }
+        self.batch_indices.reserve(num_indices);
+        self.batch_indices
+            .extend(geom.indices[..num_indices].iter().map(|&i| base + i));
     }
 
     fn push_blend_mode(&mut self, blend: RenderBlendMode) {

@@ -1,6 +1,6 @@
 use crate::avm2::error::make_error_2007;
 use crate::avm2::object::{FunctionObject, Object};
-use crate::avm2::{Activation, Error, Value};
+use crate::avm2::{Activation, Error, Value, ValueEnum};
 use crate::string::AvmString;
 
 use ruffle_macros::istr;
@@ -54,9 +54,9 @@ pub trait ParametersExt<'gc> {
     ///
     /// If the value is null, None is returned.
     fn try_get_object(&self, index: usize) -> Option<Object<'gc>> {
-        match self.get_value(index) {
-            Value::Null => None,
-            Value::Object(o) => Some(o),
+        match self.get_value(index).unpack() {
+            ValueEnum::Null => None,
+            ValueEnum::Object(o) => Some(o),
             _ => panic!("Expected Object or null as parameter"),
         }
     }
@@ -80,9 +80,9 @@ pub trait ParametersExt<'gc> {
     ///
     /// If the value is null, None is returned.
     fn try_get_function(&self, index: usize) -> Option<FunctionObject<'gc>> {
-        match self.get_value(index) {
-            Value::Null => None,
-            Value::Object(o) if let Some(function_object) = o.as_function_object() => {
+        match self.get_value(index).unpack() {
+            ValueEnum::Null => None,
+            ValueEnum::Object(o) if let Some(function_object) = o.as_function_object() => {
                 Some(function_object)
             }
             _ => panic!("Expected FunctionObject or null as parameter"),
@@ -110,8 +110,8 @@ pub trait ParametersExt<'gc> {
     /// Gets the Boolean-typed value at the given index. It is expected that the
     /// value is of the Boolean type.
     fn get_bool(&self, index: usize) -> bool {
-        match self.get_value(index) {
-            Value::Bool(b) => b,
+        match self.get_value(index).unpack() {
+            ValueEnum::Bool(b) => b,
             _ => unreachable!("Expected Boolean-typed parameter"),
         }
     }
@@ -121,9 +121,9 @@ pub trait ParametersExt<'gc> {
     ///
     /// If the value is null, None is returned.
     fn try_get_string(&self, index: usize) -> Option<AvmString<'gc>> {
-        match self.get_value(index) {
-            Value::Null => None,
-            Value::String(s) => Some(s),
+        match self.get_value(index).unpack() {
+            ValueEnum::Null => None,
+            ValueEnum::String(s) => Some(s),
             _ => unreachable!("Expected String-typed parameter"),
         }
     }

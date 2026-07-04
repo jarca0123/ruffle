@@ -40,9 +40,13 @@ pub enum Hint {
 }
 
 /// An AVM2 value.
+///
+/// This is the "wide" representation used only for matching; the value type
+/// callers store and pass around is the NaN-boxed [`Value`] struct, which
+/// widens to this via [`Value::unpack`].
 #[derive(Clone, Copy, Collect, Debug)]
 #[collect(no_drop)]
-pub enum Value<'gc> {
+pub enum ValueEnum<'gc> {
     Undefined,
     Null,
     Bool(bool),
@@ -60,13 +64,12 @@ pub enum Value<'gc> {
 }
 
 // This type is used very frequently, so make sure it doesn't unexpectedly grow.
-const _: () = assert!(size_of::<Value<'_>>() <= 16);
+const _: () = assert!(size_of::<ValueEnum<'_>>() <= 16);
 
-/// NaN-boxed representation of [`Value`], packing every case into a single
-/// `u64` instead of the 16-byte enum (`Number(f64)` + a discriminant forces the
-/// enum to 16). Built and unit-tested alongside the enum; the migration renames
-/// this to `Value` and the enum to `ValueEnum`, with call sites going through
-/// [`PackedValue::unpack`] / the typed constructors.
+/// NaN-boxed representation of an AVM2 value, packing every case into a single
+/// `u64` instead of the 16-byte [`ValueEnum`] (`Number(f64)` + a discriminant
+/// forces the enum to 16). Call sites match on the widened form via
+/// [`Value::unpack`] and construct through the typed constructors / `From`.
 ///
 /// # Encoding (64-bit targets with ≤48-bit pointers: x86-64, aarch64; and wasm32
 /// where pointers are 32-bit, trivially fitting)
@@ -83,7 +86,7 @@ const _: () = assert!(size_of::<Value<'_>>() <= 16);
 /// variant; `payload` is a 48-bit pointer (String/Object) or a zero-extended
 /// immediate (bool/int).
 #[derive(Clone, Copy)]
-pub struct PackedValue<'gc> {
+pub struct Value<'gc> {
     bits: u64,
     /// Brand the value with the arena's `'gc` (invariant), matching `Gc`.
     _marker: PhantomData<Gc<'gc, ()>>,
@@ -105,9 +108,9 @@ const TAG_STRING: u64 = 4;
 const TAG_OBJECT: u64 = 5;
 
 // The packed value must be exactly pointer-sized — that's the whole point.
-const _: () = assert!(size_of::<PackedValue<'_>>() == 8);
+const _: () = assert!(size_of::<Value<'_>>() == 8);
 
-impl<'gc> PackedValue<'gc> {
+impl<'gc> Value<'gc> {
     #[inline]
     fn boxed(tag: u64, payload: u64) -> Self {
         debug_assert!(
@@ -122,7 +125,7 @@ impl<'gc> PackedValue<'gc> {
 
     /// True when the word is a real `f64` rather than a boxed value.
     #[inline]
-    fn is_number(self) -> bool {
+    fn is_f64(self) -> bool {
         self.bits & BOX_MARK != BOX_MARK
     }
 
@@ -136,15 +139,48 @@ impl<'gc> PackedValue<'gc> {
         self.bits & PAYLOAD_MASK
     }
 
-    /// Pack a `Value` into the single-word representation.
+    // --- Packed fast-path extractors ---
+    //
+    // These read the packed bits directly for the hot numeric/bool cases,
+    // without materializing a 16-byte `ValueEnum` via `unpack()`. The coercion
+    // and comparison hot paths (`coerce_to_i32/u32/number/boolean`,
+    // `abstract_eq`) route through them; profiling OpenTTD showed the per-call
+    // `unpack()` in those methods was a measurable cost after the value shrank
+    // to 8 bytes.
+
+    /// The `i32` if this is a packed `Integer`, else `None`.
     #[inline]
-    pub fn pack(value: Value<'gc>) -> Self {
+    fn packed_i32(self) -> Option<i32> {
+        (!self.is_f64() && self.tag() == TAG_INT).then(|| self.payload() as u32 as i32)
+    }
+
+    /// The `f64` if this is a packed `Number`, else `None`.
+    #[inline]
+    fn packed_f64(self) -> Option<f64> {
+        self.is_f64().then(|| f64::from_bits(self.bits))
+    }
+
+    /// The numeric value as `f64` if this is a `Number` *or* an `Integer`, else
+    /// `None`. `i32` is exactly representable in `f64`, so this matches AS3's
+    /// numeric coercion of the two interchangeable numeric variants.
+    #[inline]
+    fn packed_number(self) -> Option<f64> {
+        match self.packed_f64() {
+            Some(n) => Some(n),
+            None => self.packed_i32().map(|i| i as f64),
+        }
+    }
+
+    /// Pack a [`ValueEnum`] into the single-word representation. Internal
+    /// constructor; the public entry point is `impl From<ValueEnum> for Value`.
+    #[inline]
+    fn pack(value: ValueEnum<'gc>) -> Self {
         match value {
-            Value::Undefined => Self::boxed(TAG_UNDEFINED, 0),
-            Value::Null => Self::boxed(TAG_NULL, 0),
-            Value::Bool(b) => Self::boxed(TAG_BOOL, b as u64),
-            Value::Integer(i) => Self::boxed(TAG_INT, i as u32 as u64),
-            Value::Number(n) => {
+            ValueEnum::Undefined => Self::boxed(TAG_UNDEFINED, 0),
+            ValueEnum::Null => Self::boxed(TAG_NULL, 0),
+            ValueEnum::Bool(b) => Self::boxed(TAG_BOOL, b as u64),
+            ValueEnum::Integer(i) => Self::boxed(TAG_INT, i as u32 as u64),
+            ValueEnum::Number(n) => {
                 // Canonicalize NaNs so no number ever collides with a box pattern.
                 let bits = if n.is_nan() { CANON_NAN } else { n.to_bits() };
                 Self {
@@ -154,47 +190,108 @@ impl<'gc> PackedValue<'gc> {
             }
             // Pointers are exposed so the address→pointer round-trip in `unpack`
             // is sound under strict provenance.
-            Value::String(s) => Self::boxed(TAG_STRING, s.as_gc_ptr().expose_provenance() as u64),
-            Value::Object(o) => Self::boxed(TAG_OBJECT, o.as_gc_ptr().expose_provenance() as u64),
+            ValueEnum::String(s) => {
+                Self::boxed(TAG_STRING, s.as_gc_ptr().expose_provenance() as u64)
+            }
+            ValueEnum::Object(o) => {
+                Self::boxed(TAG_OBJECT, o.as_gc_ptr().expose_provenance() as u64)
+            }
         }
     }
 
-    /// Unpack back into the wide `Value` enum for matching.
+    /// Unpack back into the wide [`ValueEnum`] for matching.
     #[inline]
-    pub fn unpack(self) -> Value<'gc> {
-        if self.is_number() {
-            return Value::Number(f64::from_bits(self.bits));
+    pub fn unpack(self) -> ValueEnum<'gc> {
+        if self.is_f64() {
+            return ValueEnum::Number(f64::from_bits(self.bits));
         }
         match self.tag() {
-            TAG_UNDEFINED => Value::Undefined,
-            TAG_NULL => Value::Null,
-            TAG_BOOL => Value::Bool(self.payload() != 0),
-            TAG_INT => Value::Integer(self.payload() as u32 as i32),
+            TAG_UNDEFINED => ValueEnum::Undefined,
+            TAG_NULL => ValueEnum::Null,
+            TAG_BOOL => ValueEnum::Bool(self.payload() != 0),
+            TAG_INT => ValueEnum::Integer(self.payload() as u32 as i32),
             // SAFETY: this word was produced by `pack` from a live `String`/
             // `Object` of this `'gc`; we are inside the arena callback, so the
             // pointee is still allocated. `with_exposed_provenance` recovers the
             // provenance exposed in `pack`.
-            TAG_STRING => Value::String(unsafe {
+            TAG_STRING => ValueEnum::String(unsafe {
                 AvmString::from_gc_ptr(std::ptr::with_exposed_provenance(self.payload() as usize))
             }),
-            TAG_OBJECT => Value::Object(unsafe {
+            TAG_OBJECT => ValueEnum::Object(unsafe {
                 Object::from_gc_ptr(std::ptr::with_exposed_provenance(self.payload() as usize))
             }),
-            other => unreachable!("invalid PackedValue tag {other}"),
+            other => unreachable!("invalid Value tag {other}"),
         }
     }
 }
 
-// SAFETY: the only Gc pointers a PackedValue can hold are the String/Object
-// payloads, which `trace` decodes and forwards. PackedValue is `Copy` with no
+/// The zero-touch construction API: these associated items let every existing
+/// construction site keep writing `Value::Bool(b)`, `Value::Undefined`, etc.,
+/// now building the packed value directly. Each must produce the same bits as
+/// packing the corresponding [`ValueEnum`] variant.
+// The zero-touch construction API deliberately mirrors the old enum variant
+// names (`Value::Integer(..)`, `Value::Undefined`) so construction sites migrate
+// untouched, hence the non-snake/upper-case allows.
+#[allow(non_snake_case, non_upper_case_globals)]
+impl<'gc> Value<'gc> {
+    pub const Undefined: Self = Self {
+        bits: BOX_MARK | (TAG_UNDEFINED << TAG_SHIFT),
+        _marker: PhantomData,
+    };
+    pub const Null: Self = Self {
+        bits: BOX_MARK | (TAG_NULL << TAG_SHIFT),
+        _marker: PhantomData,
+    };
+
+    #[inline(always)]
+    pub fn Bool(value: bool) -> Self {
+        Self::pack(ValueEnum::Bool(value))
+    }
+
+    #[inline(always)]
+    pub fn Integer(value: i32) -> Self {
+        Self::pack(ValueEnum::Integer(value))
+    }
+
+    #[inline(always)]
+    pub fn Number(value: f64) -> Self {
+        Self::pack(ValueEnum::Number(value))
+    }
+
+    #[inline(always)]
+    pub fn String(value: AvmString<'gc>) -> Self {
+        Self::pack(ValueEnum::String(value))
+    }
+
+    #[inline(always)]
+    pub fn Object(value: Object<'gc>) -> Self {
+        Self::pack(ValueEnum::Object(value))
+    }
+}
+
+impl<'gc> From<ValueEnum<'gc>> for Value<'gc> {
+    #[inline]
+    fn from(value: ValueEnum<'gc>) -> Self {
+        Self::pack(value)
+    }
+}
+
+impl std::fmt::Debug for Value<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.unpack(), f)
+    }
+}
+
+// SAFETY: the only Gc pointers a packed Value can hold are the String/Object
+// payloads, which `trace` decodes and forwards. Value is `Copy` with no
 // `Drop`, so `no_drop`'s requirement (no Drop impl touching Gc pointers) holds.
-unsafe impl<'gc> Collect<'gc> for PackedValue<'gc> {
+unsafe impl<'gc> Collect<'gc> for Value<'gc> {
     #[inline]
     fn trace<T: gc_arena::collect::Trace<'gc>>(&self, cc: &mut T) {
         // Immediates and numbers hold no pointers.
         match self.unpack() {
-            Value::String(s) => cc.trace(&s),
-            Value::Object(o) => cc.trace(&o),
+            ValueEnum::String(s) => cc.trace(&s),
+            ValueEnum::Object(o) => cc.trace(&o),
             _ => {}
         }
     }
@@ -208,26 +305,26 @@ mod packed_value_tests {
     /// Round-trip every immediate/number case through pack→unpack.
     #[test]
     fn immediates_round_trip() {
-        fn check(v: Value<'_>) {
-            let packed = PackedValue::pack(v);
+        fn check(v: ValueEnum<'_>) {
+            let packed = Value::from(v);
             match (v, packed.unpack()) {
-                (Value::Undefined, Value::Undefined)
-                | (Value::Null, Value::Null) => {}
-                (Value::Bool(a), Value::Bool(b)) => assert_eq!(a, b),
-                (Value::Integer(a), Value::Integer(b)) => assert_eq!(a, b),
-                (Value::Number(a), Value::Number(b)) => {
+                (ValueEnum::Undefined, ValueEnum::Undefined)
+                | (ValueEnum::Null, ValueEnum::Null) => {}
+                (ValueEnum::Bool(a), ValueEnum::Bool(b)) => assert_eq!(a, b),
+                (ValueEnum::Integer(a), ValueEnum::Integer(b)) => assert_eq!(a, b),
+                (ValueEnum::Number(a), ValueEnum::Number(b)) => {
                     assert!(a == b || (a.is_nan() && b.is_nan()), "{a} != {b}");
                 }
                 (a, b) => panic!("variant changed: {a:?} -> {b:?}"),
             }
         }
 
-        check(Value::Undefined);
-        check(Value::Null);
-        check(Value::Bool(true));
-        check(Value::Bool(false));
+        check(ValueEnum::Undefined);
+        check(ValueEnum::Null);
+        check(ValueEnum::Bool(true));
+        check(ValueEnum::Bool(false));
         for i in [0i32, 1, -1, i32::MIN, i32::MAX, -12345, 0x7FFF_FFFF] {
-            check(Value::Integer(i));
+            check(ValueEnum::Integer(i));
         }
         for n in [
             0.0f64,
@@ -242,7 +339,7 @@ mod packed_value_tests {
             5e-324,        // smallest subnormal
             std::f64::consts::PI,
         ] {
-            check(Value::Number(n));
+            check(ValueEnum::Number(n));
         }
     }
 
@@ -259,9 +356,9 @@ mod packed_value_tests {
         ] {
             let n = f64::from_bits(raw);
             assert!(n.is_nan());
-            let packed = PackedValue::pack(Value::Number(n));
+            let packed = Value::from(ValueEnum::Number(n));
             match packed.unpack() {
-                Value::Number(u) => assert!(u.is_nan(), "raw {raw:#x} unpacked to {u}"),
+                ValueEnum::Number(u) => assert!(u.is_nan(), "raw {raw:#x} unpacked to {u}"),
                 other => panic!("NaN {raw:#x} misdecoded as {other:?}"),
             }
         }
@@ -277,13 +374,13 @@ mod packed_value_tests {
 
         // Plain `Vec` root (gc_arena has no general `Collect` for std `RefCell`;
         // `mutate_root` already grants `&mut` access, so we don't need one).
-        let mut arena: Arena<Rootable![Vec<PackedValue<'_>>]> = Arena::new(|_mc| Vec::new());
+        let mut arena: Arena<Rootable![Vec<Value<'_>>]> = Arena::new(|_mc| Vec::new());
 
         const N: usize = 500;
         arena.mutate_root(|mc, root| {
             for i in 0..N {
                 let s = AvmString::new_utf8(mc, format!("survivor-{i}"));
-                root.push(PackedValue::pack(Value::String(s)));
+                root.push(Value::from(ValueEnum::String(s)));
             }
         });
         arena.finish_cycle();
@@ -308,11 +405,11 @@ mod packed_value_tests {
     fn string_pointer_round_trips() {
         rootless_mutate(|mc| {
             let s = AvmString::new_utf8(mc, "hello NaN-box");
-            let packed = PackedValue::pack(Value::String(s));
-            assert!(!packed.is_number());
+            let packed = Value::from(ValueEnum::String(s));
+            assert!(!packed.is_f64());
             assert_eq!(packed.tag(), TAG_STRING);
             match packed.unpack() {
-                Value::String(s2) => {
+                ValueEnum::String(s2) => {
                     // Same allocation, same bytes.
                     assert_eq!(s2.as_gc_ptr(), s.as_gc_ptr());
                     assert_eq!(&*s2, &*s);
@@ -416,16 +513,16 @@ impl From<u32> for Value<'_> {
 
 impl PartialEq for Value<'_> {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::Undefined, Value::Undefined) => true,
-            (Value::Null, Value::Null) => true,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Number(a), Value::Number(b)) => a == b,
-            (Value::Number(a), Value::Integer(b)) => *a == *b as f64,
-            (Value::Integer(a), Value::Number(b)) => *a as f64 == *b,
-            (Value::Integer(a), Value::Integer(b)) => a == b,
-            (Value::String(a), Value::String(b)) => a == b,
-            (Value::Object(a), Value::Object(b)) => Object::ptr_eq(*a, *b),
+        match (&self.unpack(), &other.unpack()) {
+            (ValueEnum::Undefined, ValueEnum::Undefined) => true,
+            (ValueEnum::Null, ValueEnum::Null) => true,
+            (ValueEnum::Bool(a), ValueEnum::Bool(b)) => a == b,
+            (ValueEnum::Number(a), ValueEnum::Number(b)) => a == b,
+            (ValueEnum::Number(a), ValueEnum::Integer(b)) => *a == *b as f64,
+            (ValueEnum::Integer(a), ValueEnum::Number(b)) => *a as f64 == *b,
+            (ValueEnum::Integer(a), ValueEnum::Integer(b)) => a == b,
+            (ValueEnum::String(a), ValueEnum::String(b)) => a == b,
+            (ValueEnum::Object(a), ValueEnum::Object(b)) => Object::ptr_eq(*a, *b),
             _ => false,
         }
     }
@@ -785,8 +882,8 @@ impl<'gc> Value<'gc> {
     /// between a [`Value::Number`] and [`Value::Integer`]. If there's no need
     /// to differentiate between those variants, no normalization is needed.
     pub fn normalize(self) -> Self {
-        match self {
-            Value::Number(n) => {
+        match self.unpack() {
+            ValueEnum::Number(n) => {
                 let i = n as i32;
                 if n.to_bits() == (i as f64).to_bits() && fits_in_value_integer_i32(i) {
                     Value::Integer(i)
@@ -794,7 +891,7 @@ impl<'gc> Value<'gc> {
                     self
                 }
             }
-            Value::Integer(i) => {
+            ValueEnum::Integer(i) => {
                 if !fits_in_value_integer_i32(i) {
                     Value::Number(i as f64)
                 } else {
@@ -810,11 +907,7 @@ impl<'gc> Value<'gc> {
     /// This function performs no numerical coercion, nor are any methods called.
     /// If the value is not numeric, None is returned.
     pub fn try_as_f64(&self) -> Option<f64> {
-        Some(match self {
-            Value::Number(num) => *num,
-            Value::Integer(num) => *num as f64,
-            _ => return None,
-        })
+        self.packed_number()
     }
 
     /// Get the numerical portion of the value, if it exists.
@@ -827,18 +920,18 @@ impl<'gc> Value<'gc> {
 
     /// Like `as_f64`, but for `i32`
     pub fn as_i32(&self) -> i32 {
-        match self {
-            Value::Number(num) => f64_to_wrapping_i32(*num),
-            Value::Integer(num) => *num,
+        match &self.unpack() {
+            ValueEnum::Number(num) => f64_to_wrapping_i32(*num),
+            ValueEnum::Integer(num) => *num,
             _ => panic!("Expected Number or Integer"),
         }
     }
 
     /// Like `as_f64`, but for `u32`
     pub fn as_u32(&self) -> u32 {
-        match self {
-            Value::Number(num) => f64_to_wrapping_u32(*num),
-            Value::Integer(num) => *num as u32,
+        match &self.unpack() {
+            ValueEnum::Number(num) => f64_to_wrapping_u32(*num),
+            ValueEnum::Integer(num) => *num as u32,
             _ => panic!("Expected Number or Integer"),
         }
     }
@@ -846,9 +939,9 @@ impl<'gc> Value<'gc> {
     // If the current value represents an index (a unsigned integer less than u32::MAX),
     // then return that value. Returns None otherwise.
     pub fn try_as_index(&self) -> Option<usize> {
-        Some(match self {
-            value @ Value::Integer(num) if value.is_u32() => *num as usize,
-            value @ Value::Number(num) if value.is_u32() && *num < u32::MAX as f64 => {
+        Some(match &self.unpack() {
+            ValueEnum::Integer(num) if self.is_u32() => *num as usize,
+            ValueEnum::Number(num) if self.is_u32() && *num < u32::MAX as f64 => {
                 assert!(num.is_finite());
                 *num as usize
             }
@@ -862,7 +955,7 @@ impl<'gc> Value<'gc> {
     /// expected that their `toString`/`valueOf` handlers have already had a
     /// chance to unbox the primitive contained within.
     pub fn is_primitive(&self) -> bool {
-        !matches!(self, Value::Object(_))
+        !matches!(self.unpack(), ValueEnum::Object(_))
     }
 
     /// Coerce the value to a boolean.
@@ -870,13 +963,21 @@ impl<'gc> Value<'gc> {
     /// Boolean coercion happens according to the rules specified in the ES4
     /// draft proposals, which appear to be identical to ECMA-262 Edition 3.
     pub fn coerce_to_boolean(&self) -> bool {
-        match self {
-            Value::Undefined | Value::Null => false,
-            Value::Bool(b) => *b,
-            Value::Number(f) => !f.is_nan() && *f != 0.0,
-            Value::Integer(i) => *i != 0,
-            Value::String(s) => !s.is_empty(),
-            Value::Object(_) => true,
+        // Packed fast paths for the hot numeric/bool cases (no `unpack()`).
+        if let Some(i) = self.packed_i32() {
+            return i != 0;
+        }
+        if let Some(f) = self.packed_f64() {
+            return !f.is_nan() && f != 0.0;
+        }
+        match self.unpack() {
+            ValueEnum::Bool(b) => b,
+            ValueEnum::Undefined | ValueEnum::Null => false,
+            ValueEnum::String(s) => !s.is_empty(),
+            ValueEnum::Object(_) => true,
+            ValueEnum::Number(_) | ValueEnum::Integer(_) => {
+                unreachable!("handled by packed fast path")
+            }
         }
     }
 
@@ -897,13 +998,13 @@ impl<'gc> Value<'gc> {
         hint: Option<Hint>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        let hint = hint.unwrap_or_else(|| match self {
-            Value::Object(o) => o.default_hint(),
+        let hint = hint.unwrap_or_else(|| match self.unpack() {
+            ValueEnum::Object(o) => o.default_hint(),
             _ => Hint::Number,
         });
 
-        match self {
-            Value::Object(_) if hint == Hint::String => {
+        match self.unpack() {
+            ValueEnum::Object(_) if hint == Hint::String => {
                 let prim = self.call_public_property(
                     istr!("toString"),
                     FunctionArgs::empty(),
@@ -921,7 +1022,7 @@ impl<'gc> Value<'gc> {
 
                 Err(make_error_1050(activation, *self))
             }
-            Value::Object(_) if hint == Hint::Number => {
+            ValueEnum::Object(_) if hint == Hint::Number => {
                 let prim =
                     self.call_public_property(istr!("valueOf"), FunctionArgs::empty(), activation)?;
                 if prim.is_primitive() {
@@ -965,30 +1066,28 @@ impl<'gc> Value<'gc> {
             value: &Value<'gc>,
             activation: &mut Activation<'_, 'gc>,
         ) -> Result<f64, Error<'gc>> {
-            Ok(match value {
-                Value::Undefined => f64::NAN,
-                Value::Null => 0.0,
-                Value::Bool(true) => 1.0,
-                Value::Bool(false) => 0.0,
-                Value::Integer(_) | Value::Number(_) => unreachable!("Handled by fast path"),
-                Value::String(s) => {
+            Ok(match &value.unpack() {
+                ValueEnum::Undefined => f64::NAN,
+                ValueEnum::Null => 0.0,
+                ValueEnum::Bool(true) => 1.0,
+                ValueEnum::Bool(false) => 0.0,
+                ValueEnum::Integer(_) | ValueEnum::Number(_) => {
+                    unreachable!("Handled by fast path")
+                }
+                ValueEnum::String(s) => {
                     let swf_version = activation.context.root_swf.version();
                     string_to_f64(s, swf_version, true).unwrap_or_else(|| string_to_int(s, 0, true))
                 }
-                Value::Object(_) => value
+                ValueEnum::Object(_) => value
                     .coerce_to_primitive(Some(Hint::Number), activation)?
                     .coerce_to_number(activation)?,
             })
         }
 
-        match self {
-            Value::Number(n) => Ok(*n),
-            Value::Integer(i) => Ok(*i as f64),
-            _ => {
-                // Fall back to slow path
-                coerce_to_number_slow(self, activation)
-            }
+        if let Some(n) = self.packed_number() {
+            return Ok(n);
         }
+        coerce_to_number_slow(self, activation)
     }
 
     /// Coerce the value to a 32-bit unsigned integer.
@@ -1009,24 +1108,25 @@ impl<'gc> Value<'gc> {
             value: &Value<'gc>,
             activation: &mut Activation<'_, 'gc>,
         ) -> Result<u32, Error<'gc>> {
-            Ok(match value {
-                Value::Integer(_) | Value::Number(_) => unreachable!("Handled by fast path"),
-                Value::Bool(b) => *b as u32,
-                Value::Undefined | Value::Null => 0,
-                Value::String(_) | Value::Object(_) => {
+            Ok(match &value.unpack() {
+                ValueEnum::Integer(_) | ValueEnum::Number(_) => {
+                    unreachable!("Handled by fast path")
+                }
+                ValueEnum::Bool(b) => *b as u32,
+                ValueEnum::Undefined | ValueEnum::Null => 0,
+                ValueEnum::String(_) | ValueEnum::Object(_) => {
                     f64_to_wrapping_u32(value.coerce_to_number(activation)?)
                 }
             })
         }
 
-        match self {
-            Value::Number(n) => Ok(f64_to_wrapping_u32(*n)),
-            Value::Integer(i) => Ok(*i as u32),
-            _ => {
-                // Fall back to slow path
-                coerce_to_u32_slow(self, activation)
-            }
+        if let Some(i) = self.packed_i32() {
+            return Ok(i as u32);
         }
+        if let Some(n) = self.packed_f64() {
+            return Ok(f64_to_wrapping_u32(n));
+        }
+        coerce_to_u32_slow(self, activation)
     }
 
     /// Coerce the value to a 32-bit signed integer.
@@ -1047,24 +1147,25 @@ impl<'gc> Value<'gc> {
             value: &Value<'gc>,
             activation: &mut Activation<'_, 'gc>,
         ) -> Result<i32, Error<'gc>> {
-            Ok(match value {
-                Value::Integer(_) | Value::Number(_) => unreachable!("Handled by fast path"),
-                Value::Bool(b) => *b as i32,
-                Value::Undefined | Value::Null => 0,
-                Value::String(_) | Value::Object(_) => {
+            Ok(match &value.unpack() {
+                ValueEnum::Integer(_) | ValueEnum::Number(_) => {
+                    unreachable!("Handled by fast path")
+                }
+                ValueEnum::Bool(b) => *b as i32,
+                ValueEnum::Undefined | ValueEnum::Null => 0,
+                ValueEnum::String(_) | ValueEnum::Object(_) => {
                     f64_to_wrapping_i32(value.coerce_to_number(activation)?)
                 }
             })
         }
 
-        match self {
-            Value::Number(n) => Ok(f64_to_wrapping_i32(*n)),
-            Value::Integer(i) => Ok(*i),
-            _ => {
-                // Fall back to slow path
-                coerce_to_i32_slow(self, activation)
-            }
+        if let Some(i) = self.packed_i32() {
+            return Ok(i);
         }
+        if let Some(n) = self.packed_f64() {
+            return Ok(f64_to_wrapping_i32(n));
+        }
+        coerce_to_i32_slow(self, activation)
     }
 
     /// Minimum number of digits after which numbers are formatted as
@@ -1100,19 +1201,19 @@ impl<'gc> Value<'gc> {
         &'a self,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<AvmString<'gc>, Error<'gc>> {
-        Ok(match self {
-            Value::Undefined => istr!("undefined"),
-            Value::Null => istr!("null"),
-            Value::Bool(true) => istr!("true"),
-            Value::Bool(false) => istr!("false"),
-            Value::Number(n) if n.is_nan() => istr!("NaN"),
-            Value::Number(n) if *n == 0.0 => istr!("0"),
-            Value::Number(n) if *n < 0.0 => AvmString::new_utf8(
+        Ok(match &self.unpack() {
+            ValueEnum::Undefined => istr!("undefined"),
+            ValueEnum::Null => istr!("null"),
+            ValueEnum::Bool(true) => istr!("true"),
+            ValueEnum::Bool(false) => istr!("false"),
+            ValueEnum::Number(n) if n.is_nan() => istr!("NaN"),
+            ValueEnum::Number(n) if *n == 0.0 => istr!("0"),
+            ValueEnum::Number(n) if *n < 0.0 => AvmString::new_utf8(
                 activation.gc(),
                 format!("-{}", Value::Number(-n).coerce_to_string(activation)?),
             ),
-            Value::Number(n) if n.is_infinite() => istr!("Infinity"),
-            Value::Number(n) => {
+            ValueEnum::Number(n) if n.is_infinite() => istr!("Infinity"),
+            ValueEnum::Number(n) => {
                 let digits = n.log10().floor();
 
                 // TODO: This needs to limit precision in the resulting decimal
@@ -1134,15 +1235,15 @@ impl<'gc> Value<'gc> {
                     AvmString::new_utf8(activation.gc(), n.to_string())
                 }
             }
-            Value::Integer(i) => {
+            ValueEnum::Integer(i) => {
                 if *i >= 0 && *i < 10 {
                     activation.strings().ascii_char(b'0' + *i as u8)
                 } else {
                     AvmString::new_utf8(activation.gc(), i.to_string())
                 }
             }
-            Value::String(s) => *s,
-            Value::Object(_) => self
+            ValueEnum::String(s) => *s,
+            ValueEnum::Object(_) => self
                 .coerce_to_primitive(Some(Hint::String), activation)?
                 .coerce_to_string(activation)?,
         })
@@ -1158,9 +1259,9 @@ impl<'gc> Value<'gc> {
         &self,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<String, Error<'gc>> {
-        Ok(match self {
-            Value::String(s) => format!("\"{s}\""),
-            Value::Object(obj) => {
+        Ok(match &self.unpack() {
+            ValueEnum::String(s) => format!("\"{s}\""),
+            ValueEnum::Object(obj) => {
                 // Flash prints the class name (ignoring the toString() impl on the object),
                 // followed by something that looks like an address (it varies between executions).
                 // For now, we just set the "address" to all zeroes, on the off chance that some
@@ -1180,7 +1281,7 @@ impl<'gc> Value<'gc> {
         activation: &mut Activation<'_, 'gc>,
         name: Option<&Multiname<'gc>>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        if matches!(self, Value::Null | Value::Undefined) {
+        if matches!(self.unpack(), ValueEnum::Null | ValueEnum::Undefined) {
             return Err(error::make_null_or_undefined_error(activation, *self, name));
         }
 
@@ -1189,8 +1290,8 @@ impl<'gc> Value<'gc> {
 
     #[inline(always)]
     pub fn as_object(&self) -> Option<Object<'gc>> {
-        match self {
-            Value::Object(o) => Some(*o),
+        match &self.unpack() {
+            ValueEnum::Object(o) => Some(*o),
             _ => None,
         }
     }
@@ -1215,9 +1316,9 @@ impl<'gc> Value<'gc> {
             panic!("{msg}")
         }
 
-        match self {
-            Value::Object(o) => Ok(o),
-            Value::Null | Value::Undefined => {
+        match self.unpack() {
+            ValueEnum::Object(o) => Ok(o),
+            ValueEnum::Null | ValueEnum::Undefined => {
                 Err(error::make_null_or_undefined_error(activation, self, name))
             }
             _ => panic_str(msg),
@@ -1624,8 +1725,8 @@ impl<'gc> Value<'gc> {
         activation: &mut Activation<'_, 'gc>,
         multiname: &Multiname<'gc>,
     ) -> Result<bool, Error<'gc>> {
-        match self {
-            Value::Object(object) => {
+        match self.unpack() {
+            ValueEnum::Object(object) => {
                 match object.vtable().get_trait(multiname) {
                     None => {
                         if object.instance_class().is_sealed() {
@@ -1762,8 +1863,8 @@ impl<'gc> Value<'gc> {
         activation: &mut Activation<'_, 'gc>,
         name: &Multiname<'gc>,
     ) -> bool {
-        match self {
-            Value::Object(object) => object.has_own_property(name),
+        match self.unpack() {
+            ValueEnum::Object(object) => object.has_own_property(name),
             _ => self.vtable(activation).has_trait(name),
         }
     }
@@ -1800,11 +1901,11 @@ impl<'gc> Value<'gc> {
         receiver: Value<'gc>,
         args: FunctionArgs<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        match self {
-            Value::Object(o) if let Some(class_object) = o.as_class_object() => {
+        match self.unpack() {
+            ValueEnum::Object(o) if let Some(class_object) = o.as_class_object() => {
                 class_object.call(activation, args)
             }
-            Value::Object(o) if let Some(function_object) = o.as_function_object() => {
+            ValueEnum::Object(o) if let Some(function_object) = o.as_function_object() => {
                 function_object.call(activation, receiver, args)
             }
             _ => Err(make_error_1006(activation)),
@@ -1816,11 +1917,11 @@ impl<'gc> Value<'gc> {
         activation: &mut Activation<'_, 'gc>,
         args: FunctionArgs<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        match self {
-            Value::Object(o) if let Some(class_object) = o.as_class_object() => {
+        match self.unpack() {
+            ValueEnum::Object(o) if let Some(class_object) = o.as_class_object() => {
                 class_object.construct_with_args(activation, args)
             }
-            Value::Object(o) if let Some(function_object) = o.as_function_object() => {
+            ValueEnum::Object(o) if let Some(function_object) = o.as_function_object() => {
                 function_object.construct(activation, args).map(Into::into)
             }
             _ => Err(make_error_1007(activation)),
@@ -1856,7 +1957,8 @@ impl<'gc> Value<'gc> {
             return Ok(self.coerce_to_boolean().into());
         }
 
-        if matches!(self, Value::Undefined) || matches!(self, Value::Null) {
+        if matches!(self.unpack(), ValueEnum::Undefined) || matches!(self.unpack(), ValueEnum::Null)
+        {
             if class.is_builtin_void() {
                 return Ok(Value::Undefined);
             }
@@ -1882,16 +1984,16 @@ impl<'gc> Value<'gc> {
 
     /// Determine if this value is any kind of number.
     pub fn is_number(&self) -> bool {
-        matches!(self, Value::Number(_) | Value::Integer(_))
+        matches!(self.unpack(), ValueEnum::Number(_) | ValueEnum::Integer(_))
     }
 
     /// Determine if this value is a number representable as a u32 without loss
     /// of precision.
     #[expect(clippy::float_cmp)]
     pub fn is_u32(&self) -> bool {
-        match self {
-            Value::Number(n) => *n == (*n as u32 as f64),
-            Value::Integer(i) => *i >= 0,
+        match &self.unpack() {
+            ValueEnum::Number(n) => *n == (*n as u32 as f64),
+            ValueEnum::Integer(i) => *i >= 0,
             _ => false,
         }
     }
@@ -1900,9 +2002,9 @@ impl<'gc> Value<'gc> {
     /// loss of precision.
     #[expect(clippy::float_cmp)]
     pub fn is_i32(&self) -> bool {
-        match self {
-            Value::Number(n) => *n == (*n as i32 as f64),
-            Value::Integer(_) => true,
+        match &self.unpack() {
+            ValueEnum::Number(n) => *n == (*n as i32 as f64),
+            ValueEnum::Integer(_) => true,
             _ => false,
         }
     }
@@ -1925,19 +2027,19 @@ impl<'gc> Value<'gc> {
         }
 
         if type_class.is_builtin_void() {
-            return matches!(self, Value::Undefined);
+            return matches!(self.unpack(), ValueEnum::Undefined);
         }
 
         if type_class.is_builtin_boolean() {
-            return matches!(self, Value::Bool(_));
+            return matches!(self.unpack(), ValueEnum::Bool(_));
         }
 
         if type_class.is_builtin_string() {
-            return matches!(self, Value::String(_));
+            return matches!(self.unpack(), ValueEnum::String(_));
         }
 
         if type_class.is_builtin_object() {
-            return !matches!(self, Value::Undefined | Value::Null);
+            return !matches!(self.unpack(), ValueEnum::Undefined | ValueEnum::Null);
         }
 
         if let Some(o) = self.as_object() {
@@ -1954,13 +2056,13 @@ impl<'gc> Value<'gc> {
     pub fn vtable(&self, activation: &mut Activation<'_, 'gc>) -> VTable<'gc> {
         let classes = activation.avm2().classes();
 
-        match self {
-            Value::Bool(_) => classes.boolean.instance_vtable(),
-            Value::Number(_) | Value::Integer(_) => classes.number.instance_vtable(),
-            Value::String(_) => classes.string.instance_vtable(),
-            Value::Object(obj) => obj.vtable(),
+        match self.unpack() {
+            ValueEnum::Bool(_) => classes.boolean.instance_vtable(),
+            ValueEnum::Number(_) | ValueEnum::Integer(_) => classes.number.instance_vtable(),
+            ValueEnum::String(_) => classes.string.instance_vtable(),
+            ValueEnum::Object(obj) => obj.vtable(),
 
-            Value::Undefined | Value::Null => {
+            ValueEnum::Undefined | ValueEnum::Null => {
                 unreachable!("Should not have Undefined or Null in `vtable`")
             }
         }
@@ -1973,13 +2075,13 @@ impl<'gc> Value<'gc> {
     pub fn instance_class(&self, activation: &mut Activation<'_, 'gc>) -> Class<'gc> {
         let class_defs = activation.avm2().class_defs();
 
-        match self {
-            Value::Bool(_) => class_defs.boolean,
-            Value::Number(_) | Value::Integer(_) => class_defs.number,
-            Value::String(_) => class_defs.string,
-            Value::Object(obj) => obj.instance_class(),
+        match self.unpack() {
+            ValueEnum::Bool(_) => class_defs.boolean,
+            ValueEnum::Number(_) | ValueEnum::Integer(_) => class_defs.number,
+            ValueEnum::String(_) => class_defs.string,
+            ValueEnum::Object(obj) => obj.instance_class(),
 
-            Value::Undefined | Value::Null => {
+            ValueEnum::Undefined | ValueEnum::Null => {
                 unreachable!("Should not have Undefined or Null in `instance_class`")
             }
         }
@@ -1992,13 +2094,13 @@ impl<'gc> Value<'gc> {
     pub fn proto(&self, activation: &mut Activation<'_, 'gc>) -> Option<Object<'gc>> {
         let classes = activation.avm2().classes();
 
-        match self {
-            Value::Bool(_) => Some(classes.boolean.prototype()),
-            Value::Number(_) | Value::Integer(_) => Some(classes.number.prototype()),
-            Value::String(_) => Some(classes.string.prototype()),
-            Value::Object(obj) => obj.proto(),
+        match self.unpack() {
+            ValueEnum::Bool(_) => Some(classes.boolean.prototype()),
+            ValueEnum::Number(_) | ValueEnum::Integer(_) => Some(classes.number.prototype()),
+            ValueEnum::String(_) => Some(classes.string.prototype()),
+            ValueEnum::Object(obj) => obj.proto(),
 
-            Value::Undefined | Value::Null => {
+            ValueEnum::Undefined | ValueEnum::Null => {
                 unreachable!("Should not have Undefined or Null in `proto`")
             }
         }
@@ -2074,11 +2176,19 @@ impl<'gc> Value<'gc> {
         other: &Value<'gc>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<bool, Error<'gc>> {
+        // Fast path: both operands numeric. Neither can be an Object, so the
+        // XML/QName/Namespace special-cases below don't apply, and `i32` is exact
+        // in `f64`, so an `f64` compare matches AS3 for int/int, int/number and
+        // number/number alike (including `NaN != NaN` and `-0.0 == 0.0`).
+        if let (Some(a), Some(b)) = (self.packed_number(), other.packed_number()) {
+            return Ok(a == b);
+        }
+
         // ECMA-357 extends the abstract equality algorithm with steps
         // for XML and XMLList types. Because they are objects in Ruffle we
         // have to be a bit more complicated and factor out the code into
         // a separate method.
-        if let Value::Object(obj) = self {
+        if let ValueEnum::Object(obj) = self.unpack() {
             if let Some(xml_list_obj) = obj.as_xml_list_object() {
                 return xml_list_obj.equals(other, activation);
             }
@@ -2088,7 +2198,7 @@ impl<'gc> Value<'gc> {
             }
 
             if let Some(self_qname) = obj.as_qname_object()
-                && let Value::Object(o) = other
+                && let ValueEnum::Object(o) = other.unpack()
                 && let Some(other_qname) = o.as_qname_object()
             {
                 return Ok(self_qname.uri(activation.strings())
@@ -2098,7 +2208,7 @@ impl<'gc> Value<'gc> {
             }
 
             if let Some(self_ns) = obj.as_namespace_object()
-                && let Value::Object(o) = other
+                && let ValueEnum::Object(o) = other.unpack()
                 && let Some(other_ns) = o.as_namespace_object()
             {
                 return Ok(self_ns.namespace().as_uri(activation.strings())
@@ -2106,7 +2216,7 @@ impl<'gc> Value<'gc> {
             }
         }
 
-        if let Value::Object(obj) = other {
+        if let ValueEnum::Object(obj) = other.unpack() {
             if let Some(xml_list_obj) = obj.as_xml_list_object() {
                 return xml_list_obj.equals(self, activation);
             }
@@ -2116,47 +2226,56 @@ impl<'gc> Value<'gc> {
             }
         }
 
-        match (self, other) {
-            (Value::Undefined, Value::Undefined) => Ok(true),
-            (Value::Null, Value::Null) => Ok(true),
-            (Value::Integer(a), Value::Integer(b)) => Ok(a == b),
-            (Value::Number(_) | Value::Integer(_), Value::Number(_) | Value::Integer(_)) => {
+        match (&self.unpack(), &other.unpack()) {
+            (ValueEnum::Undefined, ValueEnum::Undefined) => Ok(true),
+            (ValueEnum::Null, ValueEnum::Null) => Ok(true),
+            (ValueEnum::Integer(a), ValueEnum::Integer(b)) => Ok(a == b),
+            (
+                ValueEnum::Number(_) | ValueEnum::Integer(_),
+                ValueEnum::Number(_) | ValueEnum::Integer(_),
+            ) => {
                 let a = self.coerce_to_number(activation)?;
                 let b = other.coerce_to_number(activation)?;
                 Ok(a == b)
             }
-            (Value::String(a), Value::String(b)) => Ok(a == b),
-            (Value::Bool(a), Value::Bool(b)) => Ok(a == b),
-            (Value::Object(a), Value::Object(b)) => Ok(Object::ptr_eq(*a, *b)),
-            (Value::Undefined, Value::Null) => Ok(true),
-            (Value::Null, Value::Undefined) => Ok(true),
-            (Value::Number(_) | Value::Integer(_), Value::String(_)) => {
+            (ValueEnum::String(a), ValueEnum::String(b)) => Ok(a == b),
+            (ValueEnum::Bool(a), ValueEnum::Bool(b)) => Ok(a == b),
+            (ValueEnum::Object(a), ValueEnum::Object(b)) => Ok(Object::ptr_eq(*a, *b)),
+            (ValueEnum::Undefined, ValueEnum::Null) => Ok(true),
+            (ValueEnum::Null, ValueEnum::Undefined) => Ok(true),
+            (ValueEnum::Number(_) | ValueEnum::Integer(_), ValueEnum::String(_)) => {
                 let number_other = Value::from(other.coerce_to_number(activation)?);
 
                 self.abstract_eq(&number_other, activation)
             }
-            (Value::String(_), Value::Number(_) | Value::Integer(_)) => {
+            (ValueEnum::String(_), ValueEnum::Number(_) | ValueEnum::Integer(_)) => {
                 let number_self = Value::from(self.coerce_to_number(activation)?);
 
                 number_self.abstract_eq(other, activation)
             }
-            (Value::Bool(_), _) => {
+            (ValueEnum::Bool(_), _) => {
                 let number_self = Value::from(self.coerce_to_number(activation)?);
 
                 number_self.abstract_eq(other, activation)
             }
-            (_, Value::Bool(_)) => {
+            (_, ValueEnum::Bool(_)) => {
                 let number_other = Value::from(other.coerce_to_number(activation)?);
 
                 self.abstract_eq(&number_other, activation)
             }
-            (Value::String(_) | Value::Number(_) | Value::Integer(_), Value::Object(_)) => {
+            (
+                ValueEnum::String(_) | ValueEnum::Number(_) | ValueEnum::Integer(_),
+                ValueEnum::Object(_),
+            ) => {
                 //TODO: Should this be `Hint::Number`, `Hint::String`, or no-hint?
                 let primitive_other = other.coerce_to_primitive(Some(Hint::Number), activation)?;
 
                 self.abstract_eq(&primitive_other, activation)
             }
-            (Value::Object(_), Value::String(_) | Value::Number(_) | Value::Integer(_)) => {
+            (
+                ValueEnum::Object(_),
+                ValueEnum::String(_) | ValueEnum::Number(_) | ValueEnum::Integer(_),
+            ) => {
                 //TODO: Should this be `Hint::Number`, `Hint::String`, or no-hint?
                 let primitive_self = self.coerce_to_primitive(Some(Hint::Number), activation)?;
 
@@ -2176,26 +2295,34 @@ impl<'gc> Value<'gc> {
         other: &Value<'gc>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Option<bool>, Error<'gc>> {
-        match (self, other) {
-            (Value::Integer(a), Value::Integer(b)) => Ok(Some(a < b)),
-            _ => {
-                let prim_self = self.coerce_to_primitive(Some(Hint::Number), activation)?;
-                let prim_other = other.coerce_to_primitive(Some(Hint::Number), activation)?;
-
-                if let (Value::String(s), Value::String(o)) = (&prim_self, &prim_other) {
-                    return Ok(Some(s.as_wstr() < o.as_wstr()));
-                }
-
-                let num_self = prim_self.coerce_to_number(activation)?;
-                let num_other = prim_other.coerce_to_number(activation)?;
-
-                if num_self.is_nan() || num_other.is_nan() {
-                    return Ok(None);
-                }
-
-                Ok(Some(num_self < num_other))
-            }
+        // Fast path: both operands numeric (covers int/int, int/number,
+        // number/number). `i32` is exact in `f64`, matching the old int/int arm,
+        // and the `NaN -> None` result matches the general numeric path below.
+        if let (Some(a), Some(b)) = (self.packed_number(), other.packed_number()) {
+            return Ok(if a.is_nan() || b.is_nan() {
+                None
+            } else {
+                Some(a < b)
+            });
         }
+
+        let prim_self = self.coerce_to_primitive(Some(Hint::Number), activation)?;
+        let prim_other = other.coerce_to_primitive(Some(Hint::Number), activation)?;
+
+        if let (ValueEnum::String(s), ValueEnum::String(o)) =
+            (&prim_self.unpack(), &prim_other.unpack())
+        {
+            return Ok(Some(s.as_wstr() < o.as_wstr()));
+        }
+
+        let num_self = prim_self.coerce_to_number(activation)?;
+        let num_other = prim_other.coerce_to_number(activation)?;
+
+        if num_self.is_nan() || num_other.is_nan() {
+            return Ok(None);
+        }
+
+        Ok(Some(num_self < num_other))
     }
 }
 

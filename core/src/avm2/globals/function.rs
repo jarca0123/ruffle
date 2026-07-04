@@ -8,7 +8,7 @@ use crate::avm2::globals::array::resolve_array_hole;
 use crate::avm2::globals::methods::function as function_class_methods;
 use crate::avm2::object::FunctionObject;
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueEnum};
 
 /// Create a dummy function using Function.createDummyFunction. The Function class
 /// must be stored properly in SystemClasses; otherwise, this method will panic.
@@ -90,7 +90,7 @@ pub fn apply<'gc>(
     let this = args.get_value(0);
 
     let arg_array = args.get_value(1);
-    let resolved_args = if !matches!(arg_array, Value::Undefined | Value::Null) {
+    let resolved_args = if !matches!(arg_array.unpack(), ValueEnum::Undefined | ValueEnum::Null) {
         if let Some(array_object) = arg_array.as_object().and_then(|o| o.as_array_object()) {
             let arg_storage = array_object.storage();
 

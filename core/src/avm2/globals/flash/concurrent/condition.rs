@@ -42,7 +42,7 @@ pub fn init<'gc>(
 
 /// Implements `Condition.wait`
 pub fn wait<'gc>(
-    activation: &mut Activation<'_, 'gc>,
+    _activation: &mut Activation<'_, 'gc>,
     this: Value<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {

@@ -6,7 +6,7 @@ use crate::avm2::method::Method;
 use crate::avm2::object::{ArrayObject, ScriptObject, TObject as _};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::property::Property;
-use crate::avm2::{Activation, Error, Multiname, Namespace, Object, Value};
+use crate::avm2::{Activation, Error, Multiname, Namespace, Object, Value, ValueEnum};
 use crate::context::UpdateContext;
 use crate::string::{AvmString, StringContext};
 
@@ -478,10 +478,11 @@ pub fn instance_class_describe_type<'gc>(
 ) -> Class<'gc> {
     let class_defs = activation.avm2().class_defs();
 
-    match value.normalize() {
-        Value::Null => class_defs.null,
-        Value::Undefined => class_defs.void,
-        Value::Integer(_) => class_defs.int,
-        value => value.instance_class(activation),
+    let value = value.normalize();
+    match value.unpack() {
+        ValueEnum::Null => class_defs.null,
+        ValueEnum::Undefined => class_defs.void,
+        ValueEnum::Integer(_) => class_defs.int,
+        _ => value.instance_class(activation),
     }
 }

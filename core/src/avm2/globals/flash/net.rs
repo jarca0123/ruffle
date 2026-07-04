@@ -4,7 +4,7 @@ use crate::avm2::error::{Error1014Type, make_error_1014, make_error_2007};
 use crate::avm2::globals::slots::flash_net_url_request as url_request_slots;
 use crate::avm2::object::TObject;
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::{Activation, Error, Object, Value};
+use crate::avm2::{Activation, Error, Object, Value, ValueEnum};
 use crate::backend::navigator::NavigationMethod;
 use indexmap::IndexMap;
 
@@ -81,9 +81,10 @@ pub fn navigate_to_url<'gc>(
 
     let target = args.get_string(activation, 1);
 
-    match request.get_slot(url_request_slots::_URL) {
-        Value::Null => Err(make_error_2007(activation, "url")),
-        url => {
+    let url = request.get_slot(url_request_slots::_URL);
+    match url.unpack() {
+        ValueEnum::Null => Err(make_error_2007(activation, "url")),
+        _ => {
             let url = url.coerce_to_string(activation)?.to_string();
             let method = request
                 .get_slot(url_request_slots::_METHOD)

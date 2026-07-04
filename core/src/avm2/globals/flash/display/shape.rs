@@ -6,6 +6,7 @@ use crate::avm2::globals::flash::display::display_object::initialize_for_allocat
 use crate::avm2::globals::slots::flash_display_shape as slots;
 use crate::avm2::object::{ClassObject, Object, StageObject, TObject as _};
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 use crate::display_object::Graphic;
 
 pub fn shape_allocator<'gc>(
@@ -27,13 +28,14 @@ pub fn get_graphics<'gc>(
 
     if let Some(dobj) = this.as_display_object() {
         // Lazily initialize the `Graphics` object in a hidden property.
-        let graphics = match this.get_slot(slots::_GRAPHICS) {
-            Value::Undefined | Value::Null => {
+        let graphics_slot = this.get_slot(slots::_GRAPHICS);
+        let graphics = match graphics_slot.unpack() {
+            ValueEnum::Undefined | ValueEnum::Null => {
                 let graphics = Value::from(StageObject::graphics(activation, dobj));
                 this.set_slot(slots::_GRAPHICS, graphics, activation)?;
                 graphics
             }
-            graphics => graphics,
+            _ => graphics_slot,
         };
         return Ok(graphics);
     }

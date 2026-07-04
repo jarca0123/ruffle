@@ -10,6 +10,7 @@ use crate::avm2::object::kind;
 use crate::avm2::object::script_object::ScriptObjectData;
 use crate::avm2::object::{Object, TObject};
 use crate::avm2::value::Value;
+use crate::avm2::value::ValueEnum;
 use crate::avm2::{Error, Multiname, Namespace};
 use crate::string::AvmString;
 use gc_arena::barrier::unlock;
@@ -315,7 +316,7 @@ impl<'gc> XmlListObject<'gc> {
             return Ok(true);
         }
 
-        if let Value::Object(obj) = other
+        if let ValueEnum::Object(obj) = (*other).unpack()
             && let Some(xml_list_obj) = obj.as_xml_list_object()
         {
             if self.length() != xml_list_obj.length() {
@@ -448,7 +449,7 @@ impl<'gc> XmlOrXmlListObject<'gc> {
             return Ok(Some(XmlOrXmlListObject::XmlList(list)));
         }
 
-        if matches!(value, Value::Null | Value::Undefined) {
+        if matches!(value.unpack(), ValueEnum::Null | ValueEnum::Undefined) {
             return Ok(None);
         }
 
@@ -583,7 +584,7 @@ impl<'gc> TObject<'gc> for XmlListObject<'gc> {
         //
         // Nevertheless, there may be some weird edge case where this actually matters.
         // To be safe, we'll just perform exactly the same check that avmplus does.
-        if matches!(method, Value::Undefined) {
+        if matches!(method.unpack(), ValueEnum::Undefined) {
             let prop = self.get_property_local(multiname, activation)?;
             if let Some(list) = prop.as_object().and_then(|obj| obj.as_xml_list_object())
                 && list.length() == 0

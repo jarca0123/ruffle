@@ -8,7 +8,7 @@ use crate::avm2::bytearray::ByteArrayStorage;
 use crate::avm2::class::Class;
 use crate::avm2::object::{ByteArrayObject, ClassObject, ScriptObject, TObject, VectorObject};
 use crate::avm2::vector::VectorStorage;
-use crate::avm2::{Activation, Error, Object, Value};
+use crate::avm2::{Activation, Error, Object, Value, ValueEnum};
 use crate::avm2_stub_method;
 use crate::string::AvmString;
 use enumset::EnumSet;
@@ -25,17 +25,17 @@ pub fn serialize_value<'gc>(
     amf_version: AMFVersion,
     object_table: &mut ObjectTable<'gc>,
 ) -> AmfValue {
-    match elem.normalize() {
-        Value::Undefined => AmfValue::Undefined,
-        Value::Null => AmfValue::Null,
-        Value::Bool(b) => AmfValue::Bool(b),
-        Value::Number(f) => AmfValue::Number(f),
+    match elem.normalize().unpack() {
+        ValueEnum::Undefined => AmfValue::Undefined,
+        ValueEnum::Null => AmfValue::Null,
+        ValueEnum::Bool(b) => AmfValue::Bool(b),
+        ValueEnum::Number(f) => AmfValue::Number(f),
         // Integers are unsupported in AMF0, and must be converted to Number regardless of whether
         // it can be represented as an integer.
-        Value::Integer(i) if amf_version == AMFVersion::AMF0 => AmfValue::Number(i as f64),
-        Value::Integer(i) => AmfValue::Integer(i),
-        Value::String(s) => AmfValue::String(s.to_string()),
-        Value::Object(o) => {
+        ValueEnum::Integer(i) if amf_version == AMFVersion::AMF0 => AmfValue::Number(i as f64),
+        ValueEnum::Integer(i) => AmfValue::Integer(i),
+        ValueEnum::String(s) => AmfValue::String(s.to_string()),
+        ValueEnum::Object(o) => {
             if o.as_function_object().is_some() {
                 // NOTE: `FunctionObject`-valued keys are skipped during
                 // serialization of objects in `recursive_serialize`. However,
@@ -461,7 +461,7 @@ pub fn deserialize_value_impl<'gc>(
                     deserialize_value_impl(activation, v, object_map).map(|value| {
                         // There's no Vector.<void>: convert any
                         // Undefined items in the Vector to Null.
-                        if matches!(value, Value::Undefined) {
+                        if matches!(value.unpack(), ValueEnum::Undefined) {
                             Value::Null
                         } else {
                             value
@@ -493,7 +493,7 @@ pub fn deserialize_value_impl<'gc>(
                 let key = deserialize_value_impl(activation, key, object_map)?;
                 let value = deserialize_value_impl(activation, value, object_map)?;
 
-                if let Value::Object(key) = key {
+                if let ValueEnum::Object(key) = key.unpack() {
                     dict_obj.set_property_by_object(key, value, activation.gc());
                 } else {
                     let key_string = key.coerce_to_string(activation)?;

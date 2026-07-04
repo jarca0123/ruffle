@@ -3,7 +3,7 @@
 use crate::avm1::{Activation, ActivationIdentifier};
 use crate::avm2::{
     Activation as Avm2Activation, Avm2, EventObject as Avm2EventObject, Multiname as Avm2Multiname,
-    Value as Avm2Value,
+    Value as Avm2Value, ValueEnum as Avm2ValueEnum,
 };
 use crate::context::{RenderContext, UpdateContext};
 use crate::display_object::avm1_button::Avm1Button;
@@ -759,8 +759,8 @@ impl<'gc> ChildContainer<'gc> {
                     let multiname =
                         Avm2Multiname::new(activation.avm2().find_public_namespace(), name);
                     let current_val = parent_obj.get_property(&multiname, &mut activation);
-                    match current_val {
-                        Ok(Avm2Value::Null | Avm2Value::Undefined) => {
+                    match current_val.map(|v| v.unpack()) {
+                        Ok(Avm2ValueEnum::Null | Avm2ValueEnum::Undefined) => {
                             // When the `get_property` returns null
                             // or undefined, FP doesn't attempt to
                             // set it to `null`. This is observable:

@@ -961,6 +961,41 @@ impl std::fmt::Debug for BitmapRawData<'_> {
     }
 }
 
+/// A scoped mutable view over a bitmap's pixel buffer that pays the
+/// copy-on-write (`Rc::make_mut`) cost exactly once, on creation. Created via
+/// [`BitmapRawData::pixels_mut`]; see it for why.
+pub struct PixelsMut<'a> {
+    width: u32,
+    pixels: &'a mut [Color],
+}
+
+impl PixelsMut<'_> {
+    /// Write `color` at `(x, y)`. Panics if out of bounds (callers loop over a
+    /// region already clamped to the bitmap's dimensions).
+    #[inline]
+    pub fn set(&mut self, x: u32, y: u32, color: Color) {
+        self.pixels[(x + y * self.width) as usize] = color;
+    }
+
+    /// Read the pixel at `(x, y)` (for effects that sample the same buffer).
+    #[inline]
+    pub fn get(&self, x: u32, y: u32) -> Color {
+        self.pixels[(x + y * self.width) as usize]
+    }
+
+    /// The half-open horizontal run `[x0, x1)` of row `y` as one mutable slice.
+    ///
+    /// Row-at-a-time access is what lets the compiler auto-vectorize the pure
+    /// per-pixel maps (`copy_channel`, `threshold`, `merge`, …): a branch-free
+    /// loop over a contiguous `&mut [Color]` (optionally zipped with a source
+    /// row) becomes SSE/NEON/simd128 without any target-specific intrinsics.
+    #[inline]
+    pub fn row_range(&mut self, x0: u32, x1: u32, y: u32) -> &mut [Color] {
+        let base = (y * self.width) as usize;
+        &mut self.pixels[base + x0 as usize..base + x1 as usize]
+    }
+}
+
 impl<'gc> BitmapRawData<'gc> {
     pub fn new(width: u32, height: u32, transparency: bool, fill_color: u32) -> Self {
         Self {
@@ -1152,6 +1187,19 @@ impl<'gc> BitmapRawData<'gc> {
 
     pub fn raw_pixels_mut(&mut self) -> &mut Vec<Color> {
         Rc::make_mut(&mut self.pixels)
+    }
+
+    /// A mutable pixel view that pays the copy-on-write (`Rc::make_mut`) cost
+    /// exactly once, on creation. Use this instead of calling
+    /// [`BitmapDataStorage::set_pixel32_raw`] in a per-pixel loop, where the
+    /// per-call `make_mut` (a refcount check every pixel, plus a full-buffer
+    /// clone on the first write when the buffer is shared) is pure overhead.
+    #[inline]
+    pub fn pixels_mut(&mut self) -> PixelsMut<'_> {
+        PixelsMut {
+            width: self.width,
+            pixels: Rc::make_mut(&mut self.pixels).as_mut_slice(),
+        }
     }
 
     pub fn raw_pixels(&self) -> &[Color] {

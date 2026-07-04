@@ -9,6 +9,7 @@ use crate::avm2::globals::slots::{
 use crate::avm2::object::{ClassObject, Object, StageObject, TObject as _};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 use crate::display_object::{MovieClip, SoundTransform, TDisplayObject, TDisplayObjectContainer};
 use swf::{Rectangle, Twips};
 
@@ -103,13 +104,14 @@ pub fn get_graphics<'gc>(
 
     if let Some(dobj) = this.as_display_object() {
         // Lazily initialize the `Graphics` object in a hidden property.
-        let graphics = match this.get_slot(sprite_slots::_GRAPHICS) {
-            Value::Undefined | Value::Null => {
+        let graphics_slot = this.get_slot(sprite_slots::_GRAPHICS);
+        let graphics = match graphics_slot.unpack() {
+            ValueEnum::Undefined | ValueEnum::Null => {
                 let graphics = Value::from(StageObject::graphics(activation, dobj));
                 this.set_slot(sprite_slots::_GRAPHICS, graphics, activation)?;
                 graphics
             }
-            graphics => graphics,
+            _ => graphics_slot,
         };
         return Ok(graphics);
     }

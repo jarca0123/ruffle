@@ -2,7 +2,7 @@ use either::Either;
 use ruffle_render::pixel_bender::{PixelBenderType, PixelBenderTypeOpcode};
 
 use crate::avm2::error::{Error2004Type, make_error_2004};
-use crate::avm2::{Activation, ArrayObject, ArrayStorage, Error, Value};
+use crate::avm2::{Activation, ArrayObject, ArrayStorage, Error, Value, ValueEnum};
 use crate::context::UpdateContext;
 use crate::ecma_conversions::f64_to_wrapping_i32;
 use crate::string::AvmString;
@@ -44,9 +44,9 @@ impl PixelBenderTypeExt for PixelBenderType {
                 .ok_or_else(|| make_error_2004(activation, Error2004Type::ArgumentError))
         }
 
-        let array_storage = match value {
-            Value::Object(o) if let Some(array) = o.as_array_object() => Some(array.storage()),
-            Value::Null => None,
+        let array_storage = match value.unpack() {
+            ValueEnum::Object(o) if let Some(array) = o.as_array_object() => Some(array.storage()),
+            ValueEnum::Null => None,
             _ => unreachable!("value should be an array"),
         };
 

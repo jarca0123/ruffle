@@ -6,15 +6,15 @@ use crate::avm2::globals::slots::flash_events_event_dispatcher as slots;
 use crate::avm2::object::{DispatchObject, Object, TObject as _};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
-use crate::avm2::{Avm2, Error};
+use crate::avm2::{Avm2, Error, ValueEnum};
 
 /// Get an object's dispatch list, lazily initializing it if necessary.
 fn dispatch_list<'gc>(
     activation: &mut Activation<'_, 'gc>,
     this: Object<'gc>,
 ) -> Result<Object<'gc>, Error<'gc>> {
-    match this.get_slot(slots::DISPATCH_LIST) {
-        Value::Object(o) => Ok(o),
+    match this.get_slot(slots::DISPATCH_LIST).unpack() {
+        ValueEnum::Object(o) => Ok(o),
         _ => {
             let dispatch_list = DispatchObject::empty_list(activation);
             this.set_slot(slots::DISPATCH_LIST, dispatch_list.into(), activation)?;

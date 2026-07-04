@@ -8,7 +8,7 @@ use crate::avm2::object::TObject;
 use crate::avm2::property_map::PropertyMap;
 use crate::avm2::qname::QName;
 use crate::avm2::value::Value;
-use crate::avm2::{Multiname, Namespace};
+use crate::avm2::{Multiname, Namespace, ValueEnum};
 use core::fmt;
 use gc_arena::barrier::field;
 use gc_arena::lock::RefLock;
@@ -317,13 +317,13 @@ fn value_has_trait<'gc>(
     value: Value<'gc>,
     multiname: &Multiname<'gc>,
 ) -> bool {
-    let vtable = match value {
-        Value::Bool(_) => classes.boolean.instance_vtable(),
-        Value::Number(_) | Value::Integer(_) => classes.number.instance_vtable(),
-        Value::String(_) => classes.string.instance_vtable(),
-        Value::Object(obj) => obj.vtable(),
+    let vtable = match value.unpack() {
+        ValueEnum::Bool(_) => classes.boolean.instance_vtable(),
+        ValueEnum::Number(_) | ValueEnum::Integer(_) => classes.number.instance_vtable(),
+        ValueEnum::String(_) => classes.string.instance_vtable(),
+        ValueEnum::Object(obj) => obj.vtable(),
 
-        Value::Undefined | Value::Null => {
+        ValueEnum::Undefined | ValueEnum::Null => {
             unreachable!("Should not have Undefined or Null scope")
         }
     };
@@ -337,19 +337,19 @@ fn value_has_own_property<'gc>(
     value: Value<'gc>,
     multiname: &Multiname<'gc>,
 ) -> bool {
-    let vtable = match value {
-        Value::Bool(_) => classes.boolean.instance_vtable(),
-        Value::Number(_) | Value::Integer(_) => classes.number.instance_vtable(),
-        Value::String(_) => classes.string.instance_vtable(),
-        Value::Object(obj) => obj.vtable(),
+    let vtable = match value.unpack() {
+        ValueEnum::Bool(_) => classes.boolean.instance_vtable(),
+        ValueEnum::Number(_) | ValueEnum::Integer(_) => classes.number.instance_vtable(),
+        ValueEnum::String(_) => classes.string.instance_vtable(),
+        ValueEnum::Object(obj) => obj.vtable(),
 
-        Value::Undefined | Value::Null => {
+        ValueEnum::Undefined | ValueEnum::Null => {
             unreachable!("Should not have Undefined or Null scope")
         }
     };
 
-    match value {
-        Value::Object(object) => object.has_own_property(multiname),
+    match value.unpack() {
+        ValueEnum::Object(object) => object.has_own_property(multiname),
         _ => vtable.has_trait(multiname),
     }
 }

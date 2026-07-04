@@ -9,7 +9,7 @@ use crate::avm2::e4x::is_xml_name;
 use crate::avm2::error::make_error_1098;
 use crate::avm2::object::NamespaceObject;
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueEnum};
 
 /// Implements a custom constructor for `Namespace`.
 pub fn namespace_constructor<'gc>(
@@ -23,8 +23,8 @@ pub fn namespace_constructor<'gc>(
         0 => (Some(istr!("")), namespaces.public_all()),
         1 => {
             // These cases only activate with exactly one argument passed
-            match args.get_value(0) {
-                Value::Object(o) if let Some(qname) = o.as_qname_object() => {
+            match args.get_value(0).unpack() {
+                ValueEnum::Object(o) if let Some(qname) = o.as_qname_object() => {
                     let uri = qname.uri(activation.strings());
                     let ns = uri.map_or_else(Namespace::any, |uri| {
                         Namespace::package(uri, api_version, activation.strings())
@@ -35,11 +35,11 @@ pub fn namespace_constructor<'gc>(
                     };
                     (prefix, ns)
                 }
-                Value::Object(o) if let Some(ns) = o.as_namespace_object() => {
+                ValueEnum::Object(o) if let Some(ns) = o.as_namespace_object() => {
                     (ns.prefix(), ns.namespace())
                 }
                 val => {
-                    let name = val.coerce_to_string(activation)?;
+                    let name = Value::from(val).coerce_to_string(activation)?;
                     let ns = Namespace::package(name, api_version, activation.strings());
                     let prefix = name.is_empty().then(|| istr!(""));
                     (prefix, ns)
@@ -60,7 +60,7 @@ pub fn namespace_constructor<'gc>(
             let prefix_str = prefix.coerce_to_string(activation)?;
 
             // The order is important here to match Flash
-            let mut resulting_prefix = if matches!(prefix, Value::Undefined | Value::Null) {
+            let mut resulting_prefix = if matches!(prefix.unpack(), ValueEnum::Undefined | ValueEnum::Null) {
                 None
             } else {
                 Some(prefix_str)

@@ -18,6 +18,7 @@ use crate::avm2::object::{Object, ScriptObject, TObject};
 use crate::avm2::property::Property;
 use crate::avm2::scope::{Scope, ScopeChain};
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 use crate::avm2::vtable::VTable;
 use crate::context::UpdateContext;
 use crate::string::AvmString;
@@ -807,9 +808,9 @@ impl<'gc> TObject<'gc> for ClassObject<'gc> {
 
         //Because `null` is a valid parameter, we have to accept values as
         //parameters instead of objects. We coerce them to objects now.
-        let object_param = match nullable_params[0] {
-            Value::Null => None,
-            v => Some(v),
+        let object_param = match nullable_params[0].unpack() {
+            ValueEnum::Null => None,
+            _ => Some(nullable_params[0]),
         };
         let class_param = match object_param {
             None => None,

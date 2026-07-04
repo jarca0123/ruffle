@@ -23,6 +23,7 @@ use crate::avm2::scope::{Scope, ScopeChain, search_scope_stack};
 use crate::avm2::script::Script;
 use crate::avm2::stack::StackFrame;
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 use crate::avm2::{Avm2, Error};
 use crate::context::UpdateContext;
 use crate::library::MovieLibrary;
@@ -1276,9 +1277,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let name_value = self.stack.peek(0);
         let object_value = self.stack.peek(1);
 
-        if let Value::Object(object) = object_value {
-            match name_value {
-                Value::Integer(_) | Value::Number(_) => {
+        if let ValueEnum::Object(object) = object_value.unpack() {
+            match name_value.unpack() {
+                ValueEnum::Integer(_) | ValueEnum::Number(_) => {
                     if let Some(index) = name_value.try_as_index()
                         && let Some(value) = object.get_index_property(index)
                     {
@@ -1289,7 +1290,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                         return Ok(());
                     }
                 }
-                Value::Object(name_object) => {
+                ValueEnum::Object(name_object) => {
                     if let Some(dictionary) = object.as_dictionary_object() {
                         let _ = self.pop_stack();
                         let _ = self.pop_stack();
@@ -1351,9 +1352,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let name_value = self.stack.peek(1);
         let object_value = self.stack.peek(2);
 
-        if let Value::Object(object) = object_value {
-            match name_value {
-                Value::Integer(_) | Value::Number(_) => {
+        if let ValueEnum::Object(object) = object_value.unpack() {
+            match name_value.unpack() {
+                ValueEnum::Integer(_) | ValueEnum::Number(_) => {
                     if let Some(index) = name_value.try_as_index()
                         && let Some(result) = object.set_index_property(self, index, value)
                     {
@@ -1364,7 +1365,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                         return result;
                     }
                 }
-                Value::Object(name_object) => {
+                ValueEnum::Object(name_object) => {
                     if let Some(dictionary) = object.as_dictionary_object() {
                         let _ = self.pop_stack();
                         let _ = self.pop_stack();
@@ -1519,8 +1520,8 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let value = self.pop_stack().null_check(self, None)?;
         let name_value = self.pop_stack();
 
-        let has_prop = match value {
-            Value::Object(obj) => {
+        let has_prop = match value.unpack() {
+            ValueEnum::Object(obj) => {
                 if let Some(dictionary) = obj.as_dictionary_object()
                     && let Some(name_object) = name_value.as_object()
                 {
@@ -1864,9 +1865,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let class_class = self.avm2().class_defs().class;
         let base_class = base_value.coerce_to_type(self, class_class)?;
 
-        let base_class = match base_class {
-            Value::Object(o) if let Some(class_obj) = o.as_class_object() => Some(class_obj),
-            Value::Null => None,
+        let base_class = match base_class.unpack() {
+            ValueEnum::Object(o) if let Some(class_obj) = o.as_class_object() => Some(class_obj),
+            ValueEnum::Null => None,
             _ => unreachable!("Coercion to Class must return Class or null"),
         };
 
@@ -1953,8 +1954,8 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     fn op_coerce_o(&mut self) -> Result<(), Error<'gc>> {
         let value = self.pop_stack();
 
-        let coerced = match value {
-            Value::Undefined | Value::Null => Value::Null,
+        let coerced = match value.unpack() {
+            ValueEnum::Undefined | ValueEnum::Null => Value::Null,
             _ => value,
         };
 
@@ -1966,9 +1967,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     fn op_coerce_s(&mut self) -> Result<(), Error<'gc>> {
         let value = self.pop_stack();
 
-        let coerced = match value {
-            Value::Undefined | Value::Null => Value::Null,
-            Value::String(_) => value,
+        let coerced = match value.unpack() {
+            ValueEnum::Undefined | ValueEnum::Null => Value::Null,
+            ValueEnum::String(_) => value,
             _ => value.coerce_to_string(self)?.into(),
         };
 
@@ -2029,26 +2030,26 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let value2 = self.pop_stack();
         let value1 = self.pop_stack();
 
-        let sum_value = match (value1, value2) {
-            (Value::Integer(n1), Value::Integer(n2)) => {
+        let sum_value = match (value1.unpack(), value2.unpack()) {
+            (ValueEnum::Integer(n1), ValueEnum::Integer(n2)) => {
                 if let Some(res) = n1.checked_add(n2) {
                     res.into()
                 } else {
                     ((n1 as i64 + n2 as i64) as f64).into()
                 }
             }
-            (Value::Number(n1), Value::Number(n2)) => (n1 + n2).into(),
-            (Value::String(s), value2) => Value::String(AvmString::concat(
+            (ValueEnum::Number(n1), ValueEnum::Number(n2)) => (n1 + n2).into(),
+            (ValueEnum::String(s), _) => Value::String(AvmString::concat(
                 self.gc(),
                 s,
                 value2.coerce_to_string(self)?,
             )),
-            (value1, Value::String(s)) => Value::String(AvmString::concat(
+            (_, ValueEnum::String(s)) => Value::String(AvmString::concat(
                 self.gc(),
                 value1.coerce_to_string(self)?,
                 s,
             )),
-            (Value::Object(value1), Value::Object(value2))
+            (ValueEnum::Object(value1), ValueEnum::Object(value2))
                 if (value1.as_xml_list_object().is_some() || value1.as_xml_object().is_some())
                     && (value2.as_xml_list_object().is_some()
                         || value2.as_xml_object().is_some()) =>
@@ -2059,23 +2060,23 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                 list.append(value2.into(), self.gc());
                 list.into()
             }
-            (value1, value2) => {
+            _ => {
                 let prim_value1 = value1.coerce_to_primitive(None, self)?;
                 let prim_value2 = value2.coerce_to_primitive(None, self)?;
 
-                match (prim_value1, prim_value2) {
-                    (Value::String(s), value2) => Value::String(AvmString::concat(
+                match (prim_value1.unpack(), prim_value2.unpack()) {
+                    (ValueEnum::String(s), _) => Value::String(AvmString::concat(
                         self.gc(),
                         s,
-                        value2.coerce_to_string(self)?,
+                        prim_value2.coerce_to_string(self)?,
                     )),
-                    (value1, Value::String(s)) => Value::String(AvmString::concat(
+                    (_, ValueEnum::String(s)) => Value::String(AvmString::concat(
                         self.gc(),
-                        value1.coerce_to_string(self)?,
+                        prim_value1.coerce_to_string(self)?,
                         s,
                     )),
-                    (value1, value2) => Value::Number(
-                        value1.coerce_to_number(self)? + value2.coerce_to_number(self)?,
+                    _ => Value::Number(
+                        prim_value1.coerce_to_number(self)? + prim_value2.coerce_to_number(self)?,
                     ),
                 }
             }
@@ -2090,9 +2091,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let value2 = self.pop_stack();
         let value1 = self.pop_stack();
 
-        let sum_value = match (value1, value2) {
-            (Value::Integer(n1), Value::Integer(n2)) => n1.wrapping_add(n2),
-            (value1, value2) => {
+        let sum_value = match (value1.unpack(), value2.unpack()) {
+            (ValueEnum::Integer(n1), ValueEnum::Integer(n2)) => n1.wrapping_add(n2),
+            _ => {
                 let value1 = value1.coerce_to_i32(self)?;
                 let value2 = value2.coerce_to_i32(self)?;
 
@@ -2239,7 +2240,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         // to help int-indexing.
         // Once we get a generic implicit double->int conversion,
         // we can reevaluate whether this path is needed.
-        if let (Value::Integer(n1), Value::Integer(n2)) = (value1, value2)
+        if let (ValueEnum::Integer(n1), ValueEnum::Integer(n2)) = (value1.unpack(), value2.unpack())
             && let Some(result) = n1.checked_mul(n2)
         {
             self.push_stack(result);
@@ -2290,15 +2291,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let value2 = self.pop_stack();
         let value1 = self.pop_stack();
 
-        let sub_value: Value<'gc> = match (value1, value2) {
-            (Value::Integer(n1), Value::Integer(n2)) => {
+        let sub_value: Value<'gc> = match (value1.unpack(), value2.unpack()) {
+            (ValueEnum::Integer(n1), ValueEnum::Integer(n2)) => {
                 if let Some(res) = n1.checked_sub(n2) {
                     res.into()
                 } else {
                     ((n1 as i64 - n2 as i64) as f64).into()
                 }
             }
-            (Value::Number(n1), Value::Number(n2)) => (n1 - n2).into(),
+            (ValueEnum::Number(n1), ValueEnum::Number(n2)) => (n1 - n2).into(),
             _ => {
                 let value2 = value2.coerce_to_number(self)?;
                 let value1 = value1.coerce_to_number(self)?;
@@ -2315,9 +2316,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let value2 = self.pop_stack();
         let value1 = self.pop_stack();
 
-        let sum_value = match (value1, value2) {
-            (Value::Integer(n1), Value::Integer(n2)) => n1.wrapping_sub(n2),
-            (value1, value2) => {
+        let sum_value = match (value1.unpack(), value2.unpack()) {
+            (ValueEnum::Integer(n1), ValueEnum::Integer(n2)) => n1.wrapping_sub(n2),
+            _ => {
                 let value1 = value1.coerce_to_i32(self)?;
                 let value2 = value2.coerce_to_i32(self)?;
 
@@ -2436,9 +2437,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             return Ok(());
         }
 
-        let object = match value {
-            Value::Undefined | Value::Null => None,
-            Value::Object(obj) => Some(obj),
+        let object = match value.unpack() {
+            ValueEnum::Undefined | ValueEnum::Null => None,
+            ValueEnum::Object(obj) => Some(obj),
             _ => value.proto(self),
         };
 
@@ -2471,16 +2472,16 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let mut result_value = object_reg;
         let mut object = None;
 
-        match object_reg {
-            Value::Undefined | Value::Null => {
+        match object_reg.unpack() {
+            ValueEnum::Undefined | ValueEnum::Null => {
                 cur_index = 0;
             }
-            Value::Object(obj) => {
+            ValueEnum::Object(obj) => {
                 object = obj.proto();
                 cur_index = obj.get_next_enumerant(cur_index, self)?;
             }
-            value => {
-                let proto = value.proto(self);
+            _ => {
+                let proto = object_reg.proto(self);
                 if let Some(proto) = proto {
                     object = proto.proto();
                     cur_index = proto.get_next_enumerant(cur_index, self)?;
@@ -2516,9 +2517,10 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             return Ok(());
         }
 
-        let object = match value.null_check(self, None)? {
-            Value::Object(obj) => obj,
-            value => value
+        let value = value.null_check(self, None)?;
+        let object = match value.unpack() {
+            ValueEnum::Object(obj) => obj,
+            _ => value
                 .proto(self)
                 .expect("Primitives always have a prototype"),
         };
@@ -2539,9 +2541,10 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             return Ok(());
         }
 
-        let object = match value.null_check(self, None)? {
-            Value::Object(obj) => obj,
-            value => value
+        let value = value.null_check(self, None)?;
+        let object = match value.unpack() {
+            ValueEnum::Object(obj) => obj,
+            _ => value
                 .proto(self)
                 .expect("Primitives always have a prototype"),
         };
@@ -2592,7 +2595,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     fn op_as_type_late(&mut self) -> Result<(), Error<'gc>> {
         let class = self.pop_stack();
 
-        if matches!(class, Value::Undefined) {
+        if matches!(class.unpack(), ValueEnum::Undefined) {
             return Err(make_null_or_undefined_error(self, class, None));
         }
 
@@ -2627,10 +2630,10 @@ impl<'a, 'gc> Activation<'a, 'gc> {
 
         let value = self.pop_stack();
 
-        match value {
-            Value::Undefined => return Err(make_null_or_undefined_error(self, value, None)),
-            Value::Null => self.push_stack(false),
-            value => {
+        match value.unpack() {
+            ValueEnum::Undefined => return Err(make_null_or_undefined_error(self, value, None)),
+            ValueEnum::Null => self.push_stack(false),
+            _ => {
                 let is_instance_of = value.is_instance_of(self, type_object);
 
                 self.push_stack(is_instance_of);
@@ -2643,12 +2646,12 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     fn op_type_of(&mut self) -> Result<(), Error<'gc>> {
         let value = self.pop_stack();
 
-        let type_name = match value {
-            Value::Undefined => istr!(self, "undefined"),
-            Value::Null => istr!(self, "object"),
-            Value::Bool(_) => istr!(self, "boolean"),
-            Value::Number(_) | Value::Integer(_) => istr!(self, "number"),
-            Value::Object(o) => {
+        let type_name = match value.unpack() {
+            ValueEnum::Undefined => istr!(self, "undefined"),
+            ValueEnum::Null => istr!(self, "object"),
+            ValueEnum::Bool(_) => istr!(self, "boolean"),
+            ValueEnum::Number(_) | ValueEnum::Integer(_) => istr!(self, "number"),
+            ValueEnum::Object(o) => {
                 let classes = self.avm2().class_defs();
 
                 if o.as_function_object().is_some() {
@@ -2669,7 +2672,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
                     istr!(self, "object")
                 }
             }
-            Value::String(_) => istr!(self, "string"),
+            ValueEnum::String(_) => istr!(self, "string"),
         };
 
         self.push_stack(Value::String(type_name));
@@ -2705,11 +2708,12 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     /// Implements `Op::EscXElem`
     fn op_esc_elem(&mut self) -> Result<(), Error<'gc>> {
         // We explicitly call toXMLString on Xml/XmlListObject since the toString of these objects have special handling for simple content, which is not used here.
-        let r = match self.pop_stack() {
-            Value::Object(o) if let Some(x) = o.as_xml_object() => x.as_xml_string(self),
-            Value::Object(o) if let Some(x) = o.as_xml_list_object() => x.as_xml_string(self),
+        let value = self.pop_stack();
+        let r = match value.unpack() {
+            ValueEnum::Object(o) if let Some(x) = o.as_xml_object() => x.as_xml_string(self),
+            ValueEnum::Object(o) if let Some(x) = o.as_xml_list_object() => x.as_xml_string(self),
             // contrary to the avmplus documentation, this escapes the value on the top of the stack using EscapeElementValue from ECMA-357 *NOT* EscapeAttributeValue.
-            x => AvmString::new(self.gc(), escape_element_value(x.coerce_to_string(self)?)),
+            _ => AvmString::new(self.gc(), escape_element_value(value.coerce_to_string(self)?)),
         };
 
         self.push_stack(r);

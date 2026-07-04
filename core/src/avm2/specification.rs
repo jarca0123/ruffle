@@ -3,7 +3,7 @@ use crate::avm2::function::BoundMethod;
 use crate::avm2::method::{Method, ParamConfig};
 use crate::avm2::object::TObject as _;
 use crate::avm2::traits::{Trait, TraitKind};
-use crate::avm2::{Activation, Avm2, ClassObject, QName, Value};
+use crate::avm2::{Activation, Avm2, ClassObject, QName, Value, ValueEnum};
 use crate::context::UpdateContext;
 use crate::string::AvmString;
 use crate::stub::Stub;
@@ -47,14 +47,14 @@ fn escape_string(string: AvmString) -> String {
 }
 
 fn format_value(value: &Value) -> Option<String> {
-    match value.normalize() {
-        Value::Undefined => None,
-        Value::Null => Some("null".to_string()),
-        Value::Bool(value) => Some(value.to_string()),
-        Value::Number(value) => Some(value.to_string()),
-        Value::Integer(value) => Some(value.to_string()),
-        Value::String(value) => Some(escape_string(value)),
-        Value::Object(_) => None,
+    match value.normalize().unpack() {
+        ValueEnum::Undefined => None,
+        ValueEnum::Null => Some("null".to_string()),
+        ValueEnum::Bool(value) => Some(value.to_string()),
+        ValueEnum::Number(value) => Some(value.to_string()),
+        ValueEnum::Integer(value) => Some(value.to_string()),
+        ValueEnum::String(value) => Some(escape_string(value)),
+        ValueEnum::Object(_) => None,
     }
 }
 
@@ -116,12 +116,12 @@ struct VariableInfo {
 impl VariableInfo {
     pub fn from_value<'gc>(value: Value<'gc>, activation: &mut Activation<'_, 'gc>) -> Self {
         Self {
-            type_info: match value.normalize() {
-                Value::Bool(_) => Some("Boolean".to_string()),
-                Value::Number(_) => Some("Number".to_string()),
-                Value::Integer(_) => Some("int".to_string()),
-                Value::String(_) => Some("String".to_string()),
-                Value::Object(_) => Some("Object".to_string()),
+            type_info: match value.normalize().unpack() {
+                ValueEnum::Bool(_) => Some("Boolean".to_string()),
+                ValueEnum::Number(_) => Some("Number".to_string()),
+                ValueEnum::Integer(_) => Some("int".to_string()),
+                ValueEnum::String(_) => Some("String".to_string()),
+                ValueEnum::Object(_) => Some("Object".to_string()),
                 _ => Some("*".to_string()),
             },
             value: value

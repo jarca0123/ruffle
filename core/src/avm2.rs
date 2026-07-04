@@ -99,6 +99,7 @@ pub use crate::avm2::object::{
 };
 pub use crate::avm2::qname::QName;
 pub use crate::avm2::value::Value;
+pub use crate::avm2::value::ValueEnum;
 
 use self::api_version::ApiVersion;
 use self::object::WeakObject;

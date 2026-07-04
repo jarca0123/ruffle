@@ -18,6 +18,7 @@ pub use crate::avm2::object::bitmap_data_allocator;
 use crate::avm2::object::{BitmapDataObject, ByteArrayObject, Object, TObject, VectorObject};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 use crate::avm2::vector::VectorStorage;
 use crate::avm2_stub_method;
 use crate::bitmap::bitmap_data::{BitmapData, ChannelOptions, ThresholdOperation};
@@ -797,7 +798,7 @@ pub fn hit_test<'gc>(
         .rectangle
         .inner_class_definition();
 
-    let Value::Object(compare_object) = compare_object else {
+    let ValueEnum::Object(compare_object) = compare_object.unpack() else {
         // This is the error message Flash Player produces. Even though it's misleading.
         return Err(make_error_2005(activation, 0, "BitmapData"));
     };
@@ -1318,7 +1319,8 @@ pub fn perlin_noise<'gc>(
             .map(|i| {
                 if let Some(offsets) = offsets
                     && let Some(offsets) = offsets.as_array_storage()
-                    && let Some(Value::Object(point)) = offsets.get(i)
+                    && let Some(point) = offsets.get(i)
+                    && let ValueEnum::Object(point) = point.unpack()
                     && point.is_of_type(point_class)
                 {
                     let x = point

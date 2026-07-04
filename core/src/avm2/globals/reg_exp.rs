@@ -8,7 +8,7 @@ use crate::avm2::error::make_error_1100;
 use crate::avm2::object::{ArrayObject, TObject as _};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::regexp::RegExpFlags;
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueEnum};
 use crate::string::AvmString;
 
 pub use crate::avm2::object::reg_exp_allocator;
@@ -22,10 +22,10 @@ pub fn init<'gc>(
     let this = this.as_object().unwrap();
 
     if let Some(mut regexp) = this.as_regexp_mut(activation.gc()) {
-        let source = match args.get_value(0) {
-            Value::Undefined => istr!(""),
-            Value::Object(o) if let Some(re) = o.as_regexp_object() => {
-                if !matches!(args.get_value(1), Value::Undefined) {
+        let source = match args.get_value(0).unpack() {
+            ValueEnum::Undefined => istr!(""),
+            ValueEnum::Object(o) if let Some(re) = o.as_regexp_object() => {
+                if !matches!(args.get_value(1).unpack(), ValueEnum::Undefined) {
                     return Err(make_error_1100(activation));
                 }
 
@@ -35,14 +35,14 @@ pub fn init<'gc>(
 
                 return Ok(Value::Undefined);
             }
-            arg => arg.coerce_to_string(activation)?,
+            arg => Value::from(arg).coerce_to_string(activation)?,
         };
 
         regexp.set_source(source);
 
-        let flag_chars = match args.get_value(1) {
-            Value::Undefined => istr!(""),
-            arg => arg.coerce_to_string(activation)?,
+        let flag_chars = match args.get_value(1).unpack() {
+            ValueEnum::Undefined => istr!(""),
+            arg => Value::from(arg).coerce_to_string(activation)?,
         };
 
         let mut flags = RegExpFlags::empty();

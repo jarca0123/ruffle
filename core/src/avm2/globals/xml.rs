@@ -9,7 +9,7 @@ use crate::avm2::object::{
     E4XOrXml, NotificationCommand, QNameObject, TObject, XmlListObject, XmlObject,
 };
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::{Activation, ArrayObject, ArrayStorage, Error, Multiname, Value};
+use crate::avm2::{Activation, ArrayObject, ArrayStorage, Error, Multiname, Value, ValueEnum};
 use crate::avm2_stub_method;
 use crate::string::AvmString;
 
@@ -243,16 +243,17 @@ pub fn set_name<'gc>(
         return Ok(Value::Undefined);
     }
 
-    let name = match args.get_value(0) {
+    let name_arg = args.get_value(0);
+    let name = match name_arg.unpack() {
         // 2. If (Type(name) is Object) and (name.[[Class]] == "QName") and (name.uri == null)
-        Value::Object(o)
+        ValueEnum::Object(o)
             if let Some(qname) = o.as_qname_object()
                 && qname.is_any_namespace() =>
         {
             // a. Let name = name.localName
             qname.local_name(activation.strings()).into()
         }
-        value => value,
+        _ => name_arg,
     };
 
     // 3. Let n be a new QName created if by calling the constructor new QName(name)
@@ -1125,7 +1126,7 @@ pub fn insert_child_after<'gc>(
             return Ok(xml.into());
         }
     // 2. If (child1 == null)
-    } else if matches!(child1, Value::Null) {
+    } else if matches!(child1.unpack(), ValueEnum::Null) {
         // 2.a. Call the [[Insert]] method of x with arguments "0" and child2
         xml.node().insert(0, child2, activation)?;
         // 2.b. Return x
@@ -1183,7 +1184,7 @@ pub fn insert_child_before<'gc>(
             return Ok(xml.into());
         }
     // 2. If (child1 == null)
-    } else if matches!(child1, Value::Null) {
+    } else if matches!(child1.unpack(), ValueEnum::Null) {
         let length = if let E4XNodeKind::Element { children, .. } = &*xml.node().kind() {
             children.len()
         } else {

@@ -6,7 +6,7 @@ use crate::avm2::activation::Activation;
 use crate::avm2::api_version::ApiVersion;
 use crate::avm2::object::QNameObject;
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueEnum};
 use crate::avm2::{Error, Multiname, Namespace};
 
 pub fn call_handler<'gc>(
@@ -43,31 +43,31 @@ pub fn q_name_constructor<'gc>(
         // Parse the namespace
         let api_version = activation.avm2().root_api_version;
 
-        let namespace = match ns_arg {
-            Value::Object(o) if let Some(ns) = o.as_namespace_object() => Some(ns.namespace()),
-            Value::Object(o) if let Some(qname) = o.as_qname_object() => qname
+        let namespace = match ns_arg.unpack() {
+            ValueEnum::Object(o) if let Some(ns) = o.as_namespace_object() => Some(ns.namespace()),
+            ValueEnum::Object(o) if let Some(qname) = o.as_qname_object() => qname
                 .uri(activation.strings())
                 .map(|uri| Namespace::package(uri, ApiVersion::AllVersions, activation.strings())),
-            Value::Null => None,
-            Value::Undefined => Some(Namespace::package(
+            ValueEnum::Null => None,
+            ValueEnum::Undefined => Some(Namespace::package(
                 istr!(""),
                 api_version,
                 activation.strings(),
             )),
             v => Some(Namespace::package(
-                v.coerce_to_string(activation)?,
+                Value::from(v).coerce_to_string(activation)?,
                 api_version,
                 activation.strings(),
             )),
         };
 
         // Parse the local name
-        let local_name = match local_arg {
-            Value::Object(o) if let Some(qname) = o.as_qname_object() => {
+        let local_name = match local_arg.unpack() {
+            ValueEnum::Object(o) if let Some(qname) = o.as_qname_object() => {
                 qname.local_name(activation.strings())
             }
-            Value::Undefined => istr!(""),
-            other => other.coerce_to_string(activation)?,
+            ValueEnum::Undefined => istr!(""),
+            other => Value::from(other).coerce_to_string(activation)?,
         };
 
         (namespace, Some(local_name))

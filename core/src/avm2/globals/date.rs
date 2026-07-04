@@ -4,7 +4,7 @@ use crate::avm2::Error;
 use crate::avm2::activation::Activation;
 use crate::avm2::object::DateObject;
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::value::Value;
+use crate::avm2::value::{Value, ValueEnum};
 use crate::locale::{get_current_date_time, get_timezone};
 use crate::string::{AvmString, WStr, utils as string_utils};
 use chrono::{DateTime, Datelike, Duration, FixedOffset, LocalResult, TimeZone, Timelike, Utc};
@@ -242,8 +242,8 @@ pub fn init<'gc>(
                 .map_year(|year| if year < 100.0 { year + 1900.0 } else { year })
                 .apply(this);
         } else {
-            let timestamp = if let Value::String(date_str) = timestamp {
-                parse_full_date(activation, *date_str).unwrap_or(f64::NAN)
+            let timestamp = if let ValueEnum::String(date_str) = timestamp.unpack() {
+                parse_full_date(activation, date_str).unwrap_or(f64::NAN)
             } else {
                 timestamp.coerce_to_number(activation)?
             };

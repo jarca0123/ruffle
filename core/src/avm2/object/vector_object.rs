@@ -7,6 +7,7 @@ use crate::avm2::object::kind;
 use crate::avm2::object::script_object::ScriptObjectData;
 use crate::avm2::object::{ClassObject, Object, TObject};
 use crate::avm2::value::Value;
+use crate::avm2::value::ValueEnum;
 use crate::avm2::vector::VectorStorage;
 use crate::string::WStr;
 use core::fmt;
@@ -148,10 +149,10 @@ impl<'gc> VectorObject<'gc> {
         let mc = activation.gc();
 
         let type_of = self.0.vector.borrow().value_type_for_coercion(activation);
-        let value = match value.coerce_to_type(activation, type_of)? {
-            Value::Undefined => self.0.vector.borrow().default(),
-            Value::Null => self.0.vector.borrow().default(),
-            v => v,
+        let value = match value.coerce_to_type(activation, type_of)?.unpack() {
+            ValueEnum::Undefined => self.0.vector.borrow().default(),
+            ValueEnum::Null => self.0.vector.borrow().default(),
+            v => v.into(),
         };
 
         unlock!(Gc::write(mc, self.0), VectorObjectData, vector)

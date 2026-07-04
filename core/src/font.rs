@@ -256,6 +256,17 @@ pub struct FontFace {
     face: ttf_parser::Face<'static>,
 
     glyphs: Vec<OnceCell<Option<Glyph>>>,
+
+    /// Memoizes the cmap `char -> glyph id` lookup. Without it, `Face::glyph_index`
+    /// (a cmap subtable search) re-runs on every glyph draw and kerning query;
+    /// profiling a text-heavy SWF showed that at ~2.5% of total runtime.
+    glyph_index_cache: RefCell<fnv::FnvHashMap<char, Option<u16>>>,
+
+    /// Memoizes `(left, right) char pair -> horizontal kerning`. The uncached
+    /// path resolves two glyph ids and iterates the kern subtables per pair,
+    /// every layout.
+    kerning_cache: RefCell<fnv::FnvHashMap<(char, char), Twips>>,
+
     #[expect(dead_code, reason = "kept for parity/debugging; face is pre-parsed")]
     font_index: u32,
 
@@ -302,6 +313,8 @@ impl FontFace {
             face,
             font_index,
             glyphs,
+            glyph_index_cache: RefCell::new(fnv::FnvHashMap::default()),
+            kerning_cache: RefCell::new(fnv::FnvHashMap::default()),
             ascender,
             descender,
             leading,
@@ -310,9 +323,22 @@ impl FontFace {
         })
     }
 
+    /// `char -> glyph id`, memoized (the raw `Face::glyph_index` cmap search is
+    /// otherwise re-run on every glyph draw and kerning query).
+    fn glyph_index(&self, character: char) -> Option<ttf_parser::GlyphId> {
+        if let Some(&cached) = self.glyph_index_cache.borrow().get(&character) {
+            return cached.map(ttf_parser::GlyphId);
+        }
+        let id = self.face.glyph_index(character);
+        self.glyph_index_cache
+            .borrow_mut()
+            .insert(character, id.map(|g| g.0));
+        id
+    }
+
     pub fn get_glyph(&self, character: char) -> Option<&Glyph> {
         let face = &self.face;
-        if let Some(glyph_id) = face.glyph_index(character) {
+        if let Some(glyph_id) = self.glyph_index(character) {
             return self.glyphs[glyph_id.0 as usize]
                 .get_or_init(|| {
                     let mut drawing = Drawing::new();
@@ -354,11 +380,20 @@ impl FontFace {
     }
 
     pub fn get_kerning_offset(&self, left: char, right: char) -> Twips {
+        if let Some(&cached) = self.kerning_cache.borrow().get(&(left, right)) {
+            return cached;
+        }
+        let offset = self.compute_kerning_offset(left, right);
+        self.kerning_cache.borrow_mut().insert((left, right), offset);
+        offset
+    }
+
+    fn compute_kerning_offset(&self, left: char, right: char) -> Twips {
         let face = &self.face;
 
         if let Some(kern) = face.tables().kern
             && let (Some(left_glyph), Some(right_glyph)) =
-                (face.glyph_index(left), face.glyph_index(right))
+                (self.glyph_index(left), self.glyph_index(right))
         {
             for subtable in kern.subtables {
                 if subtable.horizontal

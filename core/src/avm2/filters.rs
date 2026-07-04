@@ -12,7 +12,7 @@ use crate::avm2::globals::slots::flash_filters_gradient_glow_filter as gradient_
 use crate::avm2::globals::slots::flash_filters_shader_filter as shader_filter_slots;
 use crate::avm2::globals::slots::flash_geom_point as point_slots;
 use crate::avm2::object::{ArrayObject, ClassObject, Object, TObject as _};
-use crate::avm2::{Activation, Error, Value};
+use crate::avm2::{Activation, Error, Value, ValueEnum};
 
 use gc_arena::{Collect, DynamicRoot, Gc, Rootable};
 use ruffle_macros::istr;
@@ -462,7 +462,9 @@ fn avm2_to_displacement_map_filter<'gc>(
         .get_slot(displacement_map_filter_slots::COMPONENT_Y)
         .coerce_to_u32(activation)?;
     let map_point =
-        if let Value::Object(point) = object.get_slot(displacement_map_filter_slots::MAP_POINT) {
+        if let ValueEnum::Object(point) =
+            object.get_slot(displacement_map_filter_slots::MAP_POINT).unpack()
+        {
             (
                 point.get_slot(point_slots::X).coerce_to_i32(activation)?,
                 point.get_slot(point_slots::Y).coerce_to_i32(activation)?,
@@ -470,7 +472,9 @@ fn avm2_to_displacement_map_filter<'gc>(
         } else {
             (0, 0)
         };
-    let mode = if let Value::String(mode) = object.get_slot(displacement_map_filter_slots::MODE) {
+    let mode = if let ValueEnum::String(mode) =
+        object.get_slot(displacement_map_filter_slots::MODE).unpack()
+    {
         if &mode == b"clamp" {
             DisplacementMapFilterMode::Clamp
         } else if &mode == b"ignore" {
@@ -492,7 +496,9 @@ fn avm2_to_displacement_map_filter<'gc>(
         .get_slot(displacement_map_filter_slots::SCALE_Y)
         .coerce_to_number(activation)?;
     let map_bitmap =
-        if let Value::Object(bitmap) = object.get_slot(displacement_map_filter_slots::MAP_BITMAP) {
+        if let ValueEnum::Object(bitmap) =
+            object.get_slot(displacement_map_filter_slots::MAP_BITMAP).unpack()
+        {
             Some(
                 bitmap
                     .as_bitmap_data()

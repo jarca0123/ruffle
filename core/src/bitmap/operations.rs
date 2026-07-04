@@ -4,7 +4,7 @@ use crate::avm2::vector::VectorStorage;
 use crate::avm2::{Activation, Error, Value as Avm2Value};
 use crate::bitmap::bitmap_data::{
     BitmapData, BitmapDataDrawError, BitmapRawData, ChannelOptions, Color, IBitmapDrawable,
-    LehmerRng, ThresholdOperation,
+    LehmerRng, PixelsMut, ThresholdOperation,
 };
 use crate::bitmap::turbulence::Turbulence;
 use crate::context::{RenderContext, UpdateContext};
@@ -17,7 +17,7 @@ use ruffle_render::filters::Filter;
 use ruffle_render::matrix::Matrix;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::transform::Transform;
-use std::cell::{Ref, RefMut};
+use std::cell::Ref;
 use swf::{BlendMode, ColorTransform, Fixed8, Rectangle, Twips};
 
 /// AVM1 and AVM2 have a shared set of operations they can perform on BitmapDatas.
@@ -204,8 +204,10 @@ pub fn noise<'gc>(
 
     let mut rng = LehmerRng::with_seed(true_seed);
 
-    for y in 0..write.height() {
-        for x in 0..write.width() {
+    let (bmp_w, bmp_h) = (write.width(), write.height());
+    let mut px = write.pixels_mut();
+    for y in 0..bmp_h {
+        for x in 0..bmp_w {
             let pixel_color = if gray_scale {
                 let gray = rng.random_range(low..high);
                 let alpha = if transparency && channel_options.contains(ChannelOptions::ALPHA) {
@@ -243,9 +245,10 @@ pub fn noise<'gc>(
                 Color::rgba(r, g, b, a)
             };
 
-            write.set_pixel32_raw(x, y, pixel_color.to_premultiplied_alpha(transparency));
+            px.set(x, y, pixel_color.to_premultiplied_alpha(transparency));
         }
     }
+    drop(px);
     let region = PixelRegion::for_whole_size(write.width(), write.height());
     write.set_cpu_dirty(mc, region)
 }
@@ -273,8 +276,11 @@ pub fn perlin_noise<'gc>(
         if base.1 == 0.0 { 0.0 } else { 1.0 / base.1 },
     );
 
-    for y in 0..write.height() {
-        for x in 0..write.width() {
+    let (bmp_w, bmp_h) = (write.width(), write.height());
+    let transparency = write.transparency();
+    let mut px_view = write.pixels_mut();
+    for y in 0..bmp_h {
+        for x in 0..bmp_w {
             let px = x as f64;
             let py = y as f64;
 
@@ -290,7 +296,7 @@ pub fn perlin_noise<'gc>(
                     fractal_noise,
                     stitch,
                     (0.0, 0.0),
-                    (write.width() as f64, write.height() as f64),
+                    (bmp_w as f64, bmp_h as f64),
                     &offsets,
                 );
 
@@ -306,7 +312,7 @@ pub fn perlin_noise<'gc>(
                         fractal_noise,
                         stitch,
                         (0.0, 0.0),
-                        (write.width() as f64, write.height() as f64),
+                        (bmp_w as f64, bmp_h as f64),
                         &offsets,
                     )
                 } else {
@@ -335,7 +341,7 @@ pub fn perlin_noise<'gc>(
                             fractal_noise,
                             stitch,
                             (0.0, 0.0),
-                            (write.width() as f64, write.height() as f64),
+                            (bmp_w as f64, bmp_h as f64),
                             &offsets,
                         );
                         channel += 1;
@@ -356,13 +362,14 @@ pub fn perlin_noise<'gc>(
                 }) as u8;
             }
 
-            if !write.transparency() {
+            if !transparency {
                 color[3] = 255;
             }
 
-            write.set_pixel32_raw(x, y, Color::rgba(color[0], color[1], color[2], color[3]));
+            px_view.set(x, y, Color::rgba(color[0], color[1], color[2], color[3]));
         }
     }
+    drop(px_view);
     let region = PixelRegion::for_whole_size(write.width(), write.height());
     write.set_cpu_dirty(mc, region)
 }
@@ -417,6 +424,7 @@ pub fn copy_channel<'gc>(
     let target = target.sync(renderer);
     let mut write = target.borrow_mut(mc);
 
+    let mut px = write.pixels_mut();
     for y in 0..dest_region.height().min(source_region.height()) {
         for x in 0..dest_region.width().min(source_region.width()) {
             let dst_x = dest_region.x_min + x;
@@ -424,8 +432,8 @@ pub fn copy_channel<'gc>(
             let src_x = source_region.x_min + x;
             let src_y = source_region.y_min + y;
 
-            let original_color: u32 = write
-                .get_pixel32_raw(dst_x, dst_y)
+            let original_color: u32 = px
+                .get(dst_x, dst_y)
                 .to_un_multiplied_alpha()
                 .into();
 
@@ -435,8 +443,8 @@ pub fn copy_channel<'gc>(
                     .to_un_multiplied_alpha()
                     .into()
             } else {
-                write
-                    .get_pixel32_raw(src_x, src_y)
+                px
+                    .get(src_x, src_y)
                     .to_un_multiplied_alpha()
                     .into()
             };
@@ -459,13 +467,14 @@ pub fn copy_channel<'gc>(
                 _ => original_color,
             };
 
-            write.set_pixel32_raw(
+            px.set(
                 dst_x,
                 dst_y,
                 Color::from(result_color).to_premultiplied_alpha(transparency),
             );
         }
     }
+    drop(px);
 
     write.set_cpu_dirty(mc, dest_region);
 }
@@ -627,6 +636,7 @@ pub fn threshold<'gc>(
     let mut write = target.borrow_mut(mc);
 
     // Check each pixel
+    let mut px = write.pixels_mut();
     for y in 0..dest_region.height() {
         for x in 0..dest_region.width() {
             let dest_x = dest_region.x_min + x;
@@ -638,14 +648,14 @@ pub fn threshold<'gc>(
             let source_color = if let Some(source) = &source {
                 source.get_pixel32_raw(src_x, src_y)
             } else {
-                write.get_pixel32_raw(src_x, src_y)
+                px.get(src_x, src_y)
             };
 
             // If the test, as defined by the operation pass then set to input colour
             if operation.matches(u32::from(source_color) & mask, masked_threshold) {
                 modified_count += 1;
                 // [NA] Spot the bug? We don't set the alpha to 0xFF for opaque BMDs. Yay flash.
-                write.set_pixel32_raw(
+                px.set(
                     dest_x,
                     dest_y,
                     Color::from(colour).to_premultiplied_alpha(true),
@@ -654,7 +664,7 @@ pub fn threshold<'gc>(
                 // If the test fails, but copy_source is true then take the colour from the source
                 if copy_source {
                     // [NA] Spot the bug? We don't set the alpha to 0xFF for opaque BMDs. Yay flash.
-                    write.set_pixel32_raw(dest_x, dest_y, source_color);
+                    px.set(dest_x, dest_y, source_color);
                 }
             }
             if let Some(dirty_area) = &mut dirty_area {
@@ -664,6 +674,7 @@ pub fn threshold<'gc>(
             }
         }
     }
+    drop(px);
 
     if let Some(dirty_area) = dirty_area {
         write.set_cpu_dirty(mc, dirty_area);
@@ -711,16 +722,18 @@ pub fn scroll<'gc>(
     let target = target.sync(renderer);
     let mut write = target.borrow_mut(mc);
 
+    let mut px = write.pixels_mut();
     let mut src_y = y_from;
     while src_y != y_to {
         let mut src_x = x_from;
         while src_x != x_to {
-            let color = write.get_pixel32_raw(src_x as u32, src_y as u32);
-            write.set_pixel32_raw((src_x + x) as u32, (src_y + y) as u32, color);
+            let color = px.get(src_x as u32, src_y as u32);
+            px.set((src_x + x) as u32, (src_y + y) as u32, color);
             src_x += dx;
         }
         src_y += dy;
     }
+    drop(px);
 
     let region = PixelRegion::for_whole_size(write.width(), write.height());
     write.set_cpu_dirty(mc, region)
@@ -761,6 +774,7 @@ pub fn palette_map<'gc>(
     let target = target.sync(renderer);
     let mut write = target.borrow_mut(mc);
 
+    let mut px = write.pixels_mut();
     for y in 0..dest_region.height() {
         for x in 0..dest_region.width() {
             let dest_x = dest_region.x_min + x;
@@ -773,7 +787,7 @@ pub fn palette_map<'gc>(
                     .get_pixel32_raw(src_x, src_y)
                     .to_un_multiplied_alpha()
             } else {
-                write.get_pixel32_raw(src_x, src_y).to_un_multiplied_alpha()
+                px.get(src_x, src_y).to_un_multiplied_alpha()
             };
 
             let r = channel_arrays.0[source_color.red() as usize];
@@ -784,9 +798,10 @@ pub fn palette_map<'gc>(
             let sum = u32::wrapping_add(u32::wrapping_add(r, g), u32::wrapping_add(b, a));
             let mix_color = Color::from(sum).to_premultiplied_alpha(true);
 
-            write.set_pixel32_raw(dest_x, dest_y, mix_color);
+            px.set(dest_x, dest_y, mix_color);
         }
     }
+    drop(px);
 
     write.set_cpu_dirty(mc, dest_region);
 }
@@ -1039,6 +1054,15 @@ pub fn merge<'gc>(
     let target = target.sync(renderer);
     let mut write = target.borrow_mut(mc);
 
+    // Loop-invariant per-channel multipliers (red, green, blue, alpha), clamped.
+    let mults: [u16; 4] = [
+        rgba_mult.0.clamp(0, 256) as u16,
+        rgba_mult.1.clamp(0, 256) as u16,
+        rgba_mult.2.clamp(0, 256) as u16,
+        rgba_mult.3.clamp(0, 256) as u16,
+    ];
+
+    let mut px = write.pixels_mut();
     for y in 0..dest_region.height() {
         for x in 0..dest_region.width() {
             let dest_x = dest_region.x_min + x;
@@ -1051,40 +1075,34 @@ pub fn merge<'gc>(
                     .get_pixel32_raw(src_x, src_y)
                     .to_un_multiplied_alpha()
             } else {
-                write.get_pixel32_raw(src_x, src_y).to_un_multiplied_alpha()
+                px.get(src_x, src_y).to_un_multiplied_alpha()
             };
 
-            let dest_color = write
-                .get_pixel32_raw(dest_x, dest_y)
-                .to_un_multiplied_alpha();
+            let dest_color = px.get(dest_x, dest_y).to_un_multiplied_alpha();
 
-            let red_mult = rgba_mult.0.clamp(0, 256) as u16;
-            let green_mult = rgba_mult.1.clamp(0, 256) as u16;
-            let blue_mult = rgba_mult.2.clamp(0, 256) as u16;
-            let alpha_mult = rgba_mult.3.clamp(0, 256) as u16;
+            let src = [
+                source_color.red(),
+                source_color.green(),
+                source_color.blue(),
+                source_color.alpha(),
+            ];
+            let dst = [
+                dest_color.red(),
+                dest_color.green(),
+                dest_color.blue(),
+                dest_color.alpha(),
+            ];
+            // Per-channel linear blend `src*m + dst*(256-m) >> 8`. `from_fn`
+            // unrolls to branch-free 4-wide math the compiler can vectorize.
+            let out: [u8; 4] = std::array::from_fn(|c| {
+                ((src[c] as u16 * mults[c] + dst[c] as u16 * (256 - mults[c])) / 256) as u8
+            });
+            let mix_color = Color::rgba(out[0], out[1], out[2], out[3]);
 
-            let red = (source_color.red() as u16 * red_mult
-                + dest_color.red() as u16 * (256 - red_mult))
-                / 256;
-            let green = (source_color.green() as u16 * green_mult
-                + dest_color.green() as u16 * (256 - green_mult))
-                / 256;
-            let blue = (source_color.blue() as u16 * blue_mult
-                + dest_color.blue() as u16 * (256 - blue_mult))
-                / 256;
-            let alpha = (source_color.alpha() as u16 * alpha_mult
-                + dest_color.alpha() as u16 * (256 - alpha_mult))
-                / 256;
-
-            let mix_color = Color::rgba(red as u8, green as u8, blue as u8, alpha as u8);
-
-            write.set_pixel32_raw(
-                dest_x,
-                dest_y,
-                mix_color.to_premultiplied_alpha(transparency),
-            );
+            px.set(dest_x, dest_y, mix_color.to_premultiplied_alpha(transparency));
         }
     }
+    drop(px);
 
     write.set_cpu_dirty(mc, dest_region);
 }
@@ -1272,12 +1290,19 @@ pub fn copy_pixels_with_alpha_source<'gc>(
     let target = target.sync(context.renderer);
     let mut write = target.borrow_mut(context.gc());
 
+    // Loop-invariant bounds of the target, so the per-pixel bounds checks
+    // don't need to borrow `write` (which is now held by the `px` view).
+    let bmp_w = write.width() as i32;
+    let bmp_h = write.height() as i32;
+    let in_bounds = |x: i32, y: i32| x >= 0 && x < bmp_w && y >= 0 && y < bmp_h;
+    let mut px = write.pixels_mut();
+
     for src_y in src_min_y..(src_min_y + src_height) {
         for src_x in src_min_x..(src_min_x + src_width) {
             let dest_x = src_x - src_min_x + dest_min_x;
             let dest_y = src_y - src_min_y + dest_min_y;
 
-            if !write.is_point_in_bounds(dest_x, dest_y) {
+            if !in_bounds(dest_x, dest_y) {
                 continue;
             }
 
@@ -1287,13 +1312,13 @@ pub fn copy_pixels_with_alpha_source<'gc>(
                 }
                 source_bitmap.get_pixel32_raw(src_x as u32, src_y as u32)
             } else {
-                if !write.is_point_in_bounds(src_x, src_y) {
+                if !in_bounds(src_x, src_y) {
                     continue;
                 }
-                write.get_pixel32_raw(src_x as u32, src_y as u32)
+                px.get(src_x as u32, src_y as u32)
             };
 
-            let mut dest_color = write.get_pixel32_raw(dest_x as u32, dest_y as u32);
+            let mut dest_color = px.get(dest_x as u32, dest_y as u32);
 
             let alpha_x = src_x - src_min_x + alpha_point.0;
             let alpha_y = src_y - src_min_y + alpha_point.1;
@@ -1307,12 +1332,10 @@ pub fn copy_pixels_with_alpha_source<'gc>(
                         .get_pixel32_raw(alpha_x as u32, alpha_y as u32)
                         .alpha()
                 } else {
-                    if !write.is_point_in_bounds(alpha_x, alpha_y) {
+                    if !in_bounds(alpha_x, alpha_y) {
                         continue;
                     }
-                    write
-                        .get_pixel32_raw(alpha_x as u32, alpha_y as u32)
-                        .alpha()
+                    px.get(alpha_x as u32, alpha_y as u32).alpha()
                 };
 
                 if source_transparency {
@@ -1347,9 +1370,10 @@ pub fn copy_pixels_with_alpha_source<'gc>(
                 intermediate_color
             };
 
-            write.set_pixel32_raw(dest_x as u32, dest_y as u32, dest_color);
+            px.set(dest_x as u32, dest_y as u32, dest_color);
         }
     }
+    drop(px);
     write.set_cpu_dirty(context.gc(), dest_region);
 }
 
@@ -1633,40 +1657,44 @@ fn blend_and_transform<'gc>(
     let mut dest = dest.sync(context.renderer).borrow_mut(context.gc());
 
     if dest_is_source {
+        let opaque = !dest.transparency();
+        let mut px = dest.pixels_mut();
         for y in 0..dest_region.height() {
             for x in 0..dest_region.width() {
-                let mut color =
-                    dest.get_pixel32_raw(source_region.x_min + x, source_region.y_min + y);
+                let mut color = px.get(source_region.x_min + x, source_region.y_min + y);
                 color = Color::from(transform * swf::Color::from(color.to_un_multiplied_alpha()))
                     .to_premultiplied_alpha(true);
-                color = dest
-                    .get_pixel32_raw(dest_region.x_min + x, dest_region.y_min + y)
+                color = px
+                    .get(dest_region.x_min + x, dest_region.y_min + y)
                     .blend_over(&color);
-                if !dest.transparency() {
+                if opaque {
                     color = color.with_alpha(255);
                 }
-                dest.set_pixel32_raw(dest_region.x_min + x, dest_region.y_min + y, color);
+                px.set(dest_region.x_min + x, dest_region.y_min + y, color);
             }
         }
+        drop(px);
     } else {
         let source = source.read_area(source_region, context.renderer);
         let opaque = !dest.transparency();
 
+        let mut px = dest.pixels_mut();
         for y in 0..dest_region.height() {
             for x in 0..dest_region.width() {
                 let mut color =
                     source.get_pixel32_raw(source_region.x_min + x, source_region.y_min + y);
                 color = Color::from(transform * swf::Color::from(color.to_un_multiplied_alpha()))
                     .to_premultiplied_alpha(true);
-                color = dest
-                    .get_pixel32_raw(dest_region.x_min + x, dest_region.y_min + y)
+                color = px
+                    .get(dest_region.x_min + x, dest_region.y_min + y)
                     .blend_over(&color);
                 if opaque {
                     color = color.with_alpha(255);
                 }
-                dest.set_pixel32_raw(dest_region.x_min + x, dest_region.y_min + y, color);
+                px.set(dest_region.x_min + x, dest_region.y_min + y, color);
             }
         }
+        drop(px);
     }
 
     dest.set_cpu_dirty(context.gc(), dest_region);
@@ -1909,18 +1937,17 @@ pub fn set_vector<'gc>(
     let transparency = bitmap_data.transparency();
     let mut iter = vector.iter();
     bitmap_data.set_cpu_dirty(activation.gc(), region);
+    let mut px = bitmap_data.pixels_mut();
     for y in region.y_min..region.y_max {
-        for x in region.x_min..region.x_max {
+        // Each row is a contiguous run `[x_min, x_max)`; grab it once and fill
+        // it in place rather than paying a per-pixel index computation.
+        for slot in px.row_range(region.x_min, region.x_max, y) {
             let color = iter
                 .next()
                 .expect("BitmapData.setVector: Expected element")
                 .as_u32();
 
-            bitmap_data.set_pixel32_raw(
-                x,
-                y,
-                Color::from(color).to_premultiplied_alpha(transparency),
-            );
+            *slot = Color::from(color).to_premultiplied_alpha(transparency);
         }
     }
     Ok(())
@@ -2087,7 +2114,7 @@ pub fn pixel_dissolve<'gc>(
     }
 
     fn write_pixel(
-        write: &mut RefMut<'_, BitmapRawData>,
+        px: &mut PixelsMut<'_>,
         different_source_than_target: &Option<Ref<'_, BitmapRawData>>,
         fill_color: u32,
         transparency: bool,
@@ -2100,14 +2127,14 @@ pub fn pixel_dissolve<'gc>(
 
         match different_source_than_target {
             None => {
-                write.set_pixel32_raw(
+                px.set(
                     write_point.0,
                     write_point.1,
                     Color::from(fill_color).to_premultiplied_alpha(transparency),
                 );
             }
             Some(different_source) => {
-                write.set_pixel32_raw(
+                px.set(
                     write_point.0,
                     write_point.1,
                     different_source.get_pixel32_raw(read_point.0, read_point.1),
@@ -2164,10 +2191,11 @@ pub fn pixel_dissolve<'gc>(
 
     let target = target.sync(renderer);
     let mut write = target.borrow_mut(mc);
+    let mut px = write.pixels_mut();
 
     // For compliance with the official Flash Player, we always write the pixel at (0, 0).
     write_pixel(
-        &mut write,
+        &mut px,
         &different_source_than_target,
         fill_color,
         transparency,
@@ -2214,7 +2242,7 @@ pub fn pixel_dissolve<'gc>(
         );
 
         write_pixel(
-            &mut write,
+            &mut px,
             &different_source_than_target,
             fill_color,
             transparency,
@@ -2223,6 +2251,7 @@ pub fn pixel_dissolve<'gc>(
             write_offset,
         );
     }
+    drop(px);
 
     write.set_cpu_dirty(mc, dest_region);
 

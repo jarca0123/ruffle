@@ -1,6 +1,6 @@
 use crate::avm2::error::{Error2004Type, make_error_2004};
 use crate::avm2::parameters::ParametersExt;
-use crate::avm2::{Activation, Error, Value};
+use crate::avm2::{Activation, Error, Value, ValueEnum};
 
 pub use crate::avm2::object::netstream_allocator as net_stream_allocator;
 
@@ -42,7 +42,7 @@ pub fn play<'gc>(
     if let Some(ns) = this.as_netstream() {
         let name = args
             .get_optional(0)
-            .filter(|v| !matches!(v, Value::Null))
+            .filter(|v| !matches!(v.unpack(), ValueEnum::Null))
             .map(|v| v.coerce_to_string(activation))
             .transpose()?;
 

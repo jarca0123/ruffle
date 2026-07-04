@@ -5,6 +5,7 @@ use crate::avm2::activation::Activation;
 use crate::avm2::error::make_error_2027;
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
+use crate::avm2::ValueEnum;
 use crate::display_object::TInteractiveObject;
 
 /// Implements `InteractiveObject.mouseEnabled`'s getter.
@@ -212,9 +213,9 @@ pub fn set_focus_rect<'gc>(
         .as_display_object()
         .and_then(|this| this.as_interactive())
     {
-        let value = match args.get_value(0) {
-            Value::Bool(true) => Some(true),
-            Value::Null => None,
+        let value = match args.get_value(0).unpack() {
+            ValueEnum::Bool(true) => Some(true),
+            ValueEnum::Null => None,
             // everything else sets focusRect to false
             _ => Some(false),
         };
