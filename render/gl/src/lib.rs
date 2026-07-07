@@ -588,6 +588,7 @@ impl GlRenderBackend {
     /// [`Self::new_for_webgl`].
     ///
     /// [`OffscreenCanvas`]: web_sys::OffscreenCanvas
+    #[cfg(target_family = "wasm")]
     pub fn new_for_webgl_offscreen(
         canvas: &web_sys::OffscreenCanvas,
         is_transparent: bool,

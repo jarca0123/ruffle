@@ -13,7 +13,7 @@ use crate::avm2::globals::{
     SystemClassDefs, SystemClasses, init_builtin_system_class_defs, init_builtin_system_classes,
     init_native_system_classes,
 };
-use crate::avm2::object::{FunctionObject, WorkerObject};
+use crate::avm2::object::WorkerObject;
 use crate::avm2::scope::ScopeChain;
 use crate::avm2::script::{Script, TranslationUnit};
 use crate::avm2::stack::Stack;
@@ -99,9 +99,9 @@ pub use crate::avm2::multiname::Multiname;
 pub use crate::avm2::namespace::{CommonNamespaces, Namespace};
 pub use crate::avm2::object::jit_slots_layout;
 pub use crate::avm2::object::{
-    ArrayObject, BitmapDataObject, ClassObject, EventObject, LoaderInfoObject, NamespaceObject,
-    Object, ScriptObject, SharedObjectObject, SoundChannelObject, Stage3DObject, StageObject,
-    TObject,
+    ArrayObject, BitmapDataObject, ClassObject, EventObject, FunctionObject, LoaderInfoObject,
+    NamespaceObject, Object, ScriptObject, SharedObjectObject, SoundChannelObject, Stage3DObject,
+    StageObject, TObject,
 };
 pub use crate::avm2::qname::QName;
 pub use crate::avm2::value::Value;

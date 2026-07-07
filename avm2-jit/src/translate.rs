@@ -266,10 +266,13 @@ pub fn translate_boxed(ops: &[Op]) -> Option<(Vec<JitOp>, Vec<SwitchTable>)> {
     // class resolves outer scopes through it. Discarding the pushes there compiled
     // a wrong (shorter) class scope into being: the class's methods then read the
     // wrong outer scope and e.g. `getglobalslot` hit the class object instead of
-    // the global (`#1026 Slot N exceeds slotCount=0 of Test$`). `NewClass` is the
-    // only scope-capturing op that compiles (`newfunction`/`callstatic`/`findprop*`
-    // all decline); the capture needs the real stack even when `scope_this` holds.
-    let captures_scope = ops.iter().any(|op| matches!(op, Op::NewClass { .. }));
+    // the global (`#1026 Slot N exceeds slotCount=0 of Test$`). `NewClass` and
+    // `NewFunction` are the scope-capturing ops that compile (`callstatic`/
+    // `findprop*` decline); the capture needs the real stack even when
+    // `scope_this` holds.
+    let captures_scope = ops
+        .iter()
+        .any(|op| matches!(op, Op::NewClass { .. } | Op::NewFunction { .. }));
     let needs_scope = captures_scope
         || (!scope_this && ops.iter().any(|op| matches!(op, Op::GetScopeObject { .. })));
     let mut next_mn: u32 = 0;
@@ -545,6 +548,17 @@ fn boxed_op(
         // Boxed in-place int local increment/decrement (verifier-proven int local).
         Op::IncLocalI { index } => JitOp::IncDecLocalIValue(index, true),
         Op::DecLocalI { index } => JitOp::IncDecLocalIValue(index, false),
+        // `inclocal`/`declocal` — the *Number* forms: `local = ToNumber(local) ± 1`
+        // via the `increment`/`decrement` helper (their throwing-coercion caveat
+        // applies — swallowed, like the stack `increment`/`decrement` ops).
+        Op::IncLocal { index } => JitOp::IncDecLocalNum(index, true),
+        Op::DecLocal { index } => JitOp::IncDecLocalNum(index, false),
+        // `hasnext2` — the `for..in`/`for each` enumeration step: reads AND
+        // writes two register operands via the `hasnext2` helper + fetchers,
+        // pushes the loop-continue Boolean. Throwing (perr).
+        Op::HasNext2 { object_register, index_register } => {
+            JitOp::HasNext2(object_register, index_register)
+        }
         // `getscriptglobals` — the script's global object. `k` indexes the per-run
         // pre-resolved script-globals table (in op order), built in `try_run`.
         Op::GetScriptGlobals { .. } => {
@@ -686,6 +700,14 @@ fn boxed_op(
             let k = *next_coerce;
             *next_coerce += 1;
             JitOp::VCall(vc::NEW_CLASS, k, 0, true)
+        }
+        // `newfunction` — build a closure capturing the current scope chain (the
+        // erased `Method` rides the coerce-class table; `captures_scope` above
+        // forces the real scope stack on, exactly like `newclass`).
+        Op::NewFunction { .. } if JIT_VCALL => {
+            let k = *next_coerce;
+            *next_coerce += 1;
+            JitOp::VCall(vc::NEW_FUNCTION, k, 0, true)
         }
         // `newactivation` — the method's activation object (closure locals).
         Op::NewActivation { .. } if JIT_VCALL => {
@@ -939,6 +961,8 @@ pub(crate) fn reference_run(ops: &[JitOp], regs: &[u64]) -> u64 {
             | JitOp::GetScopeObject(_)
             | JitOp::GetOuterScope(_)
             | JitOp::IncDecLocalIValue(_, _)
+            | JitOp::IncDecLocalNum(_, _)
+            | JitOp::HasNext2(_, _)
             | JitOp::CoerceString
             | JitOp::GetScriptGlobals(_)
             | JitOp::GetLocalDouble(_)

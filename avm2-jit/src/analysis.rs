@@ -240,6 +240,8 @@ fn simulate_block(block: &[JitOp], mut locals: Vec<bool>) -> Option<Vec<bool>> {
             | JitOp::GetScopeObject(_)
             | JitOp::GetOuterScope(_)
             | JitOp::IncDecLocalIValue(_, _)
+            | JitOp::IncDecLocalNum(_, _)
+            | JitOp::HasNext2(_, _)
             | JitOp::CoerceString
             | JitOp::GetScriptGlobals(_)
             | JitOp::GetLocalDouble(_)

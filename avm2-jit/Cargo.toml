@@ -21,10 +21,13 @@ tracing = { workspace = true }
 # beats the DoS-resistant SipHash default, which showed in gameplay profiles.
 fnv = { workspace = true }
 
-# Native execution of the emitted module (desktop path + JIT↔interpreter tests).
-# On the web the browser's own engine runs the module instead, so wasmi is only
-# pulled in off-wasm.
+# Native execution of the emitted module (desktop path + JIT↔interpreter tests):
+# wasmtime compiles it to real machine code via cranelift — the emitted-module
+# pipeline is shared with the web (where the browser's engine does the same job).
+# wasmi (a WASM interpreter, ~40x slower on exception-heavy content) remains only
+# for the in-crate lowering unit tests, which exercise emitted-code semantics.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wasmtime = { version = "46", default-features = false, features = ["cranelift", "runtime"] }
 wasmi = "0.40"
 
 # On the web the runner drives the browser's `WebAssembly` engine directly.

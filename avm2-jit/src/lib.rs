@@ -37,6 +37,7 @@ use std::rc::Rc;
 use ruffle_core::avm2::{Activation, Class, Error, JitBackend, Method, Op, TObject, Value};
 
 pub mod analysis;
+pub(crate) mod direct;
 pub mod inline;
 pub mod emit;
 pub(crate) mod helpers;
@@ -74,6 +75,10 @@ struct Compiled {
     natives: Rc<[*const ()]>,
     /// Erased `Namespace`s, one per `PushNamespace` op.
     namespaces: Rc<[*const ()]>,
+    /// Ops for the **direct-exec tier** — tiny straight-line methods run as a
+    /// Rust match-loop over their `JitOp`s, skipping the wasm engine entirely
+    /// (see [`direct`]). `None` = ineligible → the ordinary wasm path.
+    direct_ops: Option<Rc<[lower::JitOp]>>,
     /// The lowered inputs, kept for GENERATION rebuilds (see
     /// [`lower::compile_generation`]): batches of compiled methods are re-emitted
     /// into one shared "amalgam" module against their union import layout.
@@ -101,7 +106,12 @@ impl GenSource {
     }
 }
 
-type CacheEntry = Option<Compiled>;
+/// `Rc`: `try_run` clones the entry OUT of the cache map on every call (the
+/// borrow can't be held across the run — compiling a callee re-enters the
+/// cache). Cloning the former by-value `Compiled` (10 fields, 8 of them `Rc`)
+/// per call showed up in `try_run`'s ~18% self-time on Starling gameplay
+/// profiles; an `Rc` clone is one refcount bump.
+type CacheEntry = Option<Rc<Compiled>>;
 
 /// How many freshly compiled methods accumulate before they are folded into one
 /// GENERATION module (web only). Each generation costs one `WebAssembly.Module`
@@ -319,7 +329,7 @@ impl WasmJit {
         &self,
         activation: &mut Activation<'_, 'gc>,
         method: Method<'gc>,
-    ) -> Option<Compiled> {
+    ) -> Option<Rc<Compiled>> {
         let key = method.as_ptr() as usize;
         if let Some(entry) = self.cache.borrow().get(&key) {
             return entry.clone();
@@ -373,9 +383,11 @@ impl WasmJit {
                     bytes,
                     manifest,
                     mn_table: mn_list,
+                    direct_ops: direct::eligible(&gen_src.ops).then(|| gen_src.ops.clone()),
                     gen_src,
                 }
-            });
+            })
+            .map(Rc::new);
         // On the first (and only) miss for a method that declined, record why —
         // the first op the boxed path can't lower (`<compile>` if all ops are
         // supported but the lowering bailed). Skips body-less methods.
@@ -415,7 +427,7 @@ impl WasmJit {
             let cache = self.cache.borrow();
             let compiled: Vec<&Compiled> = keys
                 .iter()
-                .filter_map(|k| cache.get(k).and_then(|e| e.as_ref()))
+                .filter_map(|k| cache.get(k).and_then(|e| e.as_deref()))
                 .collect();
             let members: Vec<lower::GenMember<'_>> = compiled
                 .iter()
@@ -441,8 +453,13 @@ impl WasmJit {
             // runner keys generation members by their address.)
             let mut cache = self.cache.borrow_mut();
             for k in &keys {
+                // `Rc::get_mut` fails only while a (nested) run still holds the
+                // entry's clone — then that member just keeps its sources
+                // (memory-only, bounded).
                 if let Some(Some(c)) = cache.get_mut(k) {
-                    c.gen_src = GenSource::empty();
+                    if let Some(c) = Rc::get_mut(c) {
+                        c.gen_src = GenSource::empty();
+                    }
                 }
             }
         }
@@ -842,14 +859,19 @@ fn coerce_class_table<'gc>(method: Method<'gc>) -> Vec<*const ()> {
         .parsed_code
         .iter()
         .filter_map(|op| match op {
-            // SAFETY: `Class` is `#[repr(transparent)]` over a `Gc` (a single pointer);
-            // the class is alive for the run, so erasing its pointer is sound (the
-            // `coerce` helper reverses it within the same run). `NewClass` and
-            // `NewActivation` share the table (and translate's `next_coerce` counter).
+            // SAFETY: `Class` is a single-`Gc` wrapper (one pointer); the class is
+            // alive for the run, so erasing its pointer is sound (the `coerce`
+            // helper reverses it within the same run). `NewClass`, `NewActivation`
+            // and `NewFunction` share the table (and translate's `next_coerce`
+            // counter) — the `NewFunction` entries are erased `Method`s (the same
+            // pointer-sized `Gc` wrapper shape), reversed by `method_at`.
             Op::Coerce { class }
             | Op::NewClass { class }
             | Op::NewActivation { activation_class: class } => {
                 Some(unsafe { std::mem::transmute::<Class<'gc>, *const ()>(*class) })
+            }
+            Op::NewFunction { method } => {
+                Some(unsafe { std::mem::transmute::<Method<'gc>, *const ()>(*method) })
             }
             _ => None,
         })
@@ -1081,7 +1103,13 @@ impl JitBackend for WasmJit {
             &compiled.namespaces,
             method,
         );
-        let result_bits = helpers::with_run_ctx(&ctx, || runner::run(bytes, regs, manifest))?;
+        let result_bits = helpers::with_run_ctx(&ctx, || match &compiled.direct_ops {
+            // Direct-exec tier: a tiny straight-line method runs as a Rust
+            // match-loop over its ops — same helpers, same side tables, no wasm
+            // engine (whose per-call setup dominates 3-op accessors like `LI8`).
+            Some(ops) => direct::run(ops, regs),
+            None => runner::run(bytes, regs, manifest),
+        })?;
 
         // A `callmethod` that threw is captured out-of-band (the ABI is infallible
         // and the emitted code bails after the throwing call). Propagate it — the

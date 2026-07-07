@@ -1,13 +1,14 @@
 //! Execution of a compiled JIT module.
 //!
-//! - **Native** (desktop / tests): run the emitted `run(state_ptr) -> i64`
-//!   through the `wasmi` interpreter. The frame is *copied* into a fresh WASM
-//!   memory: registers `[0..num_locals]` are written as 8-byte `Value` slots at
+//! - **Native** (desktop / tests): the emitted module is compiled to real
+//!   machine code by **wasmtime** (cranelift) and its `run(state_ptr) -> i64`
+//!   is called. The frame is *copied* into the instance's WASM memory:
+//!   registers `[0..num_locals]` are written as 8-byte `Value` slots at
 //!   offset 0, `run(0)` is called, and the returned `i64` is the result
 //!   `Value`'s bits. No copy-back is needed — the method's frame is discarded
-//!   once it returns, so only the return value matters. (A production desktop
-//!   JIT would instead lower to native code via e.g. cranelift; wasmi keeps the
-//!   prototype honest and gives us JIT↔interpreter equivalence tests.)
+//!   once it returns, so only the return value matters. (wasmi — an
+//!   interpreter, ~40x slower on exception-heavy content — remains only in the
+//!   lowering unit tests.)
 //! - **Web**: execution goes through the browser's own WASM engine, with the
 //!   helper imports wired to a JS trampoline back into Ruffle's wasm (see the
 //!   `wasm32` `run` below).
@@ -19,29 +20,29 @@
 /// order) to [`crate::helpers`], which reach the current activation via
 /// [`crate::helpers::with_activation`] set by the caller. `None` if the module
 /// fails to compile/instantiate/run.
-/// A ready-to-call wasmi instance for one compiled method: the store owns the
+/// A ready-to-call wasmtime instance for one compiled method: the store owns the
 /// instance, its frame memory, and the bound helper imports; `run` is the typed
 /// export. Pooled per method and reused across calls — the module has **no
 /// globals**, so its only state is the frame memory, which every call overwrites
 /// (registers at offset 0) before running.
 #[cfg(not(target_arch = "wasm32"))]
 struct PooledRun {
-    store: wasmi::Store<()>,
-    memory: wasmi::Memory,
-    run: wasmi::TypedFunc<(i32, i32, i32, i32, i32), i64>,
+    store: wasmtime::Store<()>,
+    memory: wasmtime::Memory,
+    run: wasmtime::TypedFunc<(i32, i32, i32, i32, i32), i64>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 thread_local! {
-    /// The single shared wasmi engine — modules and stores must share one.
-    static NATIVE_ENGINE: wasmi::Engine = wasmi::Engine::default();
-    /// Compiled wasmi modules, keyed by `bytes.as_ptr()` (stable/unique — the
+    /// The single shared wasmtime engine — modules and stores must share one.
+    static NATIVE_ENGINE: wasmtime::Engine = wasmtime::Engine::default();
+    /// Compiled wasmtime modules, keyed by `bytes.as_ptr()` (stable/unique — the
     /// `Rc<[u8]>` lives in `WasmJit`'s never-evicted cache, mirroring the web
     /// `MODULE_CACHE`). `Module::new` (validation + translation) is the costly
     /// step and used to run **per call** — hot methods called thousands of times
     /// (the avmplus `Date` suites, `rng`) re-translated their module every
     /// invocation and blew the script-execution time limit.
-    static NATIVE_MODULES: std::cell::RefCell<fnv::FnvHashMap<usize, wasmi::Module>> =
+    static NATIVE_MODULES: std::cell::RefCell<fnv::FnvHashMap<usize, wasmtime::Module>> =
         std::cell::RefCell::new(fnv::FnvHashMap::default());
     /// Ready instances per method (same key). Popped for the duration of a call
     /// and pushed back after, so a re-entrant call (a helper running AS3 that
@@ -50,7 +51,7 @@ thread_local! {
     /// (`Store` + `Memory` + ~a dozen `Func::wrap` + `Instance::new`) per CALL —
     /// millions of them in the avmplus mops range tests, which throw/catch
     /// `#1506` ~800k times through JIT'd `LI*` — was the dominant cost; pooled,
-    /// a call is a regs memcpy + the wasmi call.
+    /// a call is a regs memcpy + the call.
     static NATIVE_INSTANCES: std::cell::RefCell<fnv::FnvHashMap<usize, Vec<PooledRun>>> =
         std::cell::RefCell::new(fnv::FnvHashMap::default());
 }
@@ -82,11 +83,11 @@ pub fn run(bytes: &[u8], regs: &[u64], m: &crate::lower::Manifest) -> Option<u64
 
     // `run(state_ptr, dm_base, dm_len, regs_ptr, regs_len)`. Native production
     // modules use the helper path for domainMemory (never `has_dm`) and the frame
-    // was written into the wasmi memory above (no register-copy prologue on
+    // was written into the instance memory above (no register-copy prologue on
     // native), so everything but `state_ptr` is unused → 0.
     let result = pr.run.call(&mut pr.store, (0, 0, 0, 0, 0)).ok();
-    // Return the instance to the pool even on a trap — traps don't poison a
-    // wasmi store, and the next call rewrites the frame anyway.
+    // Return the instance to the pool even on a trap — a trap doesn't poison
+    // the store, and the next call rewrites the frame anyway.
     NATIVE_INSTANCES.with(|p| p.borrow_mut().entry(key).or_default().push(pr));
     result.map(|v| v as u64)
 }
@@ -95,7 +96,7 @@ pub fn run(bytes: &[u8], regs: &[u64], m: &crate::lower::Manifest) -> Option<u64
 /// store + frame memory, binds the helper imports, and instantiates.
 #[cfg(not(target_arch = "wasm32"))]
 fn build_instance(bytes: &[u8], m: &crate::lower::Manifest) -> Option<PooledRun> {
-    use wasmi::{Extern, Func, Instance, Memory, MemoryType, Module, Store};
+    use wasmtime::{Extern, Func, Instance, Memory, MemoryType, Module, Store};
 
     let engine = NATIVE_ENGINE.with(Clone::clone);
     let module = NATIVE_MODULES.with(|cache| {
@@ -110,7 +111,7 @@ fn build_instance(bytes: &[u8], m: &crate::lower::Manifest) -> Option<PooledRun>
     let mut store = Store::new(&engine, ());
 
     // One 64 KiB page holds 8192 slots — far more than any real frame.
-    let memory = Memory::new(&mut store, MemoryType::new(1, None).ok()?).ok()?;
+    let memory = Memory::new(&mut store, MemoryType::new(1, None)).ok()?;
 
     // Imports in declaration order — matching `lower::compile`: arity-1 helpers
     // h0..h{N-1}, then (if used) arity-2 `gp`/`gs`, then the used arity-3 set
@@ -221,7 +222,7 @@ fn build_instance(bytes: &[u8], m: &crate::lower::Manifest) -> Option<PooledRun>
     let instance = Instance::new(&mut store, &module, &externs).ok()?;
     // (The inline dm path + memory 1 is exercised by `lower::tests::lowers_dm_inline`.)
     let run = instance
-        .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+        .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&mut store, "run")
         .ok()?;
     Some(PooledRun { store, memory, run })
 }
@@ -549,16 +550,21 @@ mod web {
     ) -> bool {
         let Some(mem) = memory() else { return false };
         let byte_view = Uint8Array::from(gen_bytes);
-        let Ok(module) = WebAssembly::Module::new(byte_view.as_ref()) else {
-            // MUST stay loud: a silently failing install leaves every member on
-            // its per-method slot forever — the pool exhausts and later methods
-            // degrade to the slow JS entry (seen as huge `js-to-wasm` profile
-            // time when a Manifest field was missing from the generation union).
-            tracing::warn!(
-                "AVM2 JIT: generation module INVALID ({} members) — install skipped",
-                member_keys.len()
-            );
-            return false;
+        let module = match WebAssembly::Module::new(byte_view.as_ref()) {
+            Ok(m) => m,
+            Err(e) => {
+                // MUST stay loud: a silently failing install leaves every member on
+                // its per-method slot forever — the pool exhausts and later methods
+                // degrade to the slow JS entry (seen as huge `js-to-wasm` profile
+                // time when a Manifest field was missing from the generation union).
+                // Include the engine's validation error — it names the function
+                // index + byte offset, which identifies the miscompiled member.
+                tracing::warn!(
+                    "AVM2 JIT: generation module INVALID ({} members) — install skipped: {e:?}",
+                    member_keys.len()
+                );
+                return false;
+            }
         };
         let Some((instance, run)) = instantiate(&module, union, &mem) else {
             tracing::warn!(

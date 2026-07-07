@@ -18,9 +18,9 @@ use ruffle_core::avm2::error::{
     make_error_1041, make_error_1108, make_error_1127, make_null_or_undefined_error,
 };
 use ruffle_core::avm2::{
-    Activation, ArrayObject, ArrayStorage, Class, ClassObject, Error, FunctionArgs, Method,
-    Multiname, Namespace, NamespaceObject, NativeMethodImpl, Scope, ScriptObject, TObject, Value,
-    ValueEnum,
+    Activation, ArrayObject, ArrayStorage, Class, ClassObject, Error, FunctionArgs,
+    FunctionObject, Method, Multiname, Namespace, NamespaceObject, NativeMethodImpl, Scope,
+    ScriptObject, TObject, Value, ValueEnum,
 };
 
 /// The whole per-run helper context — installed with **one pointer swap** per
@@ -129,6 +129,12 @@ thread_local! {
     /// takes it via [`take_pending_error`] and propagates it — all within the same
     /// synchronous run, so the erased `'gc` is valid.
     static PENDING_ERROR: RefCell<Option<Error<'static>>> = const { RefCell::new(None) };
+    /// `hasnext2`'s two register outputs `(object bits, index bits)`, stashed by
+    /// [`has_next2`] and fetched by [`hn2_object`]/[`hn2_index`] — the op writes
+    /// TWO locals plus a pushed Boolean, which doesn't fit one return value. On
+    /// the early-false and error paths the stash holds the op's *inputs*, so the
+    /// emitted stores are identity (the interpreter leaves the registers alone).
+    static HN2_REGS: Cell<(i64, i64)> = const { Cell::new((0, 0)) };
 }
 
 /// `returnvalue` return-type coercion: coerces `value` to the method's declared
@@ -222,6 +228,21 @@ unsafe fn coerce_class_at<'gc>(k: usize) -> Class<'gc> {
     // SAFETY: `ptr` points at a `&[*const ()]` alive for the run; entry `k` is a
     // live `Class` address erased for storage (see `RunCtx::new`).
     unsafe { std::mem::transmute::<*const (), Class<'gc>>(*ptr.add(k)) }
+}
+
+/// The `k`-th entry of the coerce-class table as a `Method` — `newfunction` rides
+/// the same table/counter as `coerce`/`newclass` (see `lib::coerce_class_table`),
+/// its entries erased from the pointer-sized `Method` handle instead of `Class`.
+///
+/// # Safety
+/// Only call from a helper invoked while inside [`with_run_ctx`], with `k` a
+/// `NewFunction` op's table index.
+unsafe fn method_at<'gc>(k: usize) -> Method<'gc> {
+    let (ptr, len) = unsafe { run_ctx() }.coerce_classes;
+    debug_assert!(k < len, "JIT method index {k} out of range (len {len})");
+    // SAFETY: entry `k` was erased from a live `Method` (a pointer-sized `Gc`
+    // wrapper, alive for the run) in `lib::coerce_class_table`.
+    unsafe { std::mem::transmute::<*const (), Method<'gc>>(*ptr.add(k)) }
 }
 
 /// The current method (reverse of the erasure in [`RunCtx::new`]).
@@ -657,6 +678,18 @@ fn decrement_i(v: i64) -> i64 {
     }
 }
 
+/// Helper 30 — `hn2_index`: the index-register output of the preceding
+/// [`has_next2`] call (see [`HN2_REGS`]). The argument is a dummy.
+fn hn2_index(_: i64) -> i64 {
+    HN2_REGS.with(|s| s.get().1)
+}
+
+/// Helper 31 — `hn2_object`: the object-register output of the preceding
+/// [`has_next2`] call (see [`HN2_REGS`]). The argument is a dummy.
+fn hn2_object(_: i64) -> i64 {
+    HN2_REGS.with(|s| s.get().0)
+}
+
 /// A JIT helper: raw `Value` in, raw `Value` out (`i64` bits either way).
 pub(crate) type HelperFn = fn(i64) -> i64;
 
@@ -694,6 +727,8 @@ pub(crate) static HELPERS: &[HelperFn] = &[
     dm_load_f64,
     increment_i,
     decrement_i,
+    hn2_index,
+    hn2_object,
 ];
 
 // Binary (arity-2, two-stack) comparison helpers, indexed by `CallHelper2(i)`.
@@ -955,6 +990,64 @@ fn multiply_i(v1: i64, v2: i64) -> i64 {
     from_value(Value::from(x.wrapping_mul(b)))
 }
 
+/// `HELPERS2[22]` — `hasnext2`: the enumeration-step op (`for..in`/`for each`
+/// loop headers). Takes the object- and index-REGISTER values, mirrors
+/// `op_has_next_2` exactly, returns the pushed Boolean, and stashes the two
+/// register outputs in [`HN2_REGS`] for the `hn2_index`/`hn2_object` fetchers
+/// (the emitted code stores them back into the locals). A throwing
+/// `ToInt32`/`get_next_enumerant` stashes into `PENDING_ERROR` (the op is
+/// throwing — the emitted code bails before the stores would matter; the stash
+/// holds the inputs anyway, so even executed stores are identity).
+fn has_next2(obj: i64, idx: i64) -> i64 {
+    let activation = unsafe { activation() };
+    // Identity default: the early-false and error paths leave both registers
+    // untouched, exactly like the interpreter.
+    HN2_REGS.with(|s| s.set((obj, idx)));
+    let cur_index = match to_value(idx).coerce_to_i32(activation) {
+        Ok(i) => i,
+        Err(e) => return stash_pending_error(e),
+    };
+    if cur_index < 0 {
+        return from_value(Value::from(false));
+    }
+    let mut cur_index = cur_index as u32;
+    let object_reg = to_value(obj);
+    let mut result_value = object_reg;
+    let mut object = None;
+    match object_reg.unpack() {
+        ValueEnum::Undefined | ValueEnum::Null => cur_index = 0,
+        ValueEnum::Object(o) => {
+            object = o.proto();
+            cur_index = match o.get_next_enumerant(cur_index, activation) {
+                Ok(i) => i,
+                Err(e) => return stash_pending_error(e),
+            };
+        }
+        _ => {
+            if let Some(proto) = object_reg.proto(activation) {
+                object = proto.proto();
+                cur_index = match proto.get_next_enumerant(cur_index, activation) {
+                    Ok(i) => i,
+                    Err(e) => return stash_pending_error(e),
+                };
+            }
+        }
+    }
+    while let (Some(cur_object), 0) = (object, cur_index) {
+        cur_index = match cur_object.get_next_enumerant(cur_index, activation) {
+            Ok(i) => i,
+            Err(e) => return stash_pending_error(e),
+        };
+        result_value = cur_object.into();
+        object = cur_object.proto();
+    }
+    if cur_index == 0 {
+        result_value = Value::Null;
+    }
+    HN2_REGS.with(|s| s.set((from_value(result_value), from_value(Value::from(cur_index)))));
+    from_value(Value::from(cur_index != 0))
+}
+
 /// A JIT binary helper: `(v1, v2) -> Value` (`i64` each).
 pub(crate) type Helper2Fn = fn(i64, i64) -> i64;
 
@@ -963,7 +1056,7 @@ pub(crate) type Helper2Fn = fn(i64, i64) -> i64;
 pub(crate) static HELPERS2: &[Helper2Fn] = &[
     cmp_eq, cmp_lt, cmp_le, cmp_gt, cmp_ge, bit_and, bit_or, bit_xor, lshift, rshift, urshift,
     multiply, subtract, divide, modulo, strict_equals, as_type_late, is_type_late, add, add_i,
-    subtract_i, multiply_i,
+    subtract_i, multiply_i, has_next2,
 ];
 
 /// The arity-2 getproperty helper (`GetProperty(k)`): reads the receiver `Value`
@@ -1598,6 +1691,16 @@ fn vcall_inner<'gc>(
                 return Err(make_error_1108(activation));
             }
             ClassObject::from_class(activation, class, base_class).map(Into::into)
+        }
+        // `newfunction` (mirrors `op_new_function`): build a closure from the
+        // `k`-th method of the coerce-class table (erased `Method` entries — see
+        // `lib::coerce_class_table`), capturing the CURRENT scope chain — the
+        // `translate` pass forces `needs_scope` for methods with `newfunction`,
+        // exactly like `newclass`, so the real scope stack is live here.
+        vc::NEW_FUNCTION => {
+            let method = unsafe { method_at(imm) };
+            let scope = activation.create_scopechain();
+            Ok(FunctionObject::from_method(activation.context, method, scope, None, None).into())
         }
         // `newactivation` (mirrors `op_new_activation`).
         vc::NEW_ACTIVATION => {

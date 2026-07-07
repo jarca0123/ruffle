@@ -31,7 +31,7 @@ use wasm_encoder::{
 
 /// Bit pattern OR-ed onto a 32-bit integer to form an AVM2 int [`Value`].
 /// MUST match `ruffle_core::avm2::value`'s `BOX_MARK | (TAG_INT << 48)`.
-const VALUE_INT_MARK: u64 = 0xFFFB_0000_0000_0000;
+pub(crate) const VALUE_INT_MARK: u64 = 0xFFFB_0000_0000_0000;
 const VALUE_ALIGN: u32 = 3;
 // WASM locals. Five params first — `run(state_ptr, dm_base, dm_len, regs_ptr,
 // regs_len)`: `dm_base` (offset into memory 1) + `dm_len` describe the current
@@ -73,7 +73,7 @@ const CANON_NAN: u64 = 0x7FF8_0000_0000_0000;
 
 /// Bit pattern of `Value::Undefined` (`BOX_MARK | (TAG_UNDEFINED << 48)`, must
 /// match `core::avm2::value`). What a `returnvoid` method returns.
-const UNDEFINED_BITS: u64 = 0xFFF8_0000_0000_0000;
+pub(crate) const UNDEFINED_BITS: u64 = 0xFFF8_0000_0000_0000;
 
 /// NaN-box marker (sign + all exponent + quiet-NaN bit): a word is a boxed
 /// (non-`Number`) `Value` iff `bits & BOX_MARK == BOX_MARK`. Must match
@@ -81,10 +81,10 @@ const UNDEFINED_BITS: u64 = 0xFFF8_0000_0000_0000;
 const BOX_MARK: u64 = 0xFFF8_0000_0000_0000;
 /// Mask isolating `BOX_MARK | tag` (the top 16 bits) so an int box can be
 /// identified by `bits & VALUE_TAG_MASK == VALUE_INT_MARK`.
-const VALUE_TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
+pub(crate) const VALUE_TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 /// A `Boolean` `Value`'s base bits (`BOX_MARK | TAG_BOOL << 48`); the `0`/`1`
 /// payload is OR-ed in. Must match `core::avm2::value` (`TAG_BOOL = 2`).
-const VALUE_BOOL_MARK: u64 = 0xFFFA_0000_0000_0000;
+pub(crate) const VALUE_BOOL_MARK: u64 = 0xFFFA_0000_0000_0000;
 /// An `Object` `Value`'s top 16 bits (`(BOX_MARK | TAG_OBJECT << 48) >> 48`,
 /// `TAG_OBJECT = 5`): a word is object-boxed iff `bits >> 48 == 0xFFFD`. The
 /// low 48 bits are then the raw `Gc` data pointer (see `Value::pack`).
@@ -129,25 +129,29 @@ pub(crate) mod tests_slot_layout {
 /// ops (`HELPERS[5..8]`). Keep in sync with [`crate::helpers::HELPERS`];
 /// `helper_count` guarantees the method imports `h0..=h{index}` when the op is
 /// present, so these equal the helpers' function indices.
-const TO_BOOLEAN: u32 = 5; // boxed branch condition
+pub(crate) const TO_BOOLEAN: u32 = 5; // boxed branch condition
 const PUSH_SCOPE: u32 = 6; // real scope push
 const GET_SCOPE_OBJECT: u32 = 7; // local scope read
-const COERCE_U: u32 = 11; // ToUint32 (coerce_u) helper fallback
-const COERCE_I: u32 = 12; // ToInt32 (coerce_i) helper fallback
-const COERCE_RETURN: u32 = 16; // returnvalue return-type coercion
-const GET_SCRIPT_GLOBALS: u32 = 17; // getscriptglobals (pre-resolved bits by index)
-const GET_PUSH_STRING: u32 = 18; // pushstring (pre-resolved string Value bits by index)
+pub(crate) const COERCE_U: u32 = 11; // ToUint32 (coerce_u) helper fallback
+pub(crate) const COERCE_I: u32 = 12; // ToInt32 (coerce_i) helper fallback
+pub(crate) const COERCE_RETURN: u32 = 16; // returnvalue return-type coercion
+pub(crate) const GET_SCRIPT_GLOBALS: u32 = 17; // getscriptglobals (pre-resolved bits by index)
+pub(crate) const GET_PUSH_STRING: u32 = 18; // pushstring (pre-resolved string Value bits by index)
 const THROW: u32 = 19; // throw (stash the thrown Value as a pending error, then return)
 const DISPATCH_EXC: u32 = 20; // route a pending exception through the handler table
 const NEW_CATCH: u32 = 21; // newcatch (build the catch scope object)
 const POP_CAUGHT: u32 = 22; // catch-block entry: fetch the caught exception value
 const POP_SCOPE: u32 = 23; // popscope (pop the real scope stack)
 const GET_OUTER_SCOPE: u32 = 24; // getouterscope (read a captured/outer scope by index)
-const COERCE_S: u32 = 25; // coerces (ToString; throwing toString → PENDING_ERROR)
-const DM_LOADF32: u32 = 26; // lf32 fallback (inline dm miss → storage read)
-const DM_LOADF64: u32 = 27; // lf64 fallback
-const INCREMENT_I: u32 = 28; // increment_i (wrapping ToInt32+1) — inline inc's non-int fallback
-const DECREMENT_I: u32 = 29; // decrement_i (wrapping ToInt32-1) — inline dec's non-int fallback
+pub(crate) const COERCE_S: u32 = 25; // coerces (ToString; throwing toString → PENDING_ERROR)
+pub(crate) const DM_LOADF32: u32 = 26; // lf32 fallback (inline dm miss → storage read)
+pub(crate) const DM_LOADF64: u32 = 27; // lf64 fallback
+pub(crate) const INCREMENT_I: u32 = 28; // increment_i (wrapping ToInt32+1) — inline inc's non-int fallback
+pub(crate) const DECREMENT_I: u32 = 29; // decrement_i (wrapping ToInt32-1) — inline dec's non-int fallback
+pub(crate) const INCREMENT_NUM: u32 = 0; // increment (ToNumber+1) — `inclocal`
+pub(crate) const DECREMENT_NUM: u32 = 1; // decrement (ToNumber-1) — `declocal`
+const HN2_INDEX: u32 = 30; // hasnext2: fetch the stashed index-register output
+const HN2_OBJECT: u32 = 31; // hasnext2: fetch the stashed object-register output
 
 /// Pushes the `Value` (i64) bits of the `f64` already held in `SCRATCH_F64` —
 /// canonicalizing NaN to `CANON_NAN` so it doesn't collide with Ruffle's
@@ -214,6 +218,11 @@ pub(crate) fn helper_count(ops: &[JitOp]) -> u32 {
             // The inline int inc/dec's non-int fallback (wrapping ToInt32 ± 1).
             JitOp::IncrementIBoxed | JitOp::IncDecLocalIValue(_, true) => Some(INCREMENT_I + 1),
             JitOp::DecrementIBoxed | JitOp::IncDecLocalIValue(_, false) => Some(DECREMENT_I + 1),
+            // Number-semantics local inc/dec goes through h0/h1.
+            JitOp::IncDecLocalNum(_, true) => Some(INCREMENT_NUM + 1),
+            JitOp::IncDecLocalNum(_, false) => Some(DECREMENT_NUM + 1),
+            // `hasnext2` fetches its two register outputs via h30/h31.
+            JitOp::HasNext2(..) => Some(HN2_OBJECT + 1),
             // `lookupswitch` coerces its selector to an i32 via the `coerce_i`
             // (ToInt32) helper before the `br_table`, so it must import `h0..=h12`.
             JitOp::LookupSwitch(_) => Some(COERCE_I + 1),
@@ -306,6 +315,7 @@ fn helper2_count(ops: &[JitOp]) -> u32 {
             JitOp::AddIBoxed => Some(H2_ADD_I + 1),
             JitOp::SubtractIBoxed => Some(H2_SUBTRACT_I + 1),
             JitOp::MultiplyIBoxed => Some(H2_MULTIPLY_I + 1),
+            JitOp::HasNext2(..) => Some(H2_HAS_NEXT2 + 1),
             _ => None,
         })
         .max()
@@ -367,9 +377,9 @@ fn has_dm(ops: &[JitOp]) -> bool {
 
 // dm helper function indices (keep in sync with `translate`'s `HELPER_DM_LOAD*`) and
 // the `dm_store` HELPER3 kind (`translate::DM_STORE`).
-const DM_LOAD8: u32 = 8;
-const DM_LOAD16: u32 = 9;
-const DM_LOAD32: u32 = 10;
+pub(crate) const DM_LOAD8: u32 = 8;
+pub(crate) const DM_LOAD16: u32 = 9;
+pub(crate) const DM_LOAD32: u32 = 10;
 const DM_STORE_KIND: u32 = 3;
 
 /// Whether `op` is a **helper** domainMemory load/store (`li*`→`CallHelper`,
@@ -401,9 +411,12 @@ const H2_IS_TYPE_LATE: u32 = 17;
 /// The wrapping-int (`_i`) arithmetic helper kinds — the `AddIBoxed`/
 /// `SubtractIBoxed`/`MultiplyIBoxed` inline ops' non-int fallback (`ToInt32` both
 /// operands, wrapping i32 op). Keep in sync with [`crate::helpers::HELPERS2`].
-const H2_ADD_I: u32 = 19;
-const H2_SUBTRACT_I: u32 = 20;
-const H2_MULTIPLY_I: u32 = 21;
+pub(crate) const H2_ADD_I: u32 = 19;
+pub(crate) const H2_SUBTRACT_I: u32 = 20;
+pub(crate) const H2_MULTIPLY_I: u32 = 21;
+/// `hasnext2` (the enumeration step): arity-2 helper returning the Boolean; the
+/// two register outputs ride the `HN2_INDEX`/`HN2_OBJECT` fetchers. Throwing.
+const H2_HAS_NEXT2: u32 = 22;
 
 /// Whether `op` is a throwing arity-2 helper (`astypelate`/`istypelate`) — these
 /// stash a thrown error in `PENDING_ERROR`, so they must be followed by a `perr`
@@ -443,7 +456,7 @@ fn is_throwing_prop(op: JitOp) -> bool {
 /// `compile_method` declines those methods.
 pub(crate) fn is_throwing_call_or_dm(op: JitOp) -> bool {
     is_self_bailing_call(op)
-        || matches!(op, JitOp::CoerceString | JitOp::Coerce(_) | JitOp::CoerceInt(_))
+        || matches!(op, JitOp::CoerceString | JitOp::Coerce(_) | JitOp::CoerceInt(_) | JitOp::HasNext2(..))
         || is_dm_op(op)
         || is_throwing_h2(op)
         || is_throwing_prop(op)
@@ -556,6 +569,9 @@ pub(crate) mod vc {
     pub const NEW_ACTIVATION: u32 = 16;
     /// `typeof`: `a`=value → the type-name String.
     pub const TYPE_OF: u32 = 17;
+    /// `newfunction`: no receiver, `imm`=coerce-class-table `k` (an erased
+    /// `Method`) → the FunctionObject closure (captures the current scope).
+    pub const NEW_FUNCTION: u32 = 21;
     /// `pushnamespace`: no receiver, `imm`=namespace-table `k` → NamespaceObject.
     pub const PUSH_NAMESPACE: u32 = 18;
     /// `coerce_d` (`ToNumber`): `a`=value → Number.
@@ -566,7 +582,7 @@ pub(crate) mod vc {
     /// Whether the kind pops a real receiver/base/value operand as `a` — the
     /// no-receiver kinds make the emitter push a dummy `0` instead.
     pub fn has_receiver(kind: u32) -> bool {
-        !matches!(kind, NEW_ARRAY | NEW_OBJECT | NEW_ACTIVATION | PUSH_NAMESPACE)
+        !matches!(kind, NEW_ARRAY | NEW_OBJECT | NEW_ACTIVATION | PUSH_NAMESPACE | NEW_FUNCTION)
     }
 }
 
@@ -640,6 +656,9 @@ pub struct Manifest {
     /// don't yield a primitive throws `#1050` via `PENDING_ERROR` (the helper's
     /// fallback), so it's dispatched/bailed like any other throwing op.
     pub has_coerce_int: bool,
+    /// Whether the method has a `HasNext2` (enumeration step) → needs the `perr`
+    /// import: a throwing `ToInt32`/`get_next_enumerant` rides `PENDING_ERROR`.
+    pub has_hasnext2: bool,
 }
 
 impl Manifest {
@@ -677,6 +696,7 @@ impl Manifest {
             h2_throws,
             has_vcall,
             has_coerce_int,
+            has_hasnext2,
         } = *m;
         self.num_helpers = self.num_helpers.max(num_helpers);
         self.has_getprop |= has_getprop;
@@ -698,6 +718,7 @@ impl Manifest {
         self.h2_throws |= h2_throws;
         self.has_vcall |= has_vcall;
         self.has_coerce_int |= has_coerce_int;
+        self.has_hasnext2 |= has_hasnext2;
     }
 
     pub fn needs_perr(&self) -> bool {
@@ -710,6 +731,7 @@ impl Manifest {
             || self.has_coerce_s
             || self.has_coerce
             || self.has_coerce_int
+            || self.has_hasnext2
             || self.h2_throws
             || self.has_getprop
             || self.has_getprop_fast
@@ -752,6 +774,7 @@ pub(crate) fn manifest(ops: &[JitOp]) -> Manifest {
         h2_throws: h2_throws(ops),
         has_vcall: ops.iter().any(|op| matches!(op, JitOp::VCall(..))),
         has_coerce_int: ops.iter().any(|op| matches!(op, JitOp::CoerceInt(_))),
+        has_hasnext2: ops.iter().any(|op| matches!(op, JitOp::HasNext2(..))),
     }
 }
 
@@ -1075,6 +1098,14 @@ pub enum JitOp {
     /// `inclocal_i`/`declocal_i` on a boxed int local: `local[index] ±= 1` in place
     /// (unbox the int, add/sub 1, re-box). No operand-stack effect. `bool` = increment.
     IncDecLocalIValue(u32, bool),
+    /// `inclocal`/`declocal` (*Number* semantics): `local[i] = ToNumber(local[i]) ± 1`
+    /// in place via the `increment`/`decrement` helper. No operand-stack effect.
+    IncDecLocalNum(u32, bool),
+    /// `hasnext2 object_reg index_reg`: the enumeration step. Loads both register
+    /// values, calls the `hasnext2` arity-2 helper (Boolean result, register
+    /// outputs stashed), stores the outputs back into the two locals via the
+    /// `HN2_INDEX`/`HN2_OBJECT` fetchers, pushes the Boolean. Net +1. Throwing.
+    HasNext2(u32, u32),
     /// `lookupswitch`: pop an int selector; branch to `cases[selector]` (op index),
     /// or `default` if the selector is out of range. The `u32` indexes the
     /// compile's [`SwitchTable`] side-table (the case list can't live in a `Copy`
@@ -1737,6 +1768,41 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             body.instruction(&Instruction::Call(if inc { INCREMENT_I } else { DECREMENT_I }));
             body.instruction(&Instruction::End);
             body.instruction(&Instruction::I64Store(slot(index)));
+        }
+        JitOp::IncDecLocalNum(index, inc) => {
+            // `inclocal`/`declocal`: `local[index] = ToNumber(local[index]) ± 1` via
+            // the arity-1 `increment`/`decrement` helper (full `Value` semantics; a
+            // throwing coercion is swallowed there, like the stack forms). No
+            // operand-stack effect.
+            body.instruction(&Instruction::LocalGet(STATE_PTR)); // store address
+            body.instruction(&Instruction::LocalGet(STATE_PTR));
+            body.instruction(&Instruction::I64Load(slot(index)));
+            body.instruction(&Instruction::Call(if inc { INCREMENT_NUM } else { DECREMENT_NUM }));
+            body.instruction(&Instruction::I64Store(slot(index)));
+        }
+        JitOp::HasNext2(obj_reg, idx_reg) => {
+            // The enumeration step: `hasnext2 object_reg index_reg`. Load both
+            // register values, call the arity-2 `hasnext2` helper → the Boolean
+            // (left on the stack), then store the helper's two stashed register
+            // outputs back into the locals via the `hn2_*` fetchers. On the
+            // early-false/error paths the stash holds the inputs, so the stores
+            // are identity; a throwing step rides `PENDING_ERROR` and the compile
+            // loop's perr bail runs after this arm (before the Boolean is used).
+            // Net +1.
+            body.instruction(&Instruction::LocalGet(STATE_PTR));
+            body.instruction(&Instruction::I64Load(slot(obj_reg)));
+            body.instruction(&Instruction::LocalGet(STATE_PTR));
+            body.instruction(&Instruction::I64Load(slot(idx_reg)));
+            body.instruction(&Instruction::Call(lay.t_base + H2_HAS_NEXT2));
+            body.instruction(&Instruction::LocalGet(STATE_PTR));
+            body.instruction(&Instruction::I64Const(0));
+            body.instruction(&Instruction::Call(HN2_INDEX));
+            body.instruction(&Instruction::I64Store(slot(idx_reg)));
+            body.instruction(&Instruction::LocalGet(STATE_PTR));
+            body.instruction(&Instruction::I64Const(0));
+            body.instruction(&Instruction::Call(HN2_OBJECT));
+            body.instruction(&Instruction::I64Store(slot(obj_reg)));
+            *depth += 1;
         }
         JitOp::GetScriptGlobals(k) => {
             // Push the `k`-th script's global object (pre-resolved bits): pass `k` as
@@ -3110,6 +3176,32 @@ fn emit_body(
 mod tests {
     use super::*;
     use wasmi::{Engine, Func, Instance, Memory, MemoryType as WMemoryType, Module, Store};
+
+    // A GENERATION module containing the newer op lowerings (`hasnext2`,
+    // `inclocal`/`declocal`, the `newfunction` vcall kind) must VALIDATE — a
+    // member emitted against the union layout with a helper/import mismatch
+    // produces an invalid module, which on web skips the whole batch install
+    // ("generation module INVALID — install skipped").
+    #[test]
+    fn generation_with_new_ops_validates() {
+        let m1 = [JitOp::HasNext2(1, 2), JitOp::ReturnValueBoxed];
+        let m2 = [
+            JitOp::IncDecLocalNum(1, false),
+            JitOp::IncDecLocalNum(2, true),
+            JitOp::ReturnVoidBoxed(UNDEFINED_BITS),
+        ];
+        let m3 = [JitOp::VCall(vc::NEW_FUNCTION, 0, 0, true), JitOp::ReturnValueBoxed];
+        let m4 = [JitOp::GetLocalValue(1), JitOp::CoerceInt(false), JitOp::ReturnValueBoxed];
+        let members = [
+            GenMember { ops: &m1, switches: &[], exceptions: &[] },
+            GenMember { ops: &m2, switches: &[], exceptions: &[] },
+            GenMember { ops: &m3, switches: &[], exceptions: &[] },
+            GenMember { ops: &m4, switches: &[], exceptions: &[] },
+        ];
+        let (bytes, _union) = compile_generation(&members).expect("generation compiles");
+        let engine = Engine::default();
+        Module::new(&engine, &bytes).expect("generation module validates");
+    }
 
     #[test]
     fn helper_dominated_declines_only_crossing_heavy() {
