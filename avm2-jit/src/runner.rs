@@ -32,18 +32,28 @@ struct PooledRun {
     run: wasmtime::TypedFunc<(i32, i32, i32, i32, i32), i64>,
 }
 
+// The wasmtime state lives in `ManuallyDrop`: a thread's TLS destructors must
+// NOT tear it down. Dropping a `Module`/`Store` deregisters its unwind info
+// (`CodeMemory` → `UnwindRegistration` → libgcc `__deregister_frame`), and when
+// that TLS destructor races the process's own `exit()` (libtest calls
+// `process::exit` while a player thread is still unwinding its TLS), libgcc
+// aborts — seen as flaky post-"test result: ok" SIGABRTs across random SWF
+// tests. Leaking the pool at thread exit is harmless: the memory goes away
+// with the process, and long-lived player threads keep using theirs.
 #[cfg(not(target_arch = "wasm32"))]
 thread_local! {
     /// The single shared wasmtime engine — modules and stores must share one.
-    static NATIVE_ENGINE: wasmtime::Engine = wasmtime::Engine::default();
+    static NATIVE_ENGINE: std::mem::ManuallyDrop<wasmtime::Engine> =
+        std::mem::ManuallyDrop::new(wasmtime::Engine::default());
     /// Compiled wasmtime modules, keyed by `bytes.as_ptr()` (stable/unique — the
     /// `Rc<[u8]>` lives in `WasmJit`'s never-evicted cache, mirroring the web
     /// `MODULE_CACHE`). `Module::new` (validation + translation) is the costly
     /// step and used to run **per call** — hot methods called thousands of times
     /// (the avmplus `Date` suites, `rng`) re-translated their module every
     /// invocation and blew the script-execution time limit.
-    static NATIVE_MODULES: std::cell::RefCell<fnv::FnvHashMap<usize, wasmtime::Module>> =
-        std::cell::RefCell::new(fnv::FnvHashMap::default());
+    static NATIVE_MODULES: std::mem::ManuallyDrop<
+        std::cell::RefCell<fnv::FnvHashMap<usize, wasmtime::Module>>,
+    > = std::mem::ManuallyDrop::new(std::cell::RefCell::new(fnv::FnvHashMap::default()));
     /// Ready instances per method (same key). Popped for the duration of a call
     /// and pushed back after, so a re-entrant call (a helper running AS3 that
     /// re-enters the same JIT'd method) finds the pool empty and builds a fresh
@@ -52,8 +62,9 @@ thread_local! {
     /// millions of them in the avmplus mops range tests, which throw/catch
     /// `#1506` ~800k times through JIT'd `LI*` — was the dominant cost; pooled,
     /// a call is a regs memcpy + the call.
-    static NATIVE_INSTANCES: std::cell::RefCell<fnv::FnvHashMap<usize, Vec<PooledRun>>> =
-        std::cell::RefCell::new(fnv::FnvHashMap::default());
+    static NATIVE_INSTANCES: std::mem::ManuallyDrop<
+        std::cell::RefCell<fnv::FnvHashMap<usize, Vec<PooledRun>>>,
+    > = std::mem::ManuallyDrop::new(std::cell::RefCell::new(fnv::FnvHashMap::default()));
 }
 
 #[cfg(not(target_arch = "wasm32"))]

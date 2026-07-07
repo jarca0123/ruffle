@@ -193,6 +193,12 @@ const INLINE_ARITH: bool = true;
 /// `helpers::vcall`; a throw propagates via `PENDING_ERROR` like a call.
 const JIT_VCALL: bool = true;
 
+/// Whether `add` uses the inline `ArithInt` form (int fast path + f64 middle
+/// path; helper only for string/object operands). Re-enabled after the
+/// vertex-corruption bisect: the culprit was the domainMemory promotion in
+/// `helpers::dm_base_len` (mirror coherence), not this.
+const INLINE_ADD: bool = true;
+
 // Indices into [`crate::helpers::HELPERS`] (keep in sync with that table).
 const HELPER_INCREMENT: u32 = 0;
 const HELPER_DECREMENT: u32 = 1;
@@ -421,9 +427,13 @@ fn boxed_op(
         Op::Subtract { .. } if JIT_GENERIC_ARITH => JitOp::CallHelper2(SUBTRACT),
         Op::Divide if JIT_GENERIC_ARITH => JitOp::CallHelper2(DIVIDE),
         Op::Modulo if JIT_GENERIC_ARITH => JitOp::CallHelper2(MODULO),
-        // `add` — numeric add or string concat (`Value::add`). Excluded from the
-        // inline int path (may be concat, not numeric), but the generic two-stack
-        // helper handles both.
+        // `add` — numeric add or string concat (`Value::add`). The inline paths
+        // fire only for NUMERIC operands (int+int → checked int, else f64 add →
+        // Number — exactly `Value::add`'s numeric arms); a string/object operand
+        // falls back to the generic helper, which handles concat/`valueOf`.
+        // NOTE: the ArithInt(ADD) inline form is gated separately (`INLINE_ADD`,
+        // OFF) while bisecting a Starling vertex-corruption regression.
+        Op::Add { .. } if INLINE_ADD => JitOp::ArithInt(ADD),
         Op::Add { .. } if JIT_GENERIC_ARITH => JitOp::CallHelper2(ADD),
         // Dynamic comparisons → a Boolean `Value`. Inlined as an `f64` compare with
         // a numeric fast path (`CmpNum`) when enabled, else the two-stack helper.

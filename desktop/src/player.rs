@@ -344,6 +344,18 @@ impl ActivePlayer {
             .with_avm2_optimizer_enabled(opt.avm2_optimizer_enabled);
         let player = builder.build();
 
+        // Opt-in AVM2 JIT (native: wasmtime + the direct-exec tier), mirroring
+        // the test harness's switch: `RUFFLE_JIT=1` drives, `RUFFLE_JIT=verify`
+        // runs the differential self-check. Off by default.
+        if let Ok(mode) = std::env::var("RUFFLE_JIT") {
+            let jit = if mode == "verify" {
+                ruffle_avm2_jit::WasmJit::shared_verified()
+            } else {
+                ruffle_avm2_jit::WasmJit::shared()
+            };
+            player.lock().expect("player lock").set_avm2_jit_backend(jit);
+        }
+
         window.set_title(&format!("Ruffle - {readable_name}"));
 
         SWF_INFO.with(|i| *i.borrow_mut() = Some(readable_name));

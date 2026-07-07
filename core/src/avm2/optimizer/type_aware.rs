@@ -685,6 +685,7 @@ pub fn type_aware_optimize<'gc>(
     method_exceptions: &mut [Exception<'gc>],
     resolved_parameters: &[ResolvedParamConfig<'gc>],
     jump_targets: &mut FnvHashSet<usize>,
+    null_safe_getslots: &mut Vec<u32>,
 ) -> Result<(), Error<'gc>> {
     let (block_list, op_index_to_block_index_table) = assemble_blocks(code_slice, jump_targets);
 
@@ -781,6 +782,7 @@ pub fn type_aware_optimize<'gc>(
             &mut worklist,
             &mut in_worklist,
             false,
+            null_safe_getslots,
         )?;
     }
 
@@ -801,6 +803,7 @@ pub fn type_aware_optimize<'gc>(
                 &mut worklist,
                 &mut in_worklist,
                 true,
+                null_safe_getslots,
             )?;
         }
     }
@@ -868,6 +871,11 @@ fn abstract_interpret_ops<'gc>(
     // `in_worklist[b]` mirrors `worklist` membership for O(1) dedup (see the caller).
     in_worklist: &mut [bool],
     do_optimize: bool,
+    // Op indices (into the FINAL, rewritten code) of `GetSlot`s whose receiver
+    // the verifier proved NOT NULL — such a slot read cannot throw, so the JIT
+    // may hoist it out of a loop (see `avm2-jit`'s hoist pass). Filled only
+    // during the optimize pass (final op positions).
+    null_safe_getslots: &mut Vec<u32>,
 ) -> Result<(), Error<'gc>> {
     let mut locals = initial_state.locals;
     let mut stack = initial_state.stack;
@@ -1535,6 +1543,10 @@ fn abstract_interpret_ops<'gc>(
             Op::GetSlot { index: slot_id } => {
                 let stack_value = stack.pop(activation)?;
 
+                if do_optimize && stack_value.not_null {
+                    null_safe_getslots.push((start_index + i) as u32);
+                }
+
                 // The value must have a vtable
                 let Some((vtable, class)) = stack_value.vtable_and_class() else {
                     return Err(make_error_1051(activation));
@@ -1603,6 +1615,12 @@ fn abstract_interpret_ops<'gc>(
                 let opt_result = optimize_get_property(activation, multiname, stack_value)?;
 
                 if let Some((new_op, return_type)) = opt_result {
+                    if do_optimize
+                        && stack_value.not_null
+                        && matches!(new_op, Op::GetSlot { .. })
+                    {
+                        null_safe_getslots.push((start_index + i) as u32);
+                    }
                     optimize_op_to!(new_op);
 
                     if let Some(return_type) = return_type {

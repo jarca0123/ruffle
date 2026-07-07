@@ -1970,6 +1970,51 @@ impl<'gc> Value<'gc> {
         }
     }
 
+    /// Whether [`Self::coerce_to_type`] with `class` would return `self`
+    /// UNCHANGED (bit-identical, no side effects, no error). A cheap tag check
+    /// per argument that lets the call setup (`init_from_method` /
+    /// `resolve_parameters`) skip the full coercion dispatch for the
+    /// overwhelmingly common already-typed argument — the per-arg coercion was
+    /// a visible slice of `exec` in call-heavy profiles. Conservative: `false`
+    /// only means the full coercion runs.
+    #[inline] // a per-argument tag check — must not be an outlined call
+    #[inline] // a per-argument tag check — must not be an outlined call
+    pub fn coerces_identically_to(&self, class: Class<'gc>) -> bool {
+        match class.builtin_type() {
+            // `ToInt32` of an int is itself.
+            Some(BuiltinType::Int) => !self.is_f64() && self.tag() == TAG_INT,
+            // `ToUint32` equals the int when non-negative (and re-boxes as int).
+            Some(BuiltinType::Uint) => {
+                !self.is_f64() && self.tag() == TAG_INT && (self.payload() as u32 as i32) >= 0
+            }
+            // A `Number` stays the same f64 (NaNs are already canonical in every
+            // packed `Number`, so the round-trip is bit-identical).
+            Some(BuiltinType::Number) => self.is_f64(),
+            Some(BuiltinType::Boolean) => !self.is_f64() && self.tag() == TAG_BOOL,
+            // `ToString` of a string is itself.
+            Some(BuiltinType::String) => !self.is_f64() && self.tag() == TAG_STRING,
+            // `Object` passes everything through except `undefined` (→ `null`).
+            Some(BuiltinType::Object) => self.is_f64() || self.tag() != TAG_UNDEFINED,
+            Some(_) => false,
+            // A concrete class: `null` passes through unchanged, and an object
+            // of EXACTLY this class is returned as-is. (A subclass instance is
+            // too, but proving that needs the class-chain walk — leave it to
+            // the full coercion.)
+            None => {
+                if self.is_f64() {
+                    return false;
+                }
+                match self.tag() {
+                    TAG_NULL => true,
+                    TAG_OBJECT => {
+                        matches!(self.unpack(), ValueEnum::Object(o) if o.instance_class() == class)
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
     /// Coerce the value to another value by type name.
     ///
     /// This function implements a handful of coercion rules that appear to be

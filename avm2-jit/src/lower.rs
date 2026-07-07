@@ -1447,7 +1447,8 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             body.instruction(&Instruction::I64ExtendI32S); // b i64
             body.instruction(&match index {
                 11 => Instruction::I64Mul,
-                _ => Instruction::I64Sub, // 12 = subtract
+                18 => Instruction::I64Add, // add (numeric arms of `Value::add`)
+                _ => Instruction::I64Sub,  // 12 = subtract
             });
             body.instruction(&Instruction::LocalSet(SCRATCH64_2)); // r = a op b
             // Fits i32? `r == sign_extend_32(r)`.
@@ -1480,7 +1481,8 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             emit_numval(body, SCRATCH64); // b
             body.instruction(&match index {
                 11 => Instruction::F64Mul,
-                _ => Instruction::F64Sub, // 12 = subtract
+                18 => Instruction::F64Add, // add (numeric middle path)
+                _ => Instruction::F64Sub,  // 12 = subtract
             });
             emit_box_double(body);
             body.instruction(&Instruction::Else);

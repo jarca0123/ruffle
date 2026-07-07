@@ -1,7 +1,11 @@
 use crate::avm2::op::Op;
 use crate::avm2::verify::Exception;
 
-pub fn remove_nops<'gc>(code: &mut Vec<Op<'gc>>, exceptions: &mut [Exception<'gc>]) {
+pub fn remove_nops<'gc>(
+    code: &mut Vec<Op<'gc>>,
+    exceptions: &mut [Exception<'gc>],
+    null_safe_getslots: &mut Vec<u32>,
+) {
     let mut offset_vec = vec![0; code.len()];
     let mut current_offset = 0;
 
@@ -50,5 +54,11 @@ pub fn remove_nops<'gc>(code: &mut Vec<Op<'gc>>, exceptions: &mut [Exception<'gc
         exception.from_offset = offset_vec[exception.from_offset];
         exception.to_offset = offset_vec[exception.to_offset];
         exception.target_offset = offset_vec[exception.target_offset];
+    }
+
+    // And the null-safe `GetSlot` positions (the AVM2 JIT's hoist input) —
+    // a `GetSlot` itself is never a nop, so its (remapped) index stays valid.
+    for idx in null_safe_getslots {
+        *idx = offset_vec[*idx as usize] as u32;
     }
 }

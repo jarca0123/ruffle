@@ -374,7 +374,9 @@ pub fn set_program_constants_from_byte_array<'gc>(
         let num_registers = args.get_i32(2);
 
         let data = args.get_object(activation, 3, "data")?;
-        let data = data.as_bytearray().expect("Parameter must be a ByteArray");
+        let mut data = data
+            .as_bytearray_mut()
+            .expect("Parameter must be a ByteArray");
 
         let byte_offset = args.get_u32(4) as usize;
 
@@ -382,17 +384,22 @@ pub fn set_program_constants_from_byte_array<'gc>(
         let num_registers =
             usize::try_from(num_registers).map_err(|_| make_error_3669(activation))?;
 
+        let num_floats = num_registers * 4;
+
         // Stage3D reads raw little-endian floats from the ByteArray regardless
         // of its `endian` setting. See `stage3d_program_constants_bytearray_le`
         // and `stage3d_program_constants_bytearray_be` for test coverage.
+        // MUST read via `read_at` (which refreshes from the shared buffer), NOT
+        // the raw local mirror: a `shareable` ByteArray's authoritative bytes
+        // live in its shared buffer — Starling fills the constants ByteArray
+        // via `sf32` (the JIT's inline domain-memory write), and reading the
+        // stale mirror here fed the shader garbage constants.
         let bytes = data
-            .bytes()
-            .get(byte_offset..)
-            .ok_or_else(|| make_error_3669(activation))?;
+            .read_at(num_floats * 4, byte_offset)
+            .map_err(|_| make_error_3669(activation))?;
 
         let (chunks, _) = bytes.as_chunks::<4>();
 
-        let num_floats = num_registers * 4;
         let raw_data = chunks
             .get(..num_floats)
             .ok_or_else(|| make_error_3669(activation))?;

@@ -20,6 +20,8 @@ image = { workspace = true, features = ["png"] }
 egui-winit = "0.33.3"
 fontdb = "0.23"
 ruffle_core = { path = "../core", features = ["audio", "clap", "mp3", "aac", "nellymoser", "default_compatibility_rules", "egui"] }
+# Opt-in AVM2 JIT (`RUFFLE_JIT=1`) — native wasmtime + direct-exec tier.
+ruffle_avm2_jit = { path = "../avm2-jit" }
 ruffle_render = { path = "../render", features = ["clap"] }
 ruffle_render_wgpu = { path = "../render/wgpu", features = ["clap"] }
 # Native OpenGL backend (experimental, --gl-native) — own glow-based renderer,

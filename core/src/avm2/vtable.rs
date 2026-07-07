@@ -265,6 +265,17 @@ impl<'gc> VTable<'gc> {
     ) -> Result<Value<'gc>, Error<'gc>> {
         let mut slot_class = self.0.slot_table[slot_id].property_class.get();
 
+        // Already-typed fast path — the steady state for hot slot writes (the
+        // class is resolved and the written value already IS that type, e.g.
+        // int globals, numeric fields): skip the coercion dispatch entirely.
+        match slot_class {
+            PropertyClass::Any => return Ok(value),
+            PropertyClass::Class(class) if value.coerces_identically_to(class) => {
+                return Ok(value);
+            }
+            _ => {}
+        }
+
         let (value, changed) = slot_class.coerce(activation, value)?;
 
         // Calling coerce modified `PropertyClass` to cache the class lookup,

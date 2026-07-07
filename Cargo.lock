@@ -5193,6 +5193,7 @@ dependencies = [
  "rand",
  "raw-window-handle",
  "rfd",
+ "ruffle_avm2_jit",
  "ruffle_core",
  "ruffle_frontend_utils",
  "ruffle_render",

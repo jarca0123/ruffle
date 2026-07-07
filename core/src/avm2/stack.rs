@@ -61,10 +61,17 @@ impl<'gc> Stack<'gc> {
 
         stack_pointer.set(stack_pointer.get() + frame_size);
 
-        // Ensure the StackFrame returned to the caller does not have any
-        // old values on it, as these may contain Gc pointers that have already
-        // been collected.
-        for value in subslice {
+        // Clear the LOCALS region: stale values may hold Gc pointers that were
+        // already collected (the stack is untraced — see `StackData::trace`),
+        // and verified bytecode MAY read a local it never wrote (`getlocal` of
+        // an unassigned local is `undefined`). The OPERAND region above the
+        // locals needs no clearing: verification guarantees every stack slot is
+        // pushed before it is read, so a stale value there is unobservable —
+        // and the per-call fill of `max_stack` extra slots was a measurable
+        // slice of `exec` in call-heavy profiles. (The flaky post-test SIGABRTs
+        // once suspected here turned out to be wasmtime unwind-info teardown in
+        // TLS destructors racing `process::exit` — fixed in the JIT's runner.)
+        for value in &subslice[..body.num_locals as usize] {
             value.set(Value::Undefined);
         }
 

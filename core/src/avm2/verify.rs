@@ -26,6 +26,12 @@ pub struct VerifiedMethodInfo<'gc> {
     pub parsed_code: Vec<Op<'gc>>,
 
     pub exceptions: Vec<Exception<'gc>>,
+
+    /// Op indices of `GetSlot`s whose receiver the verifier proved NOT NULL —
+    /// such a slot read cannot throw and touches no user code, so the AVM2 JIT
+    /// may hoist it out of a loop (a pure read is safe to run speculatively).
+    /// Sorted (recording follows block order, remapped by `remove_nops`).
+    pub null_safe_getslots: Vec<u32>,
 }
 
 #[derive(Collect)]
@@ -507,6 +513,7 @@ pub fn verify_method<'gc>(
         }
     }
 
+    let mut null_safe_getslots: Vec<u32> = Vec::new();
     crate::avm2::optimizer::optimize(
         activation,
         method,
@@ -514,11 +521,13 @@ pub fn verify_method<'gc>(
         &mut new_exceptions,
         resolved_param_config,
         jump_targets,
+        &mut null_safe_getslots,
     )?;
 
     Ok(VerifiedMethodInfo {
         parsed_code: verified_code,
         exceptions: new_exceptions,
+        null_safe_getslots,
     })
 }
 

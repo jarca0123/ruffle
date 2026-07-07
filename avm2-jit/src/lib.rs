@@ -37,6 +37,7 @@ use std::rc::Rc;
 use ruffle_core::avm2::{Activation, Class, Error, JitBackend, Method, Op, TObject, Value};
 
 pub mod analysis;
+pub(crate) mod hoist;
 pub(crate) mod direct;
 pub mod inline;
 pub mod emit;
@@ -79,6 +80,9 @@ struct Compiled {
     /// Rust match-loop over their `JitOp`s, skipping the wasm engine entirely
     /// (see [`direct`]). `None` = ineligible → the ordinary wasm path.
     direct_ops: Option<Rc<[lower::JitOp]>>,
+    /// The method's `num_locals`, cached so `try_run` skips the per-call
+    /// `method.body()` deref chain (a `Gc` pointer walk on EVERY invocation).
+    num_locals: u32,
     /// The lowered inputs, kept for GENERATION rebuilds (see
     /// [`lower::compile_generation`]): batches of compiled methods are re-emitted
     /// into one shared "amalgam" module against their union import layout.
@@ -384,6 +388,7 @@ impl WasmJit {
                     manifest,
                     mn_table: mn_list,
                     direct_ops: direct::eligible(&gen_src.ops).then(|| gen_src.ops.clone()),
+                    num_locals: method.body().map(|b| b.num_locals).unwrap_or(0),
                     gen_src,
                 }
             })
@@ -580,6 +585,25 @@ fn compile_method<'gc>(
     // The caller's multiname pointers; the inline pass appends each inlined callee's
     // (and remaps that callee's `k`s), keeping this list in sync with the final ops.
     let mut mn_list = multiname_table(method);
+    // Loop-invariant `getslot` hoisting (Starling's transform loop re-reads six
+    // matrix fields per iteration). Runs BEFORE inlining, while op indices are
+    // still 1:1 with `parsed_code` (the verifier's null-safe indices refer to
+    // those); its scratch locals sit right above `num_locals`, so the inline
+    // pass's callee locals start above them. Gated like inlining: splicing
+    // shifts indices, which a switch side-table / exception ranges can't follow.
+    let mut hoisted_locals = 0;
+    if JIT_HOIST && switches.is_empty() && exceptions.is_empty() {
+        let num_locals = method.body().map(|b| b.num_locals).unwrap_or(0);
+        let null_safe = &method.get_verified_info().null_safe_getslots;
+        // Guard: a null-safe index must still point at a GetSlot (dead-code
+        // elimination can shift a removed op's remapped index onto a neighbor).
+        let null_safe: Vec<u32> = null_safe
+            .iter()
+            .copied()
+            .filter(|&i| matches!(ops.get(i as usize), Some(lower::JitOp::GetSlot(_))))
+            .collect();
+        hoisted_locals = hoist::hoist_pass(&mut ops, &null_safe, num_locals, MAX_FRAME_SLOTS);
+    }
     // Inline pass: splice statically-resolvable, small callees so their calls become
     // wasm-internal, avoiding the per-invocation `try_run` overhead. Correct either way
     // — a failed resolve/inline leaves the call helper. Skipped when the method has a
@@ -588,7 +612,7 @@ fn compile_method<'gc>(
     // Also skipped when the method has exception handlers: their op-index ranges
     // must stay aligned with `core_ops` (inlining shifts indices).
     if JIT_INLINE && switches.is_empty() && exceptions.is_empty() {
-        inline_pass(&mut ops, &mut mn_list, method);
+        inline_pass(&mut ops, &mut mn_list, method, hoisted_locals);
     }
     // Decline helper-dominated methods: when a boxed method is mostly JS-boundary
     // crossings (getproperty/getslot/callmethod/generic helpers) with little inline
@@ -615,6 +639,9 @@ fn exc_ranges<'gc>(method: Method<'gc>) -> Vec<lower::ExcRange> {
         .collect()
 }
 
+/// Whether the loop-invariant `getslot` hoist pass runs (see [`hoist`]).
+const JIT_HOIST: bool = true;
+
 /// Whether the inline pass runs (phase 1: super constructors). Splices small,
 /// statically-resolvable callees so their calls avoid the per-invocation `try_run`
 /// overhead (the dominant cost once JIT coverage is broad).
@@ -635,10 +662,13 @@ fn inline_pass<'gc>(
     ops: &mut Vec<lower::JitOp>,
     mn_list: &mut Vec<*const ()>,
     method: Method<'gc>,
+    // Scratch locals the hoist pass consumed above `num_locals` — the inlined
+    // callees' locals start above THOSE.
+    extra_locals: u32,
 ) {
     let Some(bound) = method.bound_class() else { return };
     let Some(caller_locals) = method.body().map(|b| b.num_locals) else { return };
-    let base = caller_locals;
+    let base = caller_locals + extra_locals;
     // Repeatedly splice the first inlinable call until none remain (bounded).
     loop {
         let mut progressed = false;
@@ -971,12 +1001,13 @@ impl JitBackend for WasmJit {
             return None;
         }
 
-        let num_locals = method.body()?.num_locals as usize;
         // Every per-method side table (multinames, script globals, strings, coerce
         // classes) is built once at compile time and cached in `Compiled` — the hot
-        // path below only installs the cached slices.
+        // path below only installs the cached slices (incl. `num_locals`, so the
+        // per-call `method.body()` deref chain is gone).
         let compiled = self.compiled(activation, method)?;
         let (bytes, manifest) = (&compiled.bytes, &compiled.manifest);
+        let num_locals = compiled.num_locals as usize;
 
         // The register-snapshot source. PRODUCTION: **zero-copy** — the frame's
         // local registers are contiguous 8-byte `Value` words in Ruffle's own

@@ -218,10 +218,12 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     ) -> Result<Vec<Value<'gc>>, Error<'gc>> {
         let mut arguments_list = Vec::new();
         for (arg, param_config) in user_arguments.iter().zip(signature.iter()) {
-            let coerced_arg = if let Some(param_class) = param_config.param_type {
-                arg.coerce_to_type(self, param_class)?
-            } else {
-                arg
+            // Same already-typed fast path as `init_from_method`.
+            let coerced_arg = match param_config.param_type {
+                Some(param_class) if !arg.coerces_identically_to(param_class) => {
+                    arg.coerce_to_type(self, param_class)?
+                }
+                _ => arg,
             };
 
             arguments_list.push(coerced_arg);
@@ -345,7 +347,10 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let has_rest_or_args = method.is_variadic();
 
         if let Some(bound_class) = method.bound_class() {
-            assert!(this.is_of_type(bound_class));
+            // Sanity check only — every caller (call_property/call_method/exec
+            // paths) has already coerced the receiver to the bound class, and
+            // the class-chain walk per CALL was measurable in `exec` profiles.
+            debug_assert!(this.is_of_type(bound_class));
         }
 
         self.num_locals = num_locals;
@@ -377,10 +382,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         for (i, param_config) in signature.iter().enumerate().take(static_arg_count) {
             let arg = user_arguments.get_at(i);
 
-            let coerced_arg = if let Some(param_class) = param_config.param_type {
-                arg.coerce_to_type(self, param_class)?
-            } else {
-                arg
+            // Skip the coercion dispatch when the argument already IS the
+            // target type (the overwhelmingly common case — see
+            // `coerces_identically_to`); this per-arg call was a visible slice
+            // of `exec` in profiles.
+            let coerced_arg = match param_config.param_type {
+                Some(param_class) if !arg.coerces_identically_to(param_class) => {
+                    arg.coerce_to_type(self, param_class)?
+                }
+                _ => arg,
             };
 
             self.push_stack(coerced_arg);

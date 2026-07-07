@@ -123,12 +123,21 @@ thread_local! {
     static CAUGHT: Cell<i64> = const { Cell::new(0) };
     /// Args spilled for a pending `call_method`, pushed top-of-stack-first by
     /// [`push_call_arg`]; `call_method` drains the last `argc` and reverses them.
-    static CALL_ARGS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+    // `UnsafeCell`, not `RefCell`: the spill/drain pair runs on EVERY variadic
+    // call and the borrow bookkeeping showed in profiles. Sound: single-threaded
+    // per worker, and each access is a short section with no calls out while
+    // the reference is live (so no re-entrancy can alias it).
+    static CALL_ARGS: std::cell::UnsafeCell<Vec<i64>> =
+        const { std::cell::UnsafeCell::new(Vec::new()) };
     /// A thrown error captured by [`call_method`] (lifetime-erased). The emitted
     /// code checks [`pending_error`] after each call and bails; `try_run` then
     /// takes it via [`take_pending_error`] and propagates it — all within the same
     /// synchronous run, so the erased `'gc` is valid.
     static PENDING_ERROR: RefCell<Option<Error<'static>>> = const { RefCell::new(None) };
+    /// Mirror of `PENDING_ERROR.is_some()`. The emitted `perr` check runs after
+    /// EVERY throwing op, so it reads this plain `Cell` instead of paying a
+    /// `RefCell` borrow per check. Kept in sync by the stash/take sites.
+    static PENDING_FLAG: Cell<bool> = const { Cell::new(false) };
     /// `hasnext2`'s two register outputs `(object bits, index bits)`, stashed by
     /// [`has_next2`] and fetched by [`hn2_object`]/[`hn2_index`] — the op writes
     /// TWO locals plus a pushed Boolean, which doesn't fit one return value. On
@@ -154,6 +163,8 @@ fn coerce_return(value: i64) -> i64 {
             // SAFETY: erase `'gc` for thread-local storage; taken this same run.
             let erased: Error<'static> = unsafe { std::mem::transmute(e) };
             PENDING_ERROR.with(|slot| *slot.borrow_mut() = Some(erased));
+    PENDING_FLAG.with(|f| f.set(true));
+            PENDING_FLAG.with(|f| f.set(true));
             from_value(Value::Undefined)
         }
     }
@@ -211,6 +222,8 @@ pub(crate) fn coerce(value: i64, k: i64) -> i64 {
             // SAFETY: erase `'gc` for thread-local storage; taken this same run.
             let erased: Error<'static> = unsafe { std::mem::transmute(e) };
             PENDING_ERROR.with(|slot| *slot.borrow_mut() = Some(erased));
+    PENDING_FLAG.with(|f| f.set(true));
+            PENDING_FLAG.with(|f| f.set(true));
             from_value(Value::Undefined)
         }
     }
@@ -276,6 +289,8 @@ fn dispatch_exc(op_idx: i64) -> i64 {
             // SAFETY: erase `'gc` for thread-local storage; taken this same run.
             let erased: Error<'static> = unsafe { std::mem::transmute(e) };
             PENDING_ERROR.with(|slot| *slot.borrow_mut() = Some(erased));
+    PENDING_FLAG.with(|f| f.set(true));
+            PENDING_FLAG.with(|f| f.set(true));
             -1
         }
     }
@@ -305,6 +320,7 @@ fn throw_value(bits: i64) -> i64 {
     // SAFETY: erase `'gc` for thread-local storage; `try_run` takes it this same run.
     let erased: Error<'static> = unsafe { std::mem::transmute(error) };
     PENDING_ERROR.with(|slot| *slot.borrow_mut() = Some(erased));
+    PENDING_FLAG.with(|f| f.set(true));
     from_value(Value::Undefined)
 }
 
@@ -508,6 +524,8 @@ fn coerce_s(v: i64) -> i64 {
                 // SAFETY: erase `'gc` for thread-local storage; taken this same run.
                 let erased: Error<'static> = unsafe { std::mem::transmute(e) };
                 PENDING_ERROR.with(|slot| *slot.borrow_mut() = Some(erased));
+    PENDING_FLAG.with(|f| f.set(true));
+            PENDING_FLAG.with(|f| f.set(true));
                 return from_value(Value::Undefined);
             }
         },
@@ -542,12 +560,14 @@ fn get_scope_object(index: i64) -> i64 {
 pub(crate) fn dm_base_len() -> (u32, u32) {
     // SAFETY: helpers run only inside `with_run_ctx`.
     let activation = unsafe { activation() };
-    // Don't promote a buffer to shareable here — content like Starling assigns
-    // a DIFFERENT ordinary ByteArray as domainMemory transiently per mesh, and
-    // promotion belongs to the deliberate `dm_base_len` storage path. An
-    // unshared buffer here can only be a race with reassignment — (0, 0) is
-    // the safe answer (the run's inline dm ops take the helper fallback; the
-    // interpreter path stays correct).
+    // Don't promote a buffer to shareable here. Promotion is cheap now (no
+    // reservation) and MOST mirror paths are coherent (reads refresh via
+    // `read_at`/`read_bytes`, writes write through, and the
+    // `setProgramConstantsFromByteArray` raw read was fixed) — but promoting
+    // content-driven ByteArrays still produced rendering glitches in Starling,
+    // so SOME raw-mirror consumer remains unaccounted for. Until every
+    // `bytes()`/`bytes_mut()` user is audited for shareable coherence, only
+    // buffers that are already shareable get the inline dm fast path.
     let mut storage = activation.domain_memory().storage_mut();
     if !storage.is_shareable() {
         return (0, 0);
@@ -570,6 +590,7 @@ fn set_pending_1506(activation: &mut Activation<'_, '_>) {
     // same activation scope (see `call_method`).
     let erased: Error<'static> = unsafe { std::mem::transmute(err) };
     PENDING_ERROR.with(|slot| *slot.borrow_mut() = Some(erased));
+    PENDING_FLAG.with(|f| f.set(true));
 }
 
 /// Helper 8 — `li8`: unsigned byte load; throws #1506 on OOB.
@@ -1347,14 +1368,17 @@ pub(crate) fn get_slot(receiver: i64, slot_id: i64) -> i64 {
 
 /// Spills one call argument (pushed in reverse stack order — top first).
 pub(crate) fn push_call_arg(v: i64) {
-    CALL_ARGS.with(|a| a.borrow_mut().push(v));
+    // SAFETY: see `CALL_ARGS` — short exclusive section, no re-entry.
+    CALL_ARGS.with(|a| unsafe { (*a.get()).push(v) });
 }
 
 /// Drains the last `argc` spilled args from `CALL_ARGS` and restores argument
 /// order (they were pushed top-first). Shared by `call_method`/`call_property`.
 fn drain_call_args<'gc>(argc: i64) -> Vec<Value<'gc>> {
     CALL_ARGS.with(|a| {
-        let mut v = a.borrow_mut();
+        // SAFETY: see `CALL_ARGS` — short exclusive section; `to_value` and the
+        // collect below don't touch `CALL_ARGS`.
+        let v = unsafe { &mut *a.get() };
         let len = v.len();
         let n = (argc as usize).min(len);
         let mut raw = v.split_off(len - n);
@@ -1371,6 +1395,7 @@ fn stash_pending_error(e: Error<'_>) -> i64 {
     // same activation scope (see `try_run`).
     let erased: Error<'static> = unsafe { std::mem::transmute(e) };
     PENDING_ERROR.with(|slot| *slot.borrow_mut() = Some(erased));
+    PENDING_FLAG.with(|f| f.set(true));
     from_value(Value::Undefined)
 }
 
@@ -1749,11 +1774,17 @@ unsafe fn namespace_at<'gc>(imm: usize) -> Namespace<'gc> {
 /// Whether a call threw during this run (the emitted code checks this after each
 /// call to bail promptly). `1` = pending.
 pub(crate) fn pending_error() -> i32 {
-    PENDING_ERROR.with(|slot| slot.borrow().is_some()) as i32
+    PENDING_FLAG.with(|f| f.get()) as i32
 }
 
 /// Takes (and clears) the pending thrown error, for `try_run` to propagate.
 pub(crate) fn take_pending_error<'gc>() -> Option<Error<'gc>> {
+    // Flag-first: `try_run` clears defensively on EVERY call, so the common
+    // no-error case must be one plain `Cell` read, not a `RefCell` borrow.
+    if !PENDING_FLAG.with(|f| f.get()) {
+        return None;
+    }
+    PENDING_FLAG.with(|f| f.set(false));
     let erased = PENDING_ERROR.with(|slot| slot.borrow_mut().take())?;
     // SAFETY: reverse of the erasure in `call_method`, within the same run.
     Some(unsafe { std::mem::transmute::<Error<'static>, Error<'gc>>(erased) })

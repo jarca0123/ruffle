@@ -281,6 +281,8 @@ impl<'gc> Method<'gc> {
     }
 
     #[inline]
+    #[inline] // the verified fast path is one OnceCell check — hot in `exec`
+    #[inline] // the verified fast path is one OnceCell check — hot in `exec`
     pub fn verify(self, activation: &mut Activation<'_, 'gc>) -> Result<(), Error<'gc>> {
         // TODO: avmplus seems to eagerly verify some methods
 
@@ -333,6 +335,8 @@ impl<'gc> Method<'gc> {
 
     /// Resolve the classes used in this method's signature and return type.
     #[inline(never)]
+    #[inline] // the resolved fast path is one OnceCell check — hot in `exec`
+    #[inline] // the resolved fast path is one OnceCell check — hot in `exec`
     pub fn resolve_info(self, activation: &mut Activation<'_, 'gc>) -> Result<(), Error<'gc>> {
         if self.0.resolved_info.get().is_some() {
             return Ok(());
