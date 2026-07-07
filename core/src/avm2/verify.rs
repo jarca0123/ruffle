@@ -294,7 +294,7 @@ pub fn verify_method<'gc>(
 
     // Record a target->sources mapping of all jump
     // targets- this will be used in the optimizer.
-    let mut jump_targets = HashSet::new();
+    let mut jump_targets = fnv::FnvHashSet::default();
 
     // Handle exceptions
     let mut new_exceptions = Vec::new();

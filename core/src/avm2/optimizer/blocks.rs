@@ -1,7 +1,7 @@
 use crate::avm2::op::Op;
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use fnv::FnvHashSet;
 
 // Represents non-overlapping slices of ops with
 // a single entry point and many exit points.
@@ -17,8 +17,8 @@ pub struct Block<'a, 'gc> {
 
 pub fn assemble_blocks<'a, 'gc>(
     code: &'a [Cell<Op<'gc>>],
-    jump_targets: &HashSet<usize>,
-) -> (Vec<Block<'a, 'gc>>, HashMap<usize, usize>) {
+    jump_targets: &FnvHashSet<usize>,
+) -> (Vec<Block<'a, 'gc>>, Vec<u32>) {
     let mut block_list = Vec::with_capacity(2);
     let mut current_block_start = 0;
 
@@ -45,10 +45,15 @@ pub fn assemble_blocks<'a, 'gc>(
         }
     }
 
-    // Create a table mapping op indices to block indices.
-    let mut op_index_to_block_index_table = HashMap::new();
+    // Table mapping each block's start op-index to its block index. Op indices are
+    // dense (`0..code.len()`), so a `Vec` indexed by op-index is O(1) with **no
+    // hashing** — vs a `HashMap<usize, usize>` on the default SipHash, whose per-jump
+    // lookup dominated `process_jump`/verification at load. Jump targets are always
+    // block leaders, so a lookup always lands on a set entry; `u32::MAX` marks a
+    // non-leader op (never looked up).
+    let mut op_index_to_block_index_table = vec![u32::MAX; code.len()];
     for (i, block) in block_list.iter().enumerate() {
-        op_index_to_block_index_table.insert(block.start_index, i);
+        op_index_to_block_index_table[block.start_index] = i as u32;
     }
 
     (block_list, op_index_to_block_index_table)

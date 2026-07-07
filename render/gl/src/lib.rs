@@ -578,8 +578,32 @@ impl GlRenderBackend {
         is_transparent: bool,
         quality: StageQuality,
     ) -> Result<Self, Error> {
-        let created = context::create_for_webgl(canvas, is_transparent, quality)?;
+        let created =
+            context::create_for_webgl(context::WebGlCanvas::Html(canvas), is_transparent, quality)?;
         Self::finish_construction(created, is_transparent)
+    }
+
+    /// Creates the backend from an [`OffscreenCanvas`], for running the renderer
+    /// on a worker thread (the player-in-worker path). Otherwise identical to
+    /// [`Self::new_for_webgl`].
+    ///
+    /// [`OffscreenCanvas`]: web_sys::OffscreenCanvas
+    pub fn new_for_webgl_offscreen(
+        canvas: &web_sys::OffscreenCanvas,
+        is_transparent: bool,
+        quality: StageQuality,
+    ) -> Result<Self, Error> {
+        let created = context::create_for_webgl(
+            context::WebGlCanvas::Offscreen(canvas),
+            is_transparent,
+            quality,
+        )?;
+        let mut backend = Self::finish_construction(created, is_transparent)?;
+        // Presentation from an `OffscreenCanvas` (`transferControlToOffscreen`) is
+        // vertically mirrored versus a normal on-page canvas, so flip the present
+        // quad to show the movie upright.
+        backend.set_present_flipped(true);
+        Ok(backend)
     }
 
     /// Creates the backend from a native GL loader function (e.g. glutin's

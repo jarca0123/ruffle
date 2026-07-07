@@ -320,6 +320,17 @@ impl<'gc> Method<'gc> {
         }
     }
 
+    /// The verified info if this is a bytecode method that has **already** been
+    /// verified — non-panicking (unlike [`Self::get_verified_info`]). Used by the
+    /// AVM2 JIT's inliner to only splice already-verified callees (it must not force
+    /// verification at an arbitrary compile point).
+    pub fn try_verified_info(&self) -> Option<&VerifiedMethodInfo<'gc>> {
+        match &self.0.method_kind {
+            MethodKind::Bytecode { verified_info } => verified_info.get(),
+            _ => None,
+        }
+    }
+
     /// Resolve the classes used in this method's signature and return type.
     #[inline(never)]
     pub fn resolve_info(self, activation: &mut Activation<'_, 'gc>) -> Result<(), Error<'gc>> {

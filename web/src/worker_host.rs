@@ -19,8 +19,16 @@ impl WorkerHost for WasmWorkerHost {
         // `wasm_thread` packages the wasm-bindgen worker/TLS/stack bootstrap; the
         // closure runs on a fresh Web Worker thread, where blocking (Atomics.wait,
         // std Mutex/Condvar) is permitted.
-        if let Err(e) = wasm_thread::Builder::new().spawn(move || entry()) {
-            tracing::error!("failed to spawn worker web worker: {e:?}");
+        tracing::info!("WasmWorkerHost::spawn: creating nested Web Worker via wasm_thread");
+        let result = wasm_thread::Builder::new().spawn(move || {
+            // Runs *inside* the freshly-spawned worker — if this line never logs,
+            // the worker was created but failed to bootstrap the wasm module.
+            tracing::info!("WasmWorkerHost: nested worker thread started");
+            entry();
+        });
+        match result {
+            Ok(_) => tracing::info!("WasmWorkerHost::spawn: wasm_thread::spawn returned Ok"),
+            Err(e) => tracing::error!("WasmWorkerHost::spawn: wasm_thread::spawn failed: {e:?}"),
         }
     }
 }

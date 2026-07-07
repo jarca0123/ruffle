@@ -116,6 +116,44 @@ impl WgpuRenderBackend<SwapChainTarget> {
         Self::new(Arc::new(descriptors), target)
     }
 
+    /// [`Self::for_canvas`], but for an `OffscreenCanvas` (a worker's rendering
+    /// surface — no DOM access). `webgpu` selects the browser WebGPU backend
+    /// (needs `navigator.gpu` on the worker), else wgpu-over-WebGL2.
+    #[cfg(target_family = "wasm")]
+    pub async fn for_offscreen_canvas(
+        canvas: web_sys::OffscreenCanvas,
+        webgpu: bool,
+    ) -> Result<Self, Error> {
+        let backends = if webgpu {
+            wgpu::Backends::BROWSER_WEBGPU
+        } else {
+            wgpu::Backends::GL
+        };
+        let instance = create_wgpu_instance(
+            backends,
+            wgpu::BackendOptions {
+                gl: wgpu::GlBackendOptions {
+                    // See <https://github.com/gfx-rs/wgpu/releases/tag/v25.0.0>
+                    fence_behavior: wgpu::GlFenceBehavior::AutoFinish,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let surface = instance.create_surface(wgpu::SurfaceTarget::OffscreenCanvas(canvas))?;
+        let (adapter, device, queue) = request_adapter_and_device(
+            backends,
+            &instance,
+            Some(&surface),
+            wgpu::PowerPreference::HighPerformance,
+        )
+        .await?;
+        let descriptors = Descriptors::new(instance, adapter, device, queue);
+        let target =
+            SwapChainTarget::new(surface, &descriptors.adapter, (1, 1), &descriptors.device);
+        Self::new(Arc::new(descriptors), target)
+    }
+
     /// # Safety
     ///  See [`wgpu::SurfaceTargetUnsafe`] variants for safety requirements.
     #[cfg(not(target_family = "wasm"))]

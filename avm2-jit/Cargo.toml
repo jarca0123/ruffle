@@ -17,12 +17,20 @@ ruffle_core = { path = "../core" }
 # a WASM interpreter for testing.
 wasm-encoder = "0.221"
 tracing = { workspace = true }
+# Pointer-/id-keyed hot maps (the per-call method-cache/instance lookups): FNV
+# beats the DoS-resistant SipHash default, which showed in gameplay profiles.
+fnv = { workspace = true }
 
 # Native execution of the emitted module (desktop path + JIT↔interpreter tests).
 # On the web the browser's own engine runs the module instead, so wasmi is only
 # pulled in off-wasm.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wasmi = "0.40"
+
+# On the web the runner drives the browser's `WebAssembly` engine directly.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
 
 [dev-dependencies]
 # Run the Rust-level JIT tests in a real browser (where `WebAssembly.Module` from
@@ -36,3 +44,9 @@ js-sys = { workspace = true }
 # real headless Player, self-checking the JIT against the interpreter.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 swf = { path = "../swf" }
+
+# Only to compile the wasm32 test graph standalone: ruffle_core pulls in
+# getrandom, whose `wasm_js` backend feature is normally enabled by the `web`
+# crate. (The real web build gets it there; this just lets us check the runner.)
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }

@@ -1128,6 +1128,13 @@ impl<'gc> Class<'gc> {
             || self.is_builtin_void()
     }
 
+    /// The builtin type of this class, if any — for single-load dispatch over
+    /// the `is_builtin_*` family (hot in `Value::coerce_to_type`).
+    #[inline]
+    pub fn builtin_type(self) -> Option<BuiltinType> {
+        self.0.builtin_type.get()
+    }
+
     pub fn is_builtin_int(self) -> bool {
         matches!(self.0.builtin_type.get(), Some(BuiltinType::Int))
     }

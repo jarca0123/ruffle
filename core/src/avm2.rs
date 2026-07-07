@@ -13,7 +13,6 @@ use crate::avm2::globals::{
     SystemClassDefs, SystemClasses, init_builtin_system_class_defs, init_builtin_system_classes,
     init_native_system_classes,
 };
-use crate::avm2::method::NativeMethodImpl;
 use crate::avm2::object::{FunctionObject, WorkerObject};
 use crate::avm2::scope::ScopeChain;
 use crate::avm2::script::{Script, TranslationUnit};
@@ -91,16 +90,18 @@ pub use crate::avm2::class::Class;
 pub use crate::avm2::domain::{Domain, DomainPtr};
 pub use crate::avm2::error::Error;
 pub use crate::avm2::jit::{JitBackend, NullJit};
-pub use crate::avm2::method::Method;
+pub use crate::avm2::method::{Method, NativeMethodImpl};
 pub use crate::avm2::op::Op;
 pub use crate::avm2::flv::FlvValueAvm2Ext;
 pub use crate::avm2::function::FunctionArgs;
 pub use crate::avm2::globals::flash::ui::context_menu::make_context_menu_state;
 pub use crate::avm2::multiname::Multiname;
 pub use crate::avm2::namespace::{CommonNamespaces, Namespace};
+pub use crate::avm2::object::jit_slots_layout;
 pub use crate::avm2::object::{
-    ArrayObject, BitmapDataObject, ClassObject, EventObject, LoaderInfoObject, Object,
-    SharedObjectObject, SoundChannelObject, Stage3DObject, StageObject, TObject,
+    ArrayObject, BitmapDataObject, ClassObject, EventObject, LoaderInfoObject, NamespaceObject,
+    Object, ScriptObject, SharedObjectObject, SoundChannelObject, Stage3DObject, StageObject,
+    TObject,
 };
 pub use crate::avm2::qname::QName;
 pub use crate::avm2::value::Value;
@@ -108,7 +109,7 @@ pub use crate::avm2::value::ValueEnum;
 
 use self::api_version::ApiVersion;
 use self::object::WeakObject;
-use self::scope::Scope;
+pub use self::scope::Scope;
 
 const BROADCAST_WHITELIST: [&[u8]; 4] =
     [b"enterFrame", b"exitFrame", b"frameConstructed", b"render"];

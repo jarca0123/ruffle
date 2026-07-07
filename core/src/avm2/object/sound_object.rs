@@ -173,7 +173,14 @@ impl<'gc> SoundObject<'gc> {
                 *sound_data = SoundData::Loaded { sound };
             }
             SoundData::Loaded { sound: old_sound } => {
-                panic!("Tried to replace sound {old_sound:?} with {sound:?}")
+                // Re-setting the SAME handle is an idempotent no-op — it happens
+                // when a constructor re-runs on an already-initialized object
+                // (e.g. the JIT's differential verify re-executes an embedded
+                // sound's ctor, whose `super()` reaches `Sound.init` twice).
+                // Replacing with a *different* handle is still a logic error.
+                if *old_sound != sound {
+                    panic!("Tried to replace sound {old_sound:?} with {sound:?}")
+                }
             }
         }
         self.set_loading_state(SoundLoadingState::Loaded);

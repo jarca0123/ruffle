@@ -118,6 +118,22 @@ impl TestRunner {
             .with_autoplay(true) //.tick() requires playback
             .build();
 
+        // Opt-in AVM2 JIT differential check. The test harness is single-threaded and
+        // deterministic with no shared domainMemory, so it's an ideal place to check
+        // the JIT against the interpreter (unlike the live game, where concurrency
+        // confounds it). `RUFFLE_JIT=verify` installs verify mode (JIT runs but the
+        // interpreter's result is used; a mismatch is logged as `JIT DIVERGENCE`).
+        // Any other value makes the JIT **drive** — a bug then changes the AS3 output
+        // and fails the test outright, naming a deterministic repro.
+        if let Ok(mode) = std::env::var("RUFFLE_JIT") {
+            let jit = if mode == "verify" {
+                ruffle_avm2_jit::WasmJit::shared_verified()
+            } else {
+                ruffle_avm2_jit::WasmJit::shared()
+            };
+            player.lock().unwrap().set_avm2_jit_backend(jit);
+        }
+
         test.options
             .default_fonts
             .apply(&mut player.lock().unwrap());

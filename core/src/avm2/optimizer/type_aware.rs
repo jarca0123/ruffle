@@ -14,7 +14,8 @@ use crate::avm2::{Activation, Class, Error};
 
 use gc_arena::Gc;
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use fnv::FnvHashSet;
+use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ConstantValue {
@@ -302,28 +303,46 @@ impl std::fmt::Debug for OptValue<'_> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct Locals<'gc>(Vec<OptValue<'gc>>);
+/// Entries per [`Locals`] chunk (see below).
+const LOCALS_CHUNK: usize = 64;
+
+/// Local types of an abstract state — stored as **copy-on-write 64-entry `Rc`
+/// chunks** shared between states. Cloning a state (block entry, `to_owned`) is
+/// then O(chunks) pointer bumps, and — the point — [`AbstractState::merge_with`]
+/// can skip a whole chunk with one `Rc::ptr_eq` when both sides share the
+/// allocation: merge is idempotent, so an identical chunk cannot change. Blocks
+/// write only a handful of locals (each write un-shares just its chunk via
+/// `Rc::make_mut`), so for FlasCC's machine-generated methods — thousands of
+/// locals, tens of thousands of jump merges — almost every chunk short-circuits.
+/// The previous flat `Vec` forced a full O(locals) entry scan per merge, which
+/// alone was ~40% of OpenTTD's load time.
+#[derive(Clone, Debug)]
+struct Locals<'gc>(Vec<Rc<[OptValue<'gc>; LOCALS_CHUNK]>>, usize);
 
 impl<'gc> Locals<'gc> {
     fn new(size: usize) -> Self {
-        Self(vec![OptValue::any(); size])
+        // Every blank chunk is ONE shared allocation, so untouched regions
+        // `ptr_eq`-skip even across independently created states.
+        let blank: Rc<[OptValue<'gc>; LOCALS_CHUNK]> = Rc::new([OptValue::any(); LOCALS_CHUNK]);
+        Self(vec![blank; size.div_ceil(LOCALS_CHUNK)], size)
     }
 
     fn set_any(&mut self, index: usize) {
-        self.0[index] = OptValue::any();
+        self.set(index, OptValue::any());
     }
 
     fn set(&mut self, index: usize, value: OptValue<'gc>) {
-        self.0[index] = value;
+        debug_assert!(index < self.1);
+        Rc::make_mut(&mut self.0[index / LOCALS_CHUNK])[index % LOCALS_CHUNK] = value;
     }
 
     fn at(&self, index: usize) -> OptValue<'gc> {
-        self.0[index]
+        debug_assert!(index < self.1);
+        self.0[index / LOCALS_CHUNK][index % LOCALS_CHUNK]
     }
 
     fn len(&self) -> usize {
-        self.0.len()
+        self.1
     }
 }
 
@@ -536,28 +555,47 @@ impl<'gc> AbstractState<'gc> {
     ) -> Result<bool, Error<'gc>> {
         let mut changed = false;
 
-        // Merge locals
+        // Merge locals, CHUNK-wise: `Locals` shares 64-entry `Rc` chunks between
+        // states (copy-on-write), so when both sides hold the same allocation the
+        // chunk is equal and — merge being idempotent — cannot change: one
+        // `ptr_eq` skips all 64 entries. Blocks write only a handful of locals
+        // (un-sharing just their chunks), so almost every chunk short-circuits.
+        // The previous full O(locals) entry scan per jump merge dominated
+        // OpenTTD's load time (FlasCC: thousands of locals × tens of thousands
+        // of merges).
         assert!(self.locals.len() == other.locals.len());
 
-        for i in 0..self.locals.len() {
-            let our_local = self.locals.at(i);
-            // Lattice top absorbs everything; the merge can't change it. Skip
-            // before even loading `other` — this is the common case once locals
-            // saturate, and it's what made this loop ~34% of OpenTTD's runtime.
-            if our_local.is_any() {
+        for c in 0..self.locals.0.len() {
+            if Rc::ptr_eq(&self.locals.0[c], &other.locals.0[c]) {
                 continue;
             }
+            let base = c * LOCALS_CHUNK;
+            let end = (base + LOCALS_CHUNK).min(self.locals.len());
+            // Whether every entry matched `other`'s — then the chunks are equal
+            // in CONTENT despite distinct allocations, and we adopt `other`'s so
+            // future merges from states sharing it short-circuit on `ptr_eq`.
+            let mut identical = true;
+            for i in base..end {
+                let our_local = self.locals.at(i);
+                let other_local = other.locals.at(i);
+                // Merge is idempotent, so equal inputs produce no change.
+                if our_local == other_local {
+                    continue;
+                }
+                identical = false;
+                // Lattice top absorbs everything; the merge can't change it.
+                if our_local.is_any() {
+                    continue;
+                }
 
-            let other_local = other.locals.at(i);
-            // Merge is idempotent, so equal inputs produce no change.
-            if our_local == other_local {
-                continue;
+                let merged = our_local.merged_with(activation, other_local);
+                if merged != our_local {
+                    self.locals.set(i, merged);
+                    changed = true;
+                }
             }
-
-            let merged = our_local.merged_with(activation, other_local);
-            self.locals.set(i, merged);
-            if merged != our_local {
-                changed = true;
+            if identical {
+                self.locals.0[c] = other.locals.0[c].clone();
             }
         }
 
@@ -646,7 +684,7 @@ pub fn type_aware_optimize<'gc>(
     code_slice: &[Cell<Op<'gc>>],
     method_exceptions: &mut [Exception<'gc>],
     resolved_parameters: &[ResolvedParamConfig<'gc>],
-    jump_targets: &mut HashSet<usize>,
+    jump_targets: &mut FnvHashSet<usize>,
 ) -> Result<(), Error<'gc>> {
     let (block_list, op_index_to_block_index_table) = assemble_blocks(code_slice, jump_targets);
 
@@ -719,7 +757,12 @@ pub fn type_aware_optimize<'gc>(
 
     // Block #0 is the entry block
     let mut worklist = vec![0];
+    // Mirrors `worklist` membership so `process_jump` dedupes pushes in O(1) rather
+    // than an O(n) `Vec::contains` (which dominated verification/load time).
+    let mut in_worklist = vec![false; block_list.len()];
+    in_worklist[0] = true;
     while let Some(block_idx) = worklist.pop() {
+        in_worklist[block_idx] = false;
         let block = &block_list[block_idx];
 
         let block_entry_state = abstract_states[block_idx]
@@ -736,6 +779,7 @@ pub fn type_aware_optimize<'gc>(
             &op_index_to_block_index_table,
             method_exceptions,
             &mut worklist,
+            &mut in_worklist,
             false,
         )?;
     }
@@ -755,6 +799,7 @@ pub fn type_aware_optimize<'gc>(
                 &op_index_to_block_index_table,
                 method_exceptions,
                 &mut worklist,
+                &mut in_worklist,
                 true,
             )?;
         }
@@ -773,17 +818,19 @@ fn process_jump<'gc>(
     target: usize,
     abstract_states: &mut [Option<AbstractState<'gc>>],
     current_state: &AbstractStateRef<'_, 'gc>,
-    op_index_to_block_index_table: &HashMap<usize, usize>,
+    op_index_to_block_index_table: &[u32],
     worklist: &mut Vec<usize>,
+    // `in_worklist[b]` mirrors `worklist` membership for O(1) dedup (see the caller).
+    in_worklist: &mut [bool],
     do_optimize: bool,
 ) -> Result<(), Error<'gc>> {
     if do_optimize {
         return Ok(());
     }
 
-    let target_block_id = *op_index_to_block_index_table
-        .get(&target)
-        .expect("unexpected jump target");
+    let target_block_id = op_index_to_block_index_table[target];
+    debug_assert_ne!(target_block_id, u32::MAX, "unexpected jump target");
+    let target_block_id = target_block_id as usize;
     if let Some(target_state) = &mut abstract_states[target_block_id] {
         let state_changed = target_state.merge_with(activation, current_state)?;
         if !state_changed {
@@ -797,7 +844,10 @@ fn process_jump<'gc>(
 
     // FP reschedules blocks to the front of queue (for us, it'd be back of the vec).
     // I don't know if there's any good reason for that, but not doing it is faster.
-    if !worklist.contains(&target_block_id) {
+    // O(1) membership via `in_worklist` instead of an O(n) `worklist.contains` (which
+    // made the whole abstract-interpretation O(blocks²) — the dominant load cost).
+    if !in_worklist[target_block_id] {
+        in_worklist[target_block_id] = true;
         worklist.push(target_block_id);
     }
 
@@ -812,35 +862,62 @@ fn abstract_interpret_ops<'gc>(
     initial_state: AbstractState<'gc>,
     abstract_states: &mut [Option<AbstractState<'gc>>],
     types: &Types<'gc>,
-    op_index_to_block_index_table: &HashMap<usize, usize>,
+    op_index_to_block_index_table: &[u32],
     method_exceptions: &[Exception<'gc>],
     worklist: &mut Vec<usize>,
+    // `in_worklist[b]` mirrors `worklist` membership for O(1) dedup (see the caller).
+    in_worklist: &mut [bool],
     do_optimize: bool,
 ) -> Result<(), Error<'gc>> {
     let mut locals = initial_state.locals;
     let mut stack = initial_state.stack;
     let mut scope_stack = initial_state.scope_stack;
 
+    // Exceptions whose `[from, to)` range overlaps THIS block — the per-op scan
+    // below only needs those, and most blocks sit in no try range at all, so the
+    // whole exception path reduces to one `is_empty` check per op. The optimize
+    // pass skips it entirely (its `process_jump` is a no-op — the states were
+    // already computed by the verify pass).
+    let block_end = start_index + ops.len();
+    let block_exceptions: Vec<&Exception<'gc>> = if do_optimize {
+        Vec::new()
+    } else {
+        method_exceptions
+            .iter()
+            .filter(|e| e.from_offset < block_end && e.to_offset > start_index)
+            .collect()
+    };
+    // The exception-edge stack/scope (a single-`any`-entry stack + an empty scope
+    // stack) don't depend on the op — build them ONCE per block, lazily on the
+    // first throwing op actually inside a range (this used to clone + allocate
+    // per throwing op, which added up in try-heavy methods).
+    let mut exc_state: Option<(Stack<'gc>, ScopeStack<'gc>)> = None;
+
     for (i, op) in ops.iter().enumerate() {
-        if op.get().can_throw_error() {
+        if !block_exceptions.is_empty() && op.get().can_throw_error() {
             let current_idx = start_index + i;
-            for exception in method_exceptions {
+            for exception in &block_exceptions {
                 if current_idx >= exception.from_offset && current_idx < exception.to_offset {
                     // When branching as a result of an exception in a catch block,
                     // the exception target will be run starting with an empty
                     // scope stack and a stack with a single entry on it.
-
-                    // The abstract_states[0] access is here to copy
-                    // the empty stacks, without repeating code to create them from scratch.
-                    let mut exception_stack = abstract_states[0].as_ref().unwrap().stack.clone();
-                    exception_stack.push_any(activation)?;
-                    let empty_scope_stack =
-                        abstract_states[0].as_ref().unwrap().scope_stack.clone();
+                    if exc_state.is_none() {
+                        // The abstract_states[0] access is here to copy the empty
+                        // stacks, without repeating code to create them from scratch.
+                        let mut exception_stack =
+                            abstract_states[0].as_ref().unwrap().stack.clone();
+                        exception_stack.push_any(activation)?;
+                        let empty_scope_stack =
+                            abstract_states[0].as_ref().unwrap().scope_stack.clone();
+                        exc_state = Some((exception_stack, empty_scope_stack));
+                    }
+                    let (exception_stack, empty_scope_stack) =
+                        exc_state.as_ref().expect("just initialized");
 
                     let current_state = AbstractStateRef {
                         locals: &locals,
-                        stack: &exception_stack,
-                        scope_stack: &empty_scope_stack,
+                        stack: exception_stack,
+                        scope_stack: empty_scope_stack,
                     };
                     process_jump(
                         activation,
@@ -849,6 +926,7 @@ fn abstract_interpret_ops<'gc>(
                         &current_state,
                         op_index_to_block_index_table,
                         worklist,
+                        in_worklist,
                         do_optimize,
                     )?;
                 }
@@ -2084,6 +2162,7 @@ fn abstract_interpret_ops<'gc>(
                     &current_state,
                     op_index_to_block_index_table,
                     worklist,
+                    in_worklist,
                     do_optimize,
                 )?;
                 return Ok(());
@@ -2111,6 +2190,7 @@ fn abstract_interpret_ops<'gc>(
                     &current_state,
                     op_index_to_block_index_table,
                     worklist,
+                    in_worklist,
                     do_optimize,
                 )?;
             }
@@ -2137,6 +2217,7 @@ fn abstract_interpret_ops<'gc>(
                     &current_state,
                     op_index_to_block_index_table,
                     worklist,
+                    in_worklist,
                     do_optimize,
                 )?;
             }
@@ -2165,6 +2246,7 @@ fn abstract_interpret_ops<'gc>(
                         &current_state,
                         op_index_to_block_index_table,
                         worklist,
+                        in_worklist,
                         do_optimize,
                     )?;
                 }
@@ -2203,6 +2285,7 @@ fn abstract_interpret_ops<'gc>(
         &current_state,
         op_index_to_block_index_table,
         worklist,
+        in_worklist,
         do_optimize,
     )?;
     Ok(())
@@ -2395,9 +2478,9 @@ fn optimize_call_property<'gc>(
 fn recalculate_jump_targets<'gc>(
     ops: &[Cell<Op<'gc>>],
     exceptions: &[Exception<'gc>],
-    jump_targets: &mut HashSet<usize>,
+    jump_targets: &mut FnvHashSet<usize>,
 ) {
-    *jump_targets = HashSet::with_capacity(jump_targets.len());
+    *jump_targets = FnvHashSet::with_capacity_and_hasher(jump_targets.len(), Default::default());
 
     for exception in exceptions {
         jump_targets.insert(exception.target_offset);

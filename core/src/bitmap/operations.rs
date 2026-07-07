@@ -1,4 +1,4 @@
-use crate::avm2::bytearray::{ByteArrayError, ByteArrayStorage};
+use crate::avm2::bytearray::{ByteArrayError, ByteArrayStorage, Endian};
 use crate::avm2::error::{Error2006Type, make_error_2006};
 use crate::avm2::vector::VectorStorage;
 use crate::avm2::{Activation, Error, Value as Avm2Value};
@@ -2009,24 +2009,52 @@ pub fn set_pixels_from_byte_array<'gc>(
         // whole-buffer clone — on every pixel. Do it once, then index the row.
         let bmp_width = write.width();
         let pixels = write.raw_pixels_mut();
-        for y in region.y_min..region.y_max {
-            let row_base = (y * bmp_width) as usize;
-            for x in region.x_min..region.x_max {
-                // Copy data from bytearray until EOFError or finished
-                let color = bytearray.read_unsigned_int()?;
-                // In bounds: `region` was clamped to the target's dimensions above.
-                pixels[row_base + x as usize] = if transparency {
-                    Color::from(color).to_premultiplied_alpha(true)
-                } else {
-                    // Opaque target: premultiply-by-alpha reduces to "force
-                    // alpha to 255, leave RGB untouched" (the multiply/divide
-                    // per channel is exactly identity when a==255). Colors are
-                    // BGRA-little-endian `u32`s, so alpha is the high byte.
-                    // Skipping the arithmetic matters: this is a full-framebuffer
-                    // upload every frame for opaque SWFs like OpenTTD. The
-                    // `transparency` test is loop-invariant, so LLVM unswitches it.
-                    Color::from(color | 0xFF00_0000)
-                };
+        let needed = region.width() as usize * region.height() as usize * 4;
+        if bytearray.bytes_available() >= needed {
+            // Bulk path: ONE ByteArray read for the whole region. The per-pixel
+            // `read_unsigned_int` paid position/bounds/shared-mirror-sync
+            // overhead on every pixel — this loop was ~1.5 s of an OpenTTD
+            // gameplay profile.
+            let big_endian = matches!(bytearray.endian(), Endian::Big);
+            let raw = bytearray.read_bytes(needed)?;
+            let mut src = raw.chunks_exact(4);
+            for y in region.y_min..region.y_max {
+                let row_base = (y * bmp_width) as usize;
+                for x in region.x_min..region.x_max {
+                    // Exactly `width*height` chunks were read above.
+                    let b = src.next().expect("bulk read covers the region");
+                    let color = if big_endian {
+                        u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+                    } else {
+                        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                    };
+                    // In bounds: `region` was clamped to the target's dimensions.
+                    pixels[row_base + x as usize] = if transparency {
+                        Color::from(color).to_premultiplied_alpha(true)
+                    } else {
+                        // Opaque target: premultiply-by-alpha reduces to "force
+                        // alpha to 255, leave RGB untouched" (the multiply/divide
+                        // per channel is exactly identity when a==255). Colors are
+                        // BGRA-little-endian `u32`s, so alpha is the high byte.
+                        // The `transparency` test is loop-invariant, so LLVM
+                        // unswitches it.
+                        Color::from(color | 0xFF00_0000)
+                    };
+                }
+            }
+        } else {
+            // Short ByteArray: keep the exact legacy semantics — write pixel by
+            // pixel until the `EOFError` propagates (partial writes included).
+            for y in region.y_min..region.y_max {
+                let row_base = (y * bmp_width) as usize;
+                for x in region.x_min..region.x_max {
+                    let color = bytearray.read_unsigned_int()?;
+                    pixels[row_base + x as usize] = if transparency {
+                        Color::from(color).to_premultiplied_alpha(true)
+                    } else {
+                        Color::from(color | 0xFF00_0000)
+                    };
+                }
             }
         }
 

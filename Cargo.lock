@@ -4769,6 +4769,8 @@ dependencies = [
 name = "ruffle_avm2_jit"
 version = "0.3.0"
 dependencies = [
+ "fnv",
+ "getrandom 0.3.4",
  "js-sys",
  "ruffle_core",
  "swf 0.2.2",
@@ -5138,6 +5140,7 @@ dependencies = [
  "pretty_assertions",
  "rascal",
  "regex",
+ "ruffle_avm2_jit",
  "ruffle_core",
  "ruffle_input_format",
  "ruffle_render",
@@ -5218,6 +5221,7 @@ dependencies = [
  "gloo-net",
  "js-sys",
  "rfd",
+ "ruffle_avm2_jit",
  "ruffle_core",
  "ruffle_render",
  "ruffle_render_canvas",
@@ -5240,6 +5244,7 @@ dependencies = [
  "wasm-streams",
  "wasm_thread",
  "web-sys",
+ "web-time",
  "zip",
 ]
 

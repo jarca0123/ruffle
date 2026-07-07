@@ -9,7 +9,13 @@ mod log_adapter;
 mod navigator;
 mod storage;
 mod ui;
+#[cfg(feature = "threads")]
+mod worker_bridge;
 mod worker_host;
+#[cfg(all(feature = "threads", feature = "gl"))]
+mod worker_player;
+#[cfg(all(feature = "threads", feature = "gl"))]
+mod worker_shell;
 mod zip;
 
 use crate::builder::RuffleInstanceBuilder;

@@ -1,7 +1,7 @@
 use crate::avm2::op::Op;
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use fnv::FnvHashSet;
 
 /// A peephole optimizer to run before type-aware optimizations. This should be
 /// called once on the entire code slice.
@@ -23,7 +23,7 @@ pub fn preprocess_peephole(ops: &[Cell<Op<'_>>]) {
 /// called once on the entire code slice.
 pub fn postprocess_peephole<'a>(
     ops: &'a [Cell<Op<'_>>],
-    jump_targets: &HashSet<usize>,
+    jump_targets: &FnvHashSet<usize>,
     has_exceptions: bool,
 ) {
     // Gather some information...
@@ -226,7 +226,7 @@ pub fn postprocess_peephole<'a>(
 /// the GetLocal { 0 } and PushScope ops. Otherwise, it will return None.
 fn simple_scope_structure(
     ops: &[Cell<Op<'_>>],
-    jump_targets: &HashSet<usize>,
+    jump_targets: &FnvHashSet<usize>,
 ) -> Option<(usize, usize)> {
     let mut getlocal0_pos = None;
     for (i, op) in ops.iter().enumerate() {

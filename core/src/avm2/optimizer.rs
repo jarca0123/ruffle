@@ -11,7 +11,7 @@ use crate::avm2::op::Op;
 use crate::avm2::verify::Exception;
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use fnv::FnvHashSet;
 
 /// Run all the optimizer passes on the given code. This method should be
 /// run regardless of whether or not the "disable AVM2 optimizer" player option
@@ -23,7 +23,7 @@ pub fn optimize<'gc>(
     code: &mut Vec<Op<'gc>>,
     method_exceptions: &mut [Exception<'gc>],
     resolved_parameters: &[ResolvedParamConfig<'gc>],
-    mut jump_targets: HashSet<usize>,
+    mut jump_targets: FnvHashSet<usize>,
 ) -> Result<(), Error<'gc>> {
     let code_slice = Cell::from_mut(code.as_mut_slice());
     let code_slice = code_slice.as_slice_of_cells();

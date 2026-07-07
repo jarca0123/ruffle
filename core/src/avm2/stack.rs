@@ -164,6 +164,14 @@ impl<'a, 'gc> StackFrame<'a, 'gc> {
         unsafe { self.data.get_unchecked(index) }.get()
     }
 
+    /// Raw pointer to this frame's contiguous value storage — the local
+    /// registers live at word indices `0..num_locals` as 8-byte NaN-boxed
+    /// `Value`s (`Cell<Value>` is transparent). The AVM2 JIT passes it as its
+    /// zero-copy register-snapshot source; read-only, valid while the frame is.
+    pub fn values_ptr(&self) -> *const u64 {
+        self.data.as_ptr() as *const u64
+    }
+
     #[inline(always)]
     pub fn set_value_at(&self, index: usize, value: Value<'gc>) {
         debug_assert!(index < self.data.len(), "local register out of bounds");

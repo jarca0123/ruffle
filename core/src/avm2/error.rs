@@ -1264,9 +1264,17 @@ pub fn make_error_1504<'gc>(activation: &mut Activation<'_, 'gc>) -> Error<'gc> 
     make_error!(error(activation, "Error #1504: End of file.", 1504))
 }
 
+/// Diagnostic hook fired the first time [`make_error_1506`] runs (a domainMemory
+/// OOB — the FlasCC allocator's `#1506` heap-corruption symptom). The JIT registers
+/// one to dump every call-bearing method it has run, to pinpoint the corruptor.
+pub static ERROR_1506_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
 #[inline(never)]
 #[cold]
 pub fn make_error_1506<'gc>(activation: &mut Activation<'_, 'gc>) -> Error<'gc> {
+    if let Some(hook) = ERROR_1506_HOOK.get() {
+        hook();
+    }
     make_error!(range_error(
         activation,
         "Error #1506: The range specified is invalid.",

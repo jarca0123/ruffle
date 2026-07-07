@@ -40,6 +40,7 @@ wasm-bindgen = { workspace = true }
 workspace = true
 features = [
     "HtmlCanvasElement",
+    "OffscreenCanvas",
     "WebGl2RenderingContext",
     "WebGlRenderingContext",
     "WebglDebugRendererInfo",

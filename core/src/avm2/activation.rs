@@ -16,7 +16,6 @@ use crate::avm2::method::{Method, NativeMethodImpl, ResolvedParamConfig};
 use crate::avm2::object::TObject;
 use crate::avm2::object::{
     ArrayObject, ByteArrayObject, ClassObject, FunctionObject, NamespaceObject, ScriptObject,
-    XmlListObject,
 };
 use crate::avm2::op::{LookupSwitch, Op};
 use crate::avm2::scope::{Scope, ScopeChain, search_scope_stack};
@@ -460,7 +459,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     /// Call the superclass's instance initializer.
     ///
     /// This method may panic if called with a Null or Undefined receiver.
-    fn super_init(
+    // `pub` so the AVM2 JIT's `constructsuper` helper can invoke it (mirrors
+    // `op_construct_super`); the JIT runs inside a live activation.
+    pub fn super_init(
         &mut self,
         receiver: Value<'gc>,
         args: FunctionArgs<'_, 'gc>,
@@ -476,6 +477,13 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     pub fn local_register(&mut self, id: u32) -> Value<'gc> {
         // Verification guarantees that this points to a local register
         self.stack.value_at(id as usize)
+    }
+
+    /// Raw pointer to this frame's contiguous local registers as `Value` bit
+    /// words — the AVM2 JIT's zero-copy register-snapshot source (its wasm
+    /// prologue copies the words out; nothing writes back through this).
+    pub fn local_registers_ptr(&self) -> *const u64 {
+        self.stack.values_ptr()
     }
 
     /// Set a local register.
@@ -633,9 +641,12 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         self.stack.set_stack_pointer(self.num_locals);
     }
 
-    /// Clears the scope stack used by this activation.
+    /// Clears the scope stack used by this activation (truncates it back to the
+    /// depth captured at this Activation's entry). Public so an external executor
+    /// (e.g. the JIT's differential verifier) can reset scopes pushed during a run
+    /// before re-running the method through the interpreter.
     #[inline]
-    fn clear_scope(&mut self) {
+    pub fn clear_scope(&mut self) {
         let scope_depth = self.scope_depth;
         self.avm2().scope_stack.truncate(scope_depth);
     }
@@ -969,6 +980,36 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         }
 
         Err(original_error)
+    }
+
+    /// Exception dispatch for the AVM2 JIT: on a thrown `error` at op `ip - 1`,
+    /// returns `Ok((target_op, caught_value))` if a local handler catches it — the
+    /// operand stack has been reset and scopes cleared exactly as the interpreter's
+    /// path, and the caught error (which `handle_err` pushes onto the activation
+    /// stack) is popped back off and handed to the JIT to place on its own operand
+    /// stack — or `Err` to propagate. The JIT jumps to `target_op`'s block.
+    pub fn jit_dispatch_exception(
+        &mut self,
+        method: Method<'gc>,
+        ip: usize,
+        error: Error<'gc>,
+    ) -> Result<(usize, Value<'gc>), Error<'gc>> {
+        let target = self.handle_err(method, ip, error)?;
+        let caught = self.pop_stack();
+        Ok((target, caught))
+    }
+
+    /// Builds the `newcatch` scope object for exception handler `index` and returns
+    /// it (the JIT pushes it onto its own operand stack, rather than the activation
+    /// stack `op_newcatch` uses). Mirrors [`Self::op_newcatch`].
+    pub fn jit_new_catch(&mut self, method: Method<'gc>, index: usize) -> Value<'gc> {
+        let catch_class = method.get_verified_info().exceptions[index].catch_class;
+        let so = if let Some(catch_class) = catch_class {
+            ScriptObject::custom_object(self.gc(), catch_class, None, catch_class.vtable())
+        } else {
+            ScriptObject::new_object(self.context)
+        };
+        so.into()
     }
 
     #[inline(always)]
@@ -1617,6 +1658,16 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         Ok(())
     }
 
+    /// The `getouterscope` value for the AVM2 JIT: the `index`-th outer (captured)
+    /// scope's values object, or `undefined` if out of range. Mirrors
+    /// [`Self::op_get_outer_scope`] but returns the value (checked).
+    pub fn jit_outer_scope(&self, index: usize) -> Value<'gc> {
+        match self.outer.get(index) {
+            Some(scope) => scope.values(),
+            None => Value::Undefined,
+        }
+    }
+
     fn op_get_scope_object(&mut self, index: usize) -> Result<(), Error<'gc>> {
         // Verifier ensures that this points to a valid local scope
 
@@ -2039,57 +2090,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let value2 = self.pop_stack();
         let value1 = self.pop_stack();
 
-        let sum_value = match (value1.unpack(), value2.unpack()) {
-            (ValueEnum::Integer(n1), ValueEnum::Integer(n2)) => {
-                if let Some(res) = n1.checked_add(n2) {
-                    res.into()
-                } else {
-                    ((n1 as i64 + n2 as i64) as f64).into()
-                }
-            }
-            (ValueEnum::Number(n1), ValueEnum::Number(n2)) => (n1 + n2).into(),
-            (ValueEnum::String(s), _) => Value::String(AvmString::concat(
-                self.gc(),
-                s,
-                value2.coerce_to_string(self)?,
-            )),
-            (_, ValueEnum::String(s)) => Value::String(AvmString::concat(
-                self.gc(),
-                value1.coerce_to_string(self)?,
-                s,
-            )),
-            (ValueEnum::Object(value1), ValueEnum::Object(value2))
-                if (value1.as_xml_list_object().is_some() || value1.as_xml_object().is_some())
-                    && (value2.as_xml_list_object().is_some()
-                        || value2.as_xml_object().is_some()) =>
-            {
-                let list = XmlListObject::new(self, None, None);
-                // NOTE: Use append here since that correctly sets target property/object.
-                list.append(value1.into(), self.gc());
-                list.append(value2.into(), self.gc());
-                list.into()
-            }
-            _ => {
-                let prim_value1 = value1.coerce_to_primitive(None, self)?;
-                let prim_value2 = value2.coerce_to_primitive(None, self)?;
-
-                match (prim_value1.unpack(), prim_value2.unpack()) {
-                    (ValueEnum::String(s), _) => Value::String(AvmString::concat(
-                        self.gc(),
-                        s,
-                        prim_value2.coerce_to_string(self)?,
-                    )),
-                    (_, ValueEnum::String(s)) => Value::String(AvmString::concat(
-                        self.gc(),
-                        prim_value1.coerce_to_string(self)?,
-                        s,
-                    )),
-                    _ => Value::Number(
-                        prim_value1.coerce_to_number(self)? + prim_value2.coerce_to_number(self)?,
-                    ),
-                }
-            }
-        };
+        let sum_value = value1.add(value2, self)?;
 
         self.push_stack(sum_value);
 
@@ -2655,34 +2656,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     fn op_type_of(&mut self) -> Result<(), Error<'gc>> {
         let value = self.pop_stack();
 
-        let type_name = match value.unpack() {
-            ValueEnum::Undefined => istr!(self, "undefined"),
-            ValueEnum::Null => istr!(self, "object"),
-            ValueEnum::Bool(_) => istr!(self, "boolean"),
-            ValueEnum::Number(_) | ValueEnum::Integer(_) => istr!(self, "number"),
-            ValueEnum::Object(o) => {
-                let classes = self.avm2().class_defs();
-
-                if o.as_function_object().is_some() {
-                    if o.instance_class() == classes.function {
-                        istr!(self, "function")
-                    } else {
-                        // Subclasses always have a typeof = "object"
-                        istr!(self, "object")
-                    }
-                } else if o.as_xml_object().is_some() || o.as_xml_list_object().is_some() {
-                    if o.instance_class() == classes.xml_list || o.instance_class() == classes.xml {
-                        istr!(self, "xml")
-                    } else {
-                        // Subclasses always have a typeof = "object"
-                        istr!(self, "object")
-                    }
-                } else {
-                    istr!(self, "object")
-                }
-            }
-            ValueEnum::String(_) => istr!(self, "string"),
-        };
+        let type_name = value.type_of(self);
 
         self.push_stack(Value::String(type_name));
 
@@ -2767,7 +2741,9 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         self.outer.domain()
     }
 
-    fn domain_memory(&self) -> ByteArrayObject<'gc> {
+    /// The current domain's `domainMemory` `ByteArray` (the FlasCC "RAM" backing
+    /// `li*`/`si*`). Public so the JIT's domain-memory helpers can reach it.
+    pub fn domain_memory(&self) -> ByteArrayObject<'gc> {
         self.outer.domain().domain_memory()
     }
 

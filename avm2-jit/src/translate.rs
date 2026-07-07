@@ -17,9 +17,27 @@
 //! The differential tests here pin the *semantics* of the supported ops; gating
 //! by verifier type info is future work.
 
-use ruffle_core::avm2::Op;
+use ruffle_core::avm2::{Op, Value};
 
-use crate::lower::JitOp;
+use crate::lower::{vc, JitOp, SwitchTable};
+
+/// The raw NaN-boxed bits of a primitive constant-push op's `Value`, or `None` if
+/// `op` isn't one of the bakeable constant pushes. All are primitives (no `Gc`), so
+/// the bits are self-contained and stable — computable without an `Activation`.
+fn const_push_bits(op: &Op) -> Option<u64> {
+    let v: Value<'static> = match *op {
+        Op::PushUint { value } => Value::from(value),
+        Op::PushDouble { value } => Value::from(value),
+        Op::PushNull => Value::Null,
+        Op::PushTrue => Value::from(true),
+        Op::PushFalse => Value::from(false),
+        Op::PushUndefined => Value::Undefined,
+        _ => return None,
+    };
+    // SAFETY: `Value` is a `#[repr(transparent)]` NaN-boxed `u64`; these variants
+    // hold no `Gc` pointer, so their bits are a self-contained constant.
+    Some(unsafe { std::mem::transmute::<Value<'static>, u64>(v) })
+}
 
 /// Translates a verified core op slice to [`JitOp`], or returns `None` if it
 /// contains any op outside the supported numeric+control-flow subset.
@@ -45,7 +63,15 @@ pub fn translate(ops: &[Op]) -> Option<Vec<JitOp>> {
             Op::Jump { offset } => JitOp::Jump(offset),
             Op::IfFalse { offset } => JitOp::IfFalse(offset),
             Op::IfTrue { offset } => JitOp::IfTrue(offset),
-            Op::ReturnValue { .. } => JitOp::ReturnValue,
+            // The raw-i32 model returns an `int`; that's only sound when the declared
+            // return type is `int` (or none/`*`). A `:uint`/`:Number`/… return needs
+            // coercion (`:uint` of `-10` → `4294967286`) — decline so the boxed path's
+            // `ReturnValueCoerced` handles it.
+            Op::ReturnValue { return_type } => match return_type {
+                None => JitOp::ReturnValue,
+                Some(c) if c.is_builtin_int() => JitOp::ReturnValue,
+                Some(_) => return None,
+            },
             // Structurally-neutral ops (in the int model): keep them 1:1 so that
             // branch targets (op indices) stay aligned.
             Op::Pop | Op::PushScope => JitOp::Pop,
@@ -57,11 +83,707 @@ pub fn translate(ops: &[Op]) -> Option<Vec<JitOp>> {
     Some(out)
 }
 
+/// Whether `callmethod` JITs. **OFF** — JIT-compiling call-bearing FlasCC methods
+/// deterministically corrupts the C heap (`#1506` in `F_idalloc`, seen with CallMethod
+/// on, gone with it off). The CallMethod *mechanism* verifies correct by inspection
+/// (dispatch matches `op_call_method`, args/receiver/depth/perr all fine) and the
+/// call-aware differential verify finds no per-method divergence, so the root is
+/// still open — likely a runtime effect the verify can't see (e.g. an ESP-restore
+/// leak around the call). Call-bearing methods decline → interpreter (game works).
+/// **Diagnostic: `true`** (+ web `shared_verified()` + `INLINE_DM=false`) to run the
+/// call-only call-aware verify and catch the corruptor. Ship value is `false`.
+const JIT_CALLMETHOD: bool = true;
+
+/// Whether `callproperty`/`callpropvoid` (the multiname method-call form — the hot
+/// FlasCC C-call path) JIT. Only **non-lazy** multinames compile (a lazy multiname
+/// pops its runtime name/namespace off the operand stack in `fill_with_runtime_params`,
+/// which the spill-based arg handling doesn't model — so it declines). Mirrors the
+/// interpreter's `op_call_property`/`op_call_prop_void`; a throw propagates via the
+/// emitted pending-error bail. Shares the arg-spill + `perr` machinery with `callmethod`.
+const JIT_CALLPROP: bool = true;
+
+/// Whether `constructsuper` (invoke the superclass constructor — every class instance
+/// initializer chains to its super ctor, so this is huge in class-heavy content like
+/// Starling) JITs. Mirrors `op_construct_super` (`Activation::super_init`); shares the
+/// arg-spill + `perr` machinery with the call ops. Void (pushes nothing).
+const JIT_CONSTRUCT_SUPER: bool = true;
+
+/// Whether `Op::Call` (call a function *value* on the stack — no receiver/disp-id)
+/// JITs. Mirrors `op_call` (`Value::call`); shares the arg-spill + `perr` machinery.
+const JIT_CALL_VALUE: bool = true;
+
+/// Whether `getpropertyfast` (dynamic-name property read, `arr[i]`/dictionaries) JITs.
+/// Mirrors `op_get_property_fast` (index/dictionary fast path + a `fill_with_runtime_
+/// params` slow fallback) via the arity-3 `gpf` helper. The lazy multiname's runtime
+/// name is on the stack.
+const JIT_GETPROP_FAST: bool = true;
+
+/// Whether `lookupswitch` (a computed multi-way branch — FlasCC's C `switch`) JITs.
+/// Lowered to a nested-block `br_table` over the basic-block dispatch (see
+/// [`crate::lower::compile_with_switches`]); its targets live in a [`SwitchTable`]
+/// side-table because [`JitOp`] is `Copy`.
+const JIT_LOOKUP_SWITCH: bool = true;
+
+/// Whether `pushstring` JITs. A string `Value` holds a `Gc` pointer (not bakeable
+/// at compile time), so — like `getscriptglobals` — the bits are pre-resolved per
+/// run into a side-table (see [`crate::push_string_table`]) and pushed by index.
+const JIT_PUSH_STRING: bool = true;
+
+/// Whether `throw` JITs. Stashes the thrown value as a pending error and returns;
+/// `compile_method` gates it to methods with **no exception handlers** (a local
+/// `catch`/`finally` would intercept the throw, which this simple form can't model).
+const JIT_THROW: bool = true;
+
+/// Whether `newcatch` + full exception dispatch JITs (try/catch/finally). A method
+/// with handlers routes each throwable op (throw, throwing calls, dm-OOB) through
+/// core `Activation::handle_err`; see `lower::compile_full`.
+const JIT_NEWCATCH: bool = true;
+
+/// Whether domainMemory `li*`/`si*` are **inlined** (memory-1 `i32.load`/`store`)
+/// rather than helper calls. **Off** so `si*` funnels through the logging `dm_store`
+/// (core write-log) for the call-only verify. Restore to `cfg!(target_arch =
+/// "wasm32")` once the CallMethod corruptor is found.
+const INLINE_DM: bool = cfg!(target_arch = "wasm32");
+
+/// Confirmed **not** the 1 MB divergence root, so on.
+const JIT_GENERIC_ARITH: bool = true;
+
+/// Whether `coerce <class>` (`ToType`) is JIT'd via the `coerce` import + a per-run
+/// class table. A failing coercion (`#1034`) propagates via `PENDING_ERROR` like a
+/// throwing call, so it joins the `perr` bail/dispatch machinery.
+const JIT_COERCE: bool = true;
+
+/// Whether `astypelate`/`istypelate` (`value as/is Type`) JIT via the arity-2
+/// helpers (a non-class type operand throws `#1041` et al. via `PENDING_ERROR`).
+/// (Bisected off during the Starling-benchmark OOM hunt — proven innocent; the
+/// culprit was the default-domainMemory 1 GiB `SHARED_RESERVE` promotion.)
+const JIT_TYPE_LATE: bool = true;
+
+/// Whether dynamic compares (`lessthan`/`equals`/…) are **inlined** as an `f64`
+/// comparison with a numeric fast path (`CmpNum`) rather than always crossing to
+/// the two-stack helper (`CallHelper2`). The inline path removes the JS-boundary
+/// crossing per compare for the common numeric case (both operands `int` or
+/// `Number`), falling back to the helper only for mixed/object operands.
+const INLINE_CMP: bool = true;
+
+/// Whether bitwise ops (`bitand`/`bitor`/`bitxor`/`lshift`/`rshift`) are **inlined**
+/// as an `i32` op with an int fast path (`BitOpInt`) rather than always crossing to
+/// the two-stack helper. Only int operands take the inline path (an int's low 32
+/// bits are already its `ToInt32`); `Number`/object operands fall back to the helper.
+/// `urshift` is excluded — its `uint` result can exceed `i32` range (different box).
+const INLINE_BITWISE: bool = true;
+
+/// Whether `coerce_i`/`coerce_u` are **inlined** with an int fast path (`CoerceInt`)
+/// — an int passes straight through (`coerce_i`: `ToInt32` of an int is itself;
+/// `coerce_u`: `ToUint32` == the int when non-negative), else the arity-1 helper.
+const INLINE_COERCE: bool = true;
+
+/// Whether generic `multiply`/`subtract`/`divide` are **inlined**. `multiply`/
+/// `subtract` (`ArithInt`) take an int fast path (`i64` op, box `int` if it fits
+/// else `Number`) plus a numeric middle path (f64 op → `Number`); `divide`
+/// (`ArithNum`) inlines the f64 op for numeric operands (always a `Number`).
+/// String/object operands (side-effecting `valueOf` coercion) fall back to the
+/// two-stack helper. `modulo` stays a helper — wasm has no f64 remainder.
+const INLINE_ARITH: bool = true;
+
+/// Whether the [`JitOp::VCall`] family JITs — the generic variadic helper covering
+/// the ops the decline histograms surfaced (`constructslot`/`newclass`/
+/// `setproperty`/`applytype`/`callnative`/`callsuper`/`nextvalue`/`newactivation`/
+/// `construct`/`newarray`/…). Each kind mirrors its interpreter `op_*` in
+/// `helpers::vcall`; a throw propagates via `PENDING_ERROR` like a call.
+const JIT_VCALL: bool = true;
+
+// Indices into [`crate::helpers::HELPERS`] (keep in sync with that table).
+const HELPER_INCREMENT: u32 = 0;
+const HELPER_DECREMENT: u32 = 1;
+const HELPER_NEGATE: u32 = 2;
+const HELPER_BITNOT: u32 = 3;
+const HELPER_NOT: u32 = 4;
+// 5 = to_boolean, 6 = push_scope, 7 = get_scope_object (called implicitly by the
+// branch/scope ops in `lower`, not via `CallHelper`).
+const HELPER_DM_LOAD8: u32 = 8;
+const HELPER_DM_LOAD16: u32 = 9;
+const HELPER_DM_LOAD32: u32 = 10;
+const HELPER_COERCE_U: u32 = 11;
+const HELPER_COERCE_I: u32 = 12;
+const HELPER_SXI1: u32 = 13;
+const HELPER_SXI8: u32 = 14;
+const HELPER_SXI16: u32 = 15;
+
+// Indices into [`crate::helpers::HELPERS2`] — the arity-2 two-stack compares,
+// bitwise, and generic numeric arithmetic.
+const CMP_EQ: u32 = 0;
+const CMP_LT: u32 = 1;
+const CMP_LE: u32 = 2;
+const CMP_GT: u32 = 3;
+const CMP_GE: u32 = 4;
+const BIT_AND: u32 = 5;
+const BIT_OR: u32 = 6;
+const BIT_XOR: u32 = 7;
+const LSHIFT: u32 = 8;
+const RSHIFT: u32 = 9;
+const URSHIFT: u32 = 10;
+const MULTIPLY: u32 = 11;
+const SUBTRACT: u32 = 12;
+const DIVIDE: u32 = 13;
+const MODULO: u32 = 14;
+const STRICT_EQ: u32 = 15;
+const AS_TYPE_LATE: u32 = 16;
+const IS_TYPE_LATE: u32 = 17;
+const ADD: u32 = 18;
+
+// Indices into [`crate::helpers::HELPERS3`] — the arity-3 helpers (keep in sync
+// with that table and `lower::HELPER3_KINDS`).
+const SET_SLOT: u32 = 0;
+const SET_SLOT_NO_COERCE: u32 = 1;
+const SET_SLOT_COERCE_I: u32 = 2;
+const DM_STORE: u32 = 3;
+
+/// Translates to the **boxed** (GC-aware) path: raw `Value`s on the WASM stack,
+/// with ops the int fast path can't do lowered to imported-helper `call`s. Used
+/// when a method isn't int-sound. Handles local moves, boxed constants, unary
+/// helpers, property reads/writes, and **control flow** (branches/loops via the
+/// shared dispatch-loop lowering); bails on anything else (arithmetic, calls, …).
+///
+/// Every value it puts on the stack is a genuine `Value`, so returning any of
+/// them is sound (see the `ReturnValue` arm).
+pub fn translate_boxed(ops: &[Op]) -> Option<(Vec<JitOp>, Vec<SwitchTable>)> {
+    let mut out: Vec<JitOp> = Vec::with_capacity(ops.len());
+    let mut switches: Vec<SwitchTable> = Vec::new();
+    // Running index into the method's multiname table (one entry per getproperty
+    // op, in op order). The runner rebuilds the table in the same order, so these
+    // indices line up (see `WasmJit::try_run`).
+    // The standard method prologue `getlocal0; pushscope` with reads only of
+    // scope 0 means `getscopeobject 0` IS `getlocal0` — compile it as a plain
+    // local read and skip the real scope stack entirely (both the per-pushscope
+    // AND per-read helper crossings; `get_scope_object` was the hottest helper
+    // in an OpenTTD gameplay profile).
+    let scope_this = scope_is_this(ops);
+    // Whether the method reads scopes: only then does `pushscope` need to touch
+    // the real scope stack (otherwise it just discards, as before).
+    let needs_scope =
+        !scope_this && ops.iter().any(|op| matches!(op, Op::GetScopeObject { .. }));
+    let mut next_mn: u32 = 0;
+    let mut next_script: u32 = 0;
+    let mut next_string: u32 = 0;
+    let mut next_coerce: u32 = 0;
+    let mut next_native: u32 = 0;
+    let mut next_ns: u32 = 0;
+    for op in ops {
+        out.push(boxed_op(
+            op,
+            &mut next_mn,
+            &mut next_script,
+            &mut next_string,
+            &mut next_coerce,
+            &mut next_native,
+            &mut next_ns,
+            needs_scope,
+            scope_this,
+            &mut switches,
+        )?);
+    }
+    Some((out, switches))
+}
+
+/// Whether the method's whole scope usage is the standard prologue
+/// `getlocal0; pushscope` — the single push, never popped, only scope index 0
+/// ever read, and local 0 never reassigned. Then every `getscopeobject 0`
+/// provably yields `local0` and the real scope stack can be skipped.
+fn scope_is_this(ops: &[Op]) -> bool {
+    if !matches!(ops, [Op::GetLocal { index: 0 }, Op::PushScope, ..]) {
+        return false;
+    }
+    let single_push = ops.iter().filter(|o| matches!(o, Op::PushScope)).count() == 1;
+    single_push
+        && !ops.iter().any(|o| {
+            matches!(
+                o,
+                Op::PushWith
+                    | Op::PopScope
+                    | Op::GetScopeObject { index: 1.. }
+                    | Op::SetLocal { index: 0 }
+                    | Op::StoreLocal { index: 0 }
+                    | Op::Kill { index: 0 }
+            )
+        })
+}
+
+/// Maps a single core `Op` to its boxed [`JitOp`], or `None` if unsupported.
+/// `next_mn` is the running multiname-table index (bumped by property reads);
+/// `needs_scope` makes `pushscope` push the real scope stack (vs discard). The
+/// single source of truth for what the boxed path supports — [`translate_boxed`]
+/// and the [`first_unsupported_boxed`] diagnostic both go through it.
+#[allow(clippy::too_many_arguments)]
+fn boxed_op(
+    op: &Op,
+    next_mn: &mut u32,
+    next_script: &mut u32,
+    next_string: &mut u32,
+    next_coerce: &mut u32,
+    next_native: &mut u32,
+    next_ns: &mut u32,
+    needs_scope: bool,
+    scope_this: bool,
+    switches: &mut Vec<SwitchTable>,
+) -> Option<JitOp> {
+    Some(match *op {
+        // See [`scope_is_this`]: the only scope entry is the prologue-pushed
+        // `this`, so the read is a plain local-0 load — no helper crossing.
+        Op::GetScopeObject { index: 0 } if scope_this => JitOp::GetLocalValue(0),
+        Op::GetLocal { index } => JitOp::GetLocalValue(index),
+        Op::SetLocal { index } => JitOp::SetLocalValue(index),
+        Op::Increment => JitOp::CallHelper(HELPER_INCREMENT),
+        Op::Decrement => JitOp::CallHelper(HELPER_DECREMENT),
+        Op::Negate => JitOp::CallHelper(HELPER_NEGATE),
+        Op::BitNot => JitOp::CallHelper(HELPER_BITNOT),
+        Op::Not => JitOp::CallHelper(HELPER_NOT),
+        // Verifier `setlocal i; getlocal i` fusion: store but keep on the stack.
+        Op::StoreLocal { index } => JitOp::StoreLocalValue(index),
+        // Int arithmetic (verifier-proven int operands): unbox/op/re-box inline.
+        Op::AddI => JitOp::AddIBoxed,
+        Op::SubtractI => JitOp::SubtractIBoxed,
+        Op::MultiplyI => JitOp::MultiplyIBoxed,
+        Op::IncrementI => JitOp::IncrementIBoxed,
+        Op::DecrementI => JitOp::DecrementIBoxed,
+        // domainMemory (FlasCC "RAM", the hottest FlasCC op). On **web** it's
+        // inlined (`i32.load`/`store` on memory 1 = Ruffle's own linear memory — no
+        // JS-boundary helper crossing). On **native** it stays a helper: memory 1
+        // would be a wasmi mock disconnected from the real (native-RAM) domain
+        // memory, so the real-interpreter differential test can't compare — the
+        // inline codegen is covered by `lower::tests::lowers_dm_inline` instead.
+        Op::Li8 if INLINE_DM => JitOp::DmLoad(1),
+        Op::Li16 if INLINE_DM => JitOp::DmLoad(2),
+        Op::Li32 if INLINE_DM => JitOp::DmLoad(4),
+        Op::Si8 if INLINE_DM => JitOp::DmStore(1),
+        Op::Si16 if INLINE_DM => JitOp::DmStore(2),
+        Op::Si32 if INLINE_DM => JitOp::DmStore(4),
+        // domainMemory float load/store (`lf32`/`lf64`/`sf32`/`sf64`) — inline
+        // `f32`/`f64` access on memory 1 (web only; declines on native, like the int
+        // dm's inline path, covered by `lower::tests::lowers_dm_float_inline`).
+        Op::Lf32 if INLINE_DM => JitOp::DmLoadF(4),
+        Op::Lf64 if INLINE_DM => JitOp::DmLoadF(8),
+        Op::Sf32 if INLINE_DM => JitOp::DmStoreF(4),
+        Op::Sf64 if INLINE_DM => JitOp::DmStoreF(8),
+        Op::Li8 => JitOp::CallHelper(HELPER_DM_LOAD8),
+        Op::Li16 => JitOp::CallHelper(HELPER_DM_LOAD16),
+        Op::Li32 => JitOp::CallHelper(HELPER_DM_LOAD32),
+        Op::Si8 => JitOp::CallHelper3(DM_STORE, 1),
+        Op::Si16 => JitOp::CallHelper3(DM_STORE, 2),
+        Op::Si32 => JitOp::CallHelper3(DM_STORE, 4),
+        // Stack swap + int/uint coercion + sign-extend.
+        Op::Swap => JitOp::SwapValue,
+        Op::CoerceU if INLINE_COERCE => JitOp::CoerceInt(false),
+        Op::CoerceI if INLINE_COERCE => JitOp::CoerceInt(true),
+        Op::CoerceU => JitOp::CallHelper(HELPER_COERCE_U),
+        Op::CoerceI => JitOp::CallHelper(HELPER_COERCE_I),
+        // `coerceb` — `ToBoolean` boxed as a `Boolean` `Value` (inline `to_boolean`).
+        Op::CoerceB => JitOp::CoerceBool,
+        // `coerces` — `ToString` (a throwing `toString` bails via `PENDING_ERROR`).
+        Op::CoerceS => JitOp::CoerceString,
+        // `coerce <class>` — `ToType`. `k` indexes the per-run class table (op order,
+        // matching `coerce_class_table`); a failing coercion bails via `PENDING_ERROR`.
+        Op::Coerce { .. } if JIT_COERCE => {
+            let k = *next_coerce;
+            *next_coerce += 1;
+            JitOp::Coerce(k)
+        }
+        // `strictequals` / `astypelate` / `istypelate` — arity-2 two-stack helpers
+        // (`===`, `value as Type`, `value is Type`). The type ops **throw** on a
+        // non-class type operand (`#1041` et al.) via `PENDING_ERROR` + a post-op
+        // `perr` bail/dispatch, exactly like the interpreter — games do hit this
+        // (e.g. `x is someVar` with a non-class `someVar`) and catch the error.
+        Op::StrictEquals => JitOp::CallHelper2(STRICT_EQ),
+        Op::AsTypeLate if JIT_TYPE_LATE => JitOp::CallHelper2(AS_TYPE_LATE),
+        Op::IsTypeLate if JIT_TYPE_LATE => JitOp::CallHelper2(IS_TYPE_LATE),
+        Op::Sxi1 => JitOp::CallHelper(HELPER_SXI1),
+        Op::Sxi8 => JitOp::CallHelper(HELPER_SXI8),
+        Op::Sxi16 => JitOp::CallHelper(HELPER_SXI16),
+        // Generic (untyped) numeric arithmetic → arity-2 two-stack helpers that
+        // mirror the interpreter's `op_*` (int fast paths + coercion order). `Add`
+        // is deliberately excluded — it may be string concat, not numeric.
+        Op::Multiply if INLINE_ARITH => JitOp::ArithInt(MULTIPLY),
+        Op::Subtract { .. } if INLINE_ARITH => JitOp::ArithInt(SUBTRACT),
+        Op::Divide if INLINE_ARITH => JitOp::ArithNum(DIVIDE),
+        Op::Multiply if JIT_GENERIC_ARITH => JitOp::CallHelper2(MULTIPLY),
+        Op::Subtract { .. } if JIT_GENERIC_ARITH => JitOp::CallHelper2(SUBTRACT),
+        Op::Divide if JIT_GENERIC_ARITH => JitOp::CallHelper2(DIVIDE),
+        Op::Modulo if JIT_GENERIC_ARITH => JitOp::CallHelper2(MODULO),
+        // `add` — numeric add or string concat (`Value::add`). Excluded from the
+        // inline int path (may be concat, not numeric), but the generic two-stack
+        // helper handles both.
+        Op::Add { .. } if JIT_GENERIC_ARITH => JitOp::CallHelper2(ADD),
+        // Dynamic comparisons → a Boolean `Value`. Inlined as an `f64` compare with
+        // a numeric fast path (`CmpNum`) when enabled, else the two-stack helper.
+        Op::Equals if INLINE_CMP => JitOp::CmpNum(CMP_EQ),
+        Op::LessThan if INLINE_CMP => JitOp::CmpNum(CMP_LT),
+        Op::LessEquals if INLINE_CMP => JitOp::CmpNum(CMP_LE),
+        Op::GreaterThan if INLINE_CMP => JitOp::CmpNum(CMP_GT),
+        Op::GreaterEquals if INLINE_CMP => JitOp::CmpNum(CMP_GE),
+        Op::Equals => JitOp::CallHelper2(CMP_EQ),
+        Op::LessThan => JitOp::CallHelper2(CMP_LT),
+        Op::LessEquals => JitOp::CallHelper2(CMP_LE),
+        Op::GreaterThan => JitOp::CallHelper2(CMP_GT),
+        Op::GreaterEquals => JitOp::CallHelper2(CMP_GE),
+        // Bitwise (operands coerced to i32/u32; `<<`/`>>` masked by 0x1F). Inlined
+        // as an `i32` op with an int fast path when enabled (`urshift` stays a helper
+        // — its `uint` result can exceed `i32` range, needing a different box).
+        Op::BitAnd if INLINE_BITWISE => JitOp::BitOpInt(BIT_AND),
+        Op::BitOr if INLINE_BITWISE => JitOp::BitOpInt(BIT_OR),
+        Op::BitXor if INLINE_BITWISE => JitOp::BitOpInt(BIT_XOR),
+        Op::LShift if INLINE_BITWISE => JitOp::BitOpInt(LSHIFT),
+        Op::RShift if INLINE_BITWISE => JitOp::BitOpInt(RSHIFT),
+        Op::BitAnd => JitOp::CallHelper2(BIT_AND),
+        Op::BitOr => JitOp::CallHelper2(BIT_OR),
+        Op::BitXor => JitOp::CallHelper2(BIT_XOR),
+        Op::LShift => JitOp::CallHelper2(LSHIFT),
+        Op::RShift => JitOp::CallHelper2(RSHIFT),
+        Op::URShift => JitOp::CallHelper2(URSHIFT),
+        // Static/slow property reads carry a resolved (non-lazy) multiname; a
+        // slow read's `fill_with_runtime_params` is a no-op for it. `Fast`
+        // (dictionary/index) reads take a runtime name off the stack — not yet
+        // supported.
+        Op::GetPropertyStatic { .. } | Op::GetPropertySlow { .. } => {
+            let k = *next_mn;
+            *next_mn += 1;
+            JitOp::GetProperty(k)
+        }
+        // Dynamic-name read (`arr[i]`): the lazy multiname `k` (name off the stack) —
+        // the `get_property_fast` helper does the fast index/dictionary path or fills
+        // the multiname. Bumps the same multiname counter as the static reads.
+        Op::GetPropertyFast { .. } if JIT_GETPROP_FAST => {
+            let k = *next_mn;
+            *next_mn += 1;
+            JitOp::GetPropertyFast(k)
+        }
+        // The verifier's resolved form of a typed property read: a direct slot
+        // fetch (no multiname). One of the hottest AVM2 ops.
+        Op::GetSlot { index } => JitOp::GetSlot(index as u32),
+        // Boxed constant push (verifier normalizes pushbyte/pushshort → PushInt).
+        Op::PushInt { value } => JitOp::PushIntValue(value),
+        // Other primitive constant pushes — bake the `Value` bits at translate time
+        // (no `Gc`, so it's self-contained). `pushstring`/`pushnamespace` carry a
+        // `Gc`/`Namespace` and are excluded (would need a runtime object).
+        Op::PushUint { .. }
+        | Op::PushDouble { .. }
+        | Op::PushNull
+        | Op::PushTrue
+        | Op::PushFalse
+        | Op::PushUndefined => JitOp::PushConst(const_push_bits(op)?),
+        // `pushstring` — the string `Value` holds a `Gc`, so it can't be baked like
+        // the constants above. `k` indexes the per-run string table (op order,
+        // matching `push_string_table`); the `get_push_string` helper reads it.
+        Op::PushString { .. } if JIT_PUSH_STRING => {
+            let k = *next_string;
+            *next_string += 1;
+            JitOp::PushString(k)
+        }
+        // `throw` — pop a value, raise it as an error. Only sound when the method
+        // has no exception handler (checked in `compile_method`, which has the
+        // method's `exceptions` table); a handler-free throw just propagates out.
+        Op::Throw if JIT_THROW => JitOp::Throw,
+        // `newcatch` — build the catch/finally scope object for handler `index`.
+        Op::NewCatch { index } if JIT_NEWCATCH => JitOp::NewCatch(index as u32),
+        // Slot writes (the resolved form of a typed property write): pop
+        // receiver+value, store into the slot via an arity-3 helper.
+        Op::SetSlot { index } => JitOp::CallHelper3(SET_SLOT, index as u32),
+        Op::SetSlotNoCoerce { index } => JitOp::CallHelper3(SET_SLOT_NO_COERCE, index as u32),
+        Op::SetSlotCoerceI { index } => JitOp::CallHelper3(SET_SLOT_COERCE_I, index as u32),
+        // Control flow. Branch offsets are op indices (verifier-resolved), so
+        // they map straight across. `IfTrue`/`IfFalse` coerce the popped
+        // `Value` to a condition via the `to_boolean` helper (in `lower`).
+        Op::Jump { offset } => JitOp::Jump(offset),
+        Op::IfTrue { offset } => JitOp::IfTrueBoxed(offset),
+        Op::IfFalse { offset } => JitOp::IfFalseBoxed(offset),
+        // `lookupswitch` — pop an int selector, branch to `cases[selector]` (op
+        // index) or `default`. Offsets are verifier-resolved op indices, so they
+        // map straight across. The targets can't fit a `Copy` `JitOp`, so they go
+        // into the `switches` side-table and the op carries its index.
+        Op::LookupSwitch(ls) if JIT_LOOKUP_SWITCH => {
+            let idx = switches.len() as u32;
+            switches.push(SwitchTable {
+                default: ls.default_offset.get(),
+                cases: ls.case_offsets.iter().map(|c| c.get()).collect(),
+            });
+            JitOp::LookupSwitch(idx)
+        }
+        // Every value on the boxed stack is a genuine `Value` (a local read, a
+        // constant, or a helper result), so returning any of them is sound:
+        // `value_from_bits` reconstructs a real (never fabricated) pointer, no
+        // collection happens mid-run, and a by-value return stores into no
+        // `Gc` (needs no write barrier). See `helpers::get_property`.
+        // A declared (non-`*`) `return_type` needs runtime coercion (`:uint` of a
+        // negative int, `:Vector.<T>` of a generic vector, …); `None`/`*` returns raw.
+        Op::ReturnValue {
+            return_type: Some(_),
+        } => JitOp::ReturnValueCoerced,
+        Op::ReturnValue { .. } => JitOp::ReturnValueBoxed,
+        // `returnvoid`: return the value the declared `return_type` coerces to (void/
+        // none → `undefined`, numeric → `0`, boolean → `false`, else `null`).
+        Op::ReturnVoid { return_type } => {
+            JitOp::ReturnVoidBoxed(crate::return_void_bits(return_type))
+        }
+        Op::Dup => JitOp::DupValue,
+        // Scope access. `getscopeobject` reads the method's own local scopes, so
+        // `pushscope` must push the real scope stack when scopes are read; else it
+        // just discards (the scope object is unused).
+        Op::GetScopeObject { index } => JitOp::GetScopeObject(index as u32),
+        // `getouterscope` — a captured/outer scope by index (closures read these).
+        Op::GetOuterScope { index } => JitOp::GetOuterScope(index as u32),
+        // Boxed in-place int local increment/decrement (verifier-proven int local).
+        Op::IncLocalI { index } => JitOp::IncDecLocalIValue(index, true),
+        Op::DecLocalI { index } => JitOp::IncDecLocalIValue(index, false),
+        // `getscriptglobals` — the script's global object. `k` indexes the per-run
+        // pre-resolved script-globals table (in op order), built in `try_run`.
+        Op::GetScriptGlobals { .. } => {
+            let k = *next_script;
+            *next_script += 1;
+            JitOp::GetScriptGlobals(k)
+        }
+        // `callmethod` — a resolved (disp-id) method call. Variadic args are
+        // spilled; a thrown error propagates via the emitted pending-error check.
+        // `JIT_CALLMETHOD` gates it OFF for a bisect: does JIT'ing the C allocator's
+        // call-bearing methods cause the `#1506` divergence? (Flip to `true` to
+        // re-enable once that's resolved.)
+        Op::CallMethod {
+            index,
+            num_args,
+            push_return_value,
+        } if JIT_CALLMETHOD => JitOp::CallMethod(index as u32, num_args, push_return_value),
+        // `callproperty`/`callpropvoid` — a multiname method call (the hot FlasCC
+        // C-call path). Only non-lazy multinames compile (a lazy one consumes runtime
+        // name/ns off the stack, which the spill doesn't model). `k` indexes the run's
+        // multiname table, in op order (matching `lib::multiname_table`); pushes the
+        // result for `callproperty`, discards it for `callpropvoid`.
+        Op::CallProperty { multiname, num_args } if JIT_CALLPROP => {
+            if multiname.has_lazy_component() {
+                return None;
+            }
+            let k = *next_mn;
+            *next_mn += 1;
+            JitOp::CallProperty(k, num_args, true)
+        }
+        Op::CallPropVoid { multiname, num_args } if JIT_CALLPROP => {
+            if multiname.has_lazy_component() {
+                return None;
+            }
+            let k = *next_mn;
+            *next_mn += 1;
+            JitOp::CallProperty(k, num_args, false)
+        }
+        // `constructsuper` — invoke the superclass constructor on the receiver (the
+        // super_init helper reads the activation's bound superclass). Void.
+        Op::ConstructSuper { num_args } if JIT_CONSTRUCT_SUPER => JitOp::ConstructSuper(num_args),
+        // `call` — invoke a function value: stack `[.., function, receiver, args…]`.
+        Op::Call { num_args } if JIT_CALL_VALUE => JitOp::CallValue(num_args),
+        // --- The generic variadic-helper family (`vc` import; see `lower::vc`).
+        // Each kind mirrors its interpreter `op_*` in `helpers::vcall`; extra stack
+        // operands spill through `pca` like call args, throws propagate via
+        // `PENDING_ERROR` + the shared perr bail/dispatch. Multiname forms compile
+        // only non-lazy — except the `*Fast` forms, whose lazy runtime *name* is a
+        // stack operand handled explicitly (like `getpropertyfast`).
+        // `constructslot` — construct the class held in the receiver's slot.
+        Op::ConstructSlot { index, num_args } if JIT_VCALL => {
+            JitOp::VCall(vc::CONSTRUCT_SLOT, index as u32, num_args, true)
+        }
+        // `construct` — construct a constructor value on the stack.
+        Op::Construct { num_args } if JIT_VCALL => JitOp::VCall(vc::CONSTRUCT, 0, num_args, true),
+        // `constructprop` — construct `source.mn(args…)`.
+        Op::ConstructProp { multiname, num_args } if JIT_VCALL => {
+            if multiname.has_lazy_component() {
+                return None;
+            }
+            let k = *next_mn;
+            *next_mn += 1;
+            JitOp::VCall(vc::CONSTRUCT_PROP, k, num_args, true)
+        }
+        // `callsuper` — invoke the superclass's `mn` on the receiver.
+        Op::CallSuper { multiname, num_args } if JIT_VCALL => {
+            if multiname.has_lazy_component() {
+                return None;
+            }
+            let k = *next_mn;
+            *next_mn += 1;
+            JitOp::VCall(vc::CALL_SUPER, k, num_args, true)
+        }
+        // `callnative` — the verifier's direct native-method fast call. The fn
+        // pointer lives in the per-run natives table (`k`, in op order).
+        Op::CallNative { num_args, push_return_value, .. } if JIT_VCALL => {
+            let k = *next_native;
+            *next_native += 1;
+            JitOp::VCall(vc::CALL_NATIVE, k, num_args, push_return_value)
+        }
+        // `applytype` — parameterize a generic class (`Vector.<T>`).
+        Op::ApplyType { num_types } if JIT_VCALL => {
+            JitOp::VCall(vc::APPLY_TYPE, 0, num_types, true)
+        }
+        // `newarray` / `newobject` — literal construction from stack operands
+        // (`newobject` pops name/value *pairs* → spill 2·argc).
+        Op::NewArray { num_args } if JIT_VCALL => JitOp::VCall(vc::NEW_ARRAY, 0, num_args, true),
+        Op::NewObject { num_args } if JIT_VCALL => {
+            JitOp::VCall(vc::NEW_OBJECT, 0, num_args * 2, true)
+        }
+        // `getsuper`/`setsuper` — super-qualified property access.
+        Op::GetSuper { multiname } if JIT_VCALL => {
+            if multiname.has_lazy_component() {
+                return None;
+            }
+            let k = *next_mn;
+            *next_mn += 1;
+            JitOp::VCall(vc::GET_SUPER, k, 0, true)
+        }
+        Op::SetSuper { multiname } if JIT_VCALL => {
+            if multiname.has_lazy_component() {
+                return None;
+            }
+            let k = *next_mn;
+            *next_mn += 1;
+            JitOp::VCall(vc::SET_SUPER, k, 1, false)
+        }
+        // `deleteproperty` — pushes whether the delete succeeded.
+        Op::DeleteProperty { multiname } if JIT_VCALL => {
+            if multiname.has_lazy_component() {
+                return None;
+            }
+            let k = *next_mn;
+            *next_mn += 1;
+            JitOp::VCall(vc::DELETE_PROPERTY, k, 0, true)
+        }
+        // `nextvalue` — enumeration value at the popped index (`for each` loops).
+        Op::NextValue if JIT_VCALL => JitOp::VCall(vc::NEXT_VALUE, 0, 1, true),
+        // `in` — property-existence test (`name in obj`).
+        Op::In if JIT_VCALL => JitOp::VCall(vc::IN, 0, 1, true),
+        // `setproperty` (static multiname) — the write counterpart of
+        // `GetPropertyStatic`. (`SetPropertySlow` — a lazy *namespace* — declines.)
+        Op::SetPropertyStatic { .. } if JIT_VCALL => {
+            let k = *next_mn;
+            *next_mn += 1;
+            JitOp::VCall(vc::SET_PROP_STATIC, k, 1, false)
+        }
+        // `setproperty` (fast/lazy-name) — `arr[i] = v` / dictionary writes; the
+        // runtime name is a stack operand, `k` is the lazy multiname template.
+        Op::SetPropertyFast { .. } if JIT_VCALL => {
+            let k = *next_mn;
+            *next_mn += 1;
+            JitOp::VCall(vc::SET_PROP_FAST, k, 2, false)
+        }
+        // `newclass` — construct the ClassObject for `class` on the popped base.
+        // The class rides the coerce-class table (`next_coerce`, op order), like
+        // `coerce`/`newactivation`.
+        Op::NewClass { .. } if JIT_VCALL => {
+            let k = *next_coerce;
+            *next_coerce += 1;
+            JitOp::VCall(vc::NEW_CLASS, k, 0, true)
+        }
+        // `newactivation` — the method's activation object (closure locals).
+        Op::NewActivation { .. } if JIT_VCALL => {
+            let k = *next_coerce;
+            *next_coerce += 1;
+            JitOp::VCall(vc::NEW_ACTIVATION, k, 0, true)
+        }
+        // `typeof` — the ECMAScript type-name string.
+        Op::TypeOf if JIT_VCALL => JitOp::VCall(vc::TYPE_OF, 0, 0, true),
+        // `pushnamespace` — a NamespaceObject for the `k`-th namespace (per-run table).
+        Op::PushNamespace { .. } if JIT_VCALL => {
+            let k = *next_ns;
+            *next_ns += 1;
+            JitOp::VCall(vc::PUSH_NAMESPACE, k, 0, true)
+        }
+        // `coerce_d` (`ToNumber`) / `convert_s` (`ToString`) — can throw via a
+        // `valueOf`/`toString`, hence the vcall (perr) form, not a plain helper.
+        Op::CoerceD if JIT_VCALL => JitOp::VCall(vc::COERCE_D, 0, 0, true),
+        Op::ConvertS if JIT_VCALL => JitOp::VCall(vc::CONVERT_S, 0, 0, true),
+        Op::PushScope if needs_scope => JitOp::PushScopeReal,
+        // `popscope` pops the real scope stack only when scopes are read; otherwise
+        // (nothing was pushed there) it's a no-op.
+        Op::PopScope if needs_scope => JitOp::PopScopeReal,
+        Op::PopScope => JitOp::Nop,
+        Op::Pop | Op::PushScope => JitOp::Pop,
+        Op::Nop | Op::Kill { .. } => JitOp::Nop,
+        _ => return None,
+    })
+}
+
+/// The variant name of the first op [`translate_boxed`] can't lower (for
+/// decline-reason diagnostics), or `None` if every op is supported (a decline
+/// then came from `lower::compile`, e.g. a non-empty stack across a branch).
+pub fn first_unsupported_boxed(ops: &[Op]) -> Option<String> {
+    // `needs_scope`/`scope_this` don't affect *whether* an op is supported (only
+    // how `pushscope`/`getscopeobject` lower), so any values give the same answer.
+    let mut next_mn = 0;
+    let mut next_script = 0;
+    let mut next_string = 0;
+    let mut next_coerce = 0;
+    let mut next_native = 0;
+    let mut next_ns = 0;
+    let mut switches = Vec::new();
+    ops.iter()
+        .find(|op| {
+            boxed_op(
+                op,
+                &mut next_mn,
+                &mut next_script,
+                &mut next_string,
+                &mut next_coerce,
+                &mut next_native,
+                &mut next_ns,
+                true,
+                false,
+                &mut switches,
+            )
+            .is_none()
+        })
+        .map(op_variant_name)
+}
+
+/// The bare variant name of an `Op` (e.g. `"CallProperty"`), extracted from its
+/// `Debug` form — used to bucket decline reasons.
+fn op_variant_name(op: &Op) -> String {
+    let dbg = format!("{op:?}");
+    dbg.split([' ', '{', '('])
+        .next()
+        .unwrap_or("?")
+        .to_string()
+}
+
+/// Translates to the **double fast path**: unboxed `f64` on the WASM stack,
+/// numeric ops emitted *inline* (no helper calls). Used when a method is
+/// `Number`-typed (see [`crate::analysis::double_sound`]). Straight-line only for
+/// now (no branches); bails otherwise.
+pub fn translate_double(ops: &[Op]) -> Option<Vec<JitOp>> {
+    let mut out = Vec::with_capacity(ops.len());
+    for op in ops {
+        out.push(match *op {
+            Op::GetLocal { index } => JitOp::GetLocalDouble(index),
+            Op::SetLocal { index } => JitOp::SetLocalDouble(index),
+            // Verifier peephole for `setlocal i; getlocal i`: store but keep the
+            // value on the stack.
+            Op::StoreLocal { index } => JitOp::StoreLocalDouble(index),
+            Op::PushDouble { value } => JitOp::PushDouble(value.to_bits()),
+            // General arithmetic — valid as `f64` ops only because `double_sound`
+            // proves both operands are `Number` (so `add` is `f64.add`, never
+            // string concat).
+            Op::Add { .. } => JitOp::AddD,
+            Op::Subtract { .. } => JitOp::SubtractD,
+            Op::Multiply => JitOp::MultiplyD,
+            Op::Divide => JitOp::DivideD,
+            Op::Increment => JitOp::IncrementD,
+            Op::Decrement => JitOp::DecrementD,
+            Op::Negate => JitOp::NegateD,
+            Op::ReturnValue { .. } => JitOp::ReturnDouble,
+            Op::Pop | Op::PushScope => JitOp::Pop,
+            Op::Nop | Op::Kill { .. } => JitOp::Nop,
+            _ => return None,
+        });
+    }
+    Some(out)
+}
+
 /// A tiny reference interpreter over [`JitOp`], mirroring the raw-`i32` model the
 /// WASM lowering compiles to. It is the "interpreter" side of the differential
 /// tests: `compile(ops)` executed under a WASM runtime must agree with this for
 /// every input. Locals are `Value` bit patterns; the operand stack is raw `i32`.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn reference_run(ops: &[JitOp], regs: &[u64]) -> u64 {
     // MUST match `crate::lower::VALUE_INT_MARK`.
     const INT_MARK: u64 = 0xFFFB_0000_0000_0000;
@@ -171,6 +893,71 @@ pub(crate) fn reference_run(ops: &[JitOp], regs: &[u64]) -> u64 {
                 pc = if c != 0 { t } else { pc + 1 };
             }
             JitOp::ReturnValue => return box_int(stack.pop().unwrap()),
+            // Boxed-`Value` / double / helper ops aren't part of the int model.
+            JitOp::GetLocalValue(_)
+            | JitOp::SetLocalValue(_)
+            | JitOp::CallHelper(_)
+            | JitOp::CallHelper2(_)
+            | JitOp::CmpNum(_)
+            | JitOp::BitOpInt(_)
+            | JitOp::ArithInt(_)
+            | JitOp::ArithNum(_)
+            | JitOp::CoerceInt(_)
+            | JitOp::CoerceBool
+            | JitOp::SwapValue
+            | JitOp::ReturnValueBoxed
+            | JitOp::ReturnValueCoerced
+            | JitOp::ReturnVoidBoxed(_)
+            | JitOp::DupValue
+            | JitOp::StoreLocalValue(_)
+            | JitOp::AddIBoxed
+            | JitOp::SubtractIBoxed
+            | JitOp::MultiplyIBoxed
+            | JitOp::IncrementIBoxed
+            | JitOp::DecrementIBoxed
+            | JitOp::GetProperty(_)
+            | JitOp::GetPropertyFast(_)
+            | JitOp::GetSlot(_)
+            | JitOp::PushIntValue(_)
+            | JitOp::PushConst(_)
+            | JitOp::CallHelper3(_, _)
+            | JitOp::IfTrueBoxed(_)
+            | JitOp::IfFalseBoxed(_)
+            | JitOp::PushScopeReal
+            | JitOp::GetScopeObject(_)
+            | JitOp::GetOuterScope(_)
+            | JitOp::IncDecLocalIValue(_, _)
+            | JitOp::CoerceString
+            | JitOp::GetScriptGlobals(_)
+            | JitOp::GetLocalDouble(_)
+            | JitOp::SetLocalDouble(_)
+            | JitOp::StoreLocalDouble(_)
+            | JitOp::PushDouble(_)
+            | JitOp::AddD
+            | JitOp::SubtractD
+            | JitOp::MultiplyD
+            | JitOp::DivideD
+            | JitOp::IncrementD
+            | JitOp::DecrementD
+            | JitOp::NegateD
+            | JitOp::ReturnDouble
+            | JitOp::CallMethod(_, _, _)
+            | JitOp::CallProperty(_, _, _)
+            | JitOp::ConstructSuper(_)
+            | JitOp::CallValue(_)
+            | JitOp::VCall(..)
+            | JitOp::DmLoad(_)
+            | JitOp::DmStore(_)
+            | JitOp::DmLoadF(_)
+            | JitOp::DmStoreF(_)
+            | JitOp::LookupSwitch(_)
+            | JitOp::PushString(_)
+            | JitOp::Throw
+            | JitOp::NewCatch(_)
+            | JitOp::Coerce(_)
+            | JitOp::PopScopeReal => {
+                unreachable!("non-int ops not in the int reference interpreter")
+            }
         }
     }
 }
@@ -220,6 +1007,48 @@ mod tests {
     }
 
     #[test]
+    fn decline_reason_names_the_first_unsupported_op() {
+        // Supported prefix, then an unsupported op → its variant name.
+        // (`CheckFilter` — E4X — isn't in the boxed subset.)
+        let ops = [
+            Op::GetLocal { index: 0 },
+            Op::CheckFilter,
+            Op::ReturnValue { return_type: None },
+        ];
+        assert_eq!(first_unsupported_boxed(&ops).as_deref(), Some("CheckFilter"));
+        // Fully-supported boxed method → no reason (a decline would be `<compile>`).
+        let ok = [Op::GetLocal { index: 0 }, Op::ReturnValue { return_type: None }];
+        assert_eq!(first_unsupported_boxed(&ok), None);
+    }
+
+    #[test]
+    fn vcall_ops_translate_boxed() {
+        // Gc-free vcall kinds map 1:1 (op indices stay aligned for branches).
+        let ops = [
+            Op::GetLocal { index: 0 },
+            Op::PushScope,
+            Op::GetLocal { index: 1 },
+            Op::GetLocal { index: 2 },
+            Op::NewArray { num_args: 2 },
+            Op::TypeOf,
+            Op::ReturnValue { return_type: None },
+        ];
+        let (out, switches) = translate_boxed(&ops).expect("boxed supported");
+        assert!(switches.is_empty());
+        assert_eq!(out[4], JitOp::VCall(vc::NEW_ARRAY, 0, 2, true));
+        assert_eq!(out[5], JitOp::VCall(vc::TYPE_OF, 0, 0, true));
+        // `newobject` spills PAIRS (2·argc); `construct` spills argc.
+        let ops = [
+            Op::NewObject { num_args: 3 },
+            Op::Construct { num_args: 1 },
+            Op::ReturnValue { return_type: None },
+        ];
+        let (out, _) = translate_boxed(&ops).expect("boxed supported");
+        assert_eq!(out[0], JitOp::VCall(vc::NEW_OBJECT, 0, 6, true));
+        assert_eq!(out[1], JitOp::VCall(vc::CONSTRUCT, 0, 1, true));
+    }
+
+    #[test]
     fn translates_compare_and_prologue() {
         let ops = [
             Op::GetLocal { index: 0 },
@@ -252,7 +1081,7 @@ mod diff_tests {
     /// Runs `ops` both ways and asserts equality.
     fn assert_equiv(ops: &[JitOp], regs: &[u64]) {
         let bytes = compile(ops).expect("compiles");
-        let jit = run(&bytes, regs).expect("native runner");
+        let jit = run(&bytes, regs, &crate::lower::manifest(ops)).expect("native runner");
         let interp = reference_run(ops, regs);
         assert_eq!(jit, interp, "JIT != interpreter for regs {regs:?}");
     }
@@ -335,9 +1164,95 @@ mod diff_tests {
             assert_equiv(&ops, &regs);
             // And it computes the actual triangular number.
             let bytes = compile(&ops).unwrap();
-            let got = run(&bytes, &regs).unwrap();
+            let got = run(&bytes, &regs, &crate::lower::manifest(&ops)).unwrap();
             let expected: i32 = (0..n).sum();
             assert_eq!(got, int_bits(expected), "sum({n})");
+        }
+    }
+
+    #[test]
+    fn boxed_render_shaped_loop_terminates_and_sums() {
+        // Mirrors the loop skeleton of Starling's `DynamicBatcher.render` as the
+        // verifier emits it, through the **boxed** path (the real method is
+        // call-bearing → boxed): the bound arrives boxed and is `coerce_i`'d, the
+        // counter steps via `inclocal_i`, entry jumps past the body to the
+        // condition, and the back-edge is `lessthan; iftrue`.
+        use ruffle_core::avm2::Op;
+        let core_ops = [
+            Op::GetLocal { index: 0 },             // 0
+            Op::PushScope,                         // 1
+            Op::GetLocal { index: 1 },             // 2: n (boxed)
+            Op::CoerceI,                           // 3
+            Op::SetLocal { index: 4 },             // 4: n = int(n)
+            Op::PushInt { value: 0 },              // 5
+            Op::SetLocal { index: 5 },             // 6: i = 0
+            Op::PushInt { value: 0 },              // 7
+            Op::SetLocal { index: 2 },             // 8: s = 0
+            Op::Jump { offset: 15 },               // 9: -> condition
+            Op::GetLocal { index: 2 },             // 10: body: s
+            Op::GetLocal { index: 5 },             // 11: i
+            Op::AddI,                              // 12
+            Op::SetLocal { index: 2 },             // 13: s += i
+            Op::IncLocalI { index: 5 },            // 14: i++
+            Op::GetLocal { index: 5 },             // 15: condition: i
+            Op::GetLocal { index: 4 },             // 16: n
+            Op::LessThan,                          // 17
+            Op::IfTrue { offset: 10 },             // 18: -> body
+            Op::GetLocal { index: 2 },             // 19
+            Op::ReturnValue { return_type: None }, // 20
+        ];
+        let (ops, switches) = translate_boxed(&core_ops).expect("boxed supported");
+        assert!(switches.is_empty());
+        let bytes = compile(&ops).expect("compiles");
+        for n in [0, 1, 2, 16, 100] {
+            let regs =
+                [int_bits(0), int_bits(n), int_bits(0), int_bits(0), int_bits(0), int_bits(0)];
+            let got = run(&bytes, &regs, &crate::lower::manifest(&ops)).expect("runs");
+            let expected: i32 = (0..n).sum();
+            assert_eq!(got, int_bits(expected), "sum({n})");
+        }
+    }
+
+    #[test]
+    fn boxed_countdown_loop_terminates_and_sums() {
+        // Mirrors `DisplayObjectContainer.hitTest`'s countdown: `i = n - 1` (with
+        // the verifier's `coerce_i; storelocal; pushint 1; subtract_i` prologue),
+        // entry jumps past the body AND the `declocal_i` step to the condition,
+        // back-edge `greaterequals; iftrue`.
+        use ruffle_core::avm2::Op;
+        let core_ops = [
+            Op::GetLocal { index: 0 },             // 0
+            Op::PushScope,                         // 1
+            Op::GetLocal { index: 1 },             // 2: n (boxed)
+            Op::CoerceI,                           // 3
+            Op::StoreLocal { index: 3 },           // 4: local3 = n (kept on stack)
+            Op::PushInt { value: 1 },              // 5
+            Op::SubtractI,                         // 6: n - 1
+            Op::SetLocal { index: 4 },             // 7: i = n - 1
+            Op::PushInt { value: 0 },              // 8
+            Op::SetLocal { index: 2 },             // 9: s = 0
+            Op::Jump { offset: 16 },               // 10: -> condition (skip the step)
+            Op::GetLocal { index: 2 },             // 11: body: s
+            Op::GetLocal { index: 4 },             // 12: i
+            Op::AddI,                              // 13
+            Op::SetLocal { index: 2 },             // 14: s += i
+            Op::DecLocalI { index: 4 },            // 15: step: i--
+            Op::GetLocal { index: 4 },             // 16: condition: i
+            Op::PushInt { value: 0 },              // 17
+            Op::GreaterEquals,                     // 18: i >= 0
+            Op::IfTrue { offset: 11 },             // 19: -> body
+            Op::GetLocal { index: 2 },             // 20
+            Op::ReturnValue { return_type: None }, // 21
+        ];
+        let (ops, switches) = translate_boxed(&core_ops).expect("boxed supported");
+        assert!(switches.is_empty());
+        let bytes = compile(&ops).expect("compiles");
+        for n in [0, 1, 2, 16, 100] {
+            let regs =
+                [int_bits(0), int_bits(n), int_bits(0), int_bits(0), int_bits(0), int_bits(0)];
+            let got = run(&bytes, &regs, &crate::lower::manifest(&ops)).expect("runs");
+            let expected: i32 = (0..n).sum();
+            assert_eq!(got, int_bits(expected), "countdown sum({n})");
         }
     }
 

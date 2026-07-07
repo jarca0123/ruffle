@@ -765,6 +765,15 @@ impl RuffleInstanceBuilder {
             core.set_allow_fullscreen(self.allow_fullscreen);
             core.set_window_mode(self.wmode.as_deref().unwrap_or("window"));
 
+            // Install the experimental AVM2 WASM JIT. It compiles only the
+            // int-typed numeric+control-flow methods it can prove sound and
+            // declines everything else (including under a strict CSP) to the
+            // interpreter, so this is safe to enable unconditionally.
+            // (`shared_verified()` — the differential diagnostic — is unsound for
+            // event/timer-driven content: it re-runs call-bearing methods 4x and
+            // native side effects multiply. See worker_player.rs.)
+            core.set_avm2_jit_backend(ruffle_avm2_jit::WasmJit::shared());
+
             if matches!(self.device_font_renderer, DeviceFontRenderer::Embedded) {
                 self.setup_fonts(&mut core);
             }

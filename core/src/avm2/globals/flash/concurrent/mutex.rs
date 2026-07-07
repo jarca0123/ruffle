@@ -30,7 +30,12 @@ pub fn lock<'gc>(
     this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    this_mutex(this).shared_mutex().lock();
+    // `lock` returns `false` if the worker was interrupted (terminate requested)
+    // while parked — the mutex is not held. Raise an uncatchable error so the
+    // AS3/FlasCC stack unwinds out to the worker's run loop (avmplus's interrupt).
+    if !this_mutex(this).shared_mutex().lock() {
+        return Err(Error::rust_error("worker terminated".into()));
+    }
     Ok(Value::Undefined)
 }
 

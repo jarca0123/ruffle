@@ -45,6 +45,8 @@ tracing-log = "0.2.0"
 tracing-wasm = { workspace = true }
 ruffle_render_canvas = { path = "../render/canvas", optional = true }
 ruffle_web_common = { path = "common" }
+ruffle_avm2_jit = { path = "../avm2-jit" }
+web-time = "1.1"
 ruffle_render = { path = "../render" }
 ruffle_render_webgl = { path = "../render/webgl", optional = true }
 ruffle_render_gl = { path = "../render/gl", optional = true }
@@ -80,7 +82,9 @@ features = [
     "HtmlInputElement", "HtmlTextAreaElement", "KeyboardEvent", "Location", "PageTransitionEvent", "PointerEvent",
     "Request", "RequestInit", "Response", "Storage", "WheelEvent", "Window", "ReadableStream", "RequestCredentials",
     "Url", "WebGlContextEvent", "Clipboard", "FocusEvent", "FocusOptions", "ShadowRoot", "Gamepad", "GamepadButton", "OffscreenCanvas",
-    "TextMetrics", "OffscreenCanvasRenderingContext2d"
+    "TextMetrics", "OffscreenCanvasRenderingContext2d",
+    "WorkerGlobalScope", "MessageChannel", "MessagePort", "MessageEvent",
+    "DedicatedWorkerGlobalScope"
 ]
 
 [target.'cfg(target_family = "wasm")'.dependencies.getrandom]

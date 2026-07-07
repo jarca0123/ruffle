@@ -88,7 +88,8 @@ pub(crate) fn value_to_shared(value: Value<'_>) -> Option<SharedValue> {
         ValueEnum::Object(o) => {
             if let Some(ba) = o.as_bytearray() {
                 // A `shareable` ByteArray crosses by reference; otherwise it is
-                // copied by value.
+                // copied by value. (No pinning needed: growth moves synchronize
+                // with every accessor — see `SharedByteBuffer`.)
                 match ba.shared_buffer() {
                     Some(buffer) => Some(SharedValue::ByteBuffer(buffer)),
                     None => Some(SharedValue::ByteArrayCopy(ba.bytes().to_vec())),
@@ -270,8 +271,10 @@ pub fn terminate<'gc>(
     let changed = worker.terminate(activation)?;
 
     if changed {
-        // Ask the worker's runtime thread to stop.
+        // Ask the worker's runtime thread to stop, and wake it if it is parked in
+        // a `Condition.wait` / `Mutex.lock` so it observes the flag and unwinds.
         worker.terminate_flag().store(true, Ordering::Relaxed);
+        crate::avm2::worker_shared::wake_blocked_workers();
 
 
         let event = EventObject::bare_default_event(activation.context, "workerState");

@@ -7,7 +7,7 @@ use crate::avm2::error::{
     make_error_1115,
 };
 use crate::avm2::function::{FunctionArgs, exec};
-use crate::avm2::object::{NamespaceObject, Object, TObject};
+use crate::avm2::object::{NamespaceObject, Object, TObject, XmlListObject};
 use crate::avm2::property::Property;
 use crate::avm2::script::TranslationUnit;
 use crate::avm2::vtable::VTable;
@@ -23,7 +23,7 @@ use std::marker::PhantomData;
 use std::mem::size_of;
 use swf::avm2::types::DefaultValue as AbcDefaultValue;
 
-use super::class::Class;
+use super::class::{BuiltinType, Class};
 use super::e4x::E4XNode;
 
 /// Indicate what kind of primitive coercion would be preferred when coercing
@@ -1678,15 +1678,22 @@ impl<'gc> Value<'gc> {
         arguments: FunctionArgs<'_, 'gc>,
         activation: &mut Activation<'_, 'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
+        // Unpack the receiver ONCE for the whole call path (this used to unpack
+        // in `as_object` and again in `vtable`, on every resolved method call).
+        let object = self.as_object();
+
         // TODO: Bound methods should be cached on the Method in a
         // WeakKeyHashMap<Value, FunctionObject>, not on the Object
-        if let Some(object) = self.as_object()
+        if let Some(object) = object
             && let Some(bound_method) = object.get_bound_method(id)
         {
             return bound_method.call(activation, *self, arguments);
         }
 
-        let vtable = self.vtable(activation);
+        let vtable = match object {
+            Some(object) => object.vtable(),
+            None => self.vtable(activation), // primitive receiver
+        };
 
         let full_method = vtable.get_full_method(id).expect("Method should exist");
 
@@ -1707,7 +1714,7 @@ impl<'gc> Value<'gc> {
 
         // TODO: Bound methods should be cached on the Method in a
         // WeakKeyHashMap<Value, FunctionObject>, not on the Object
-        if let Some(object) = self.as_object() {
+        if let Some(object) = object {
             object.install_bound_method(activation.gc(), id, bound_method);
         }
 
@@ -1928,6 +1935,41 @@ impl<'gc> Value<'gc> {
         }
     }
 
+    /// The ECMAScript `typeof` name of this value (the `Op::TypeOf` result).
+    /// Shared by the interpreter's `op_type_of` and the AVM2 JIT's helper.
+    pub fn type_of(&self, activation: &mut Activation<'_, 'gc>) -> AvmString<'gc> {
+        match self.unpack() {
+            ValueEnum::Undefined => istr!(activation, "undefined"),
+            ValueEnum::Null => istr!(activation, "object"),
+            ValueEnum::Bool(_) => istr!(activation, "boolean"),
+            ValueEnum::Number(_) | ValueEnum::Integer(_) => istr!(activation, "number"),
+            ValueEnum::Object(o) => {
+                let classes = activation.avm2().class_defs();
+
+                if o.as_function_object().is_some() {
+                    if o.instance_class() == classes.function {
+                        istr!(activation, "function")
+                    } else {
+                        // Subclasses always have a typeof = "object"
+                        istr!(activation, "object")
+                    }
+                } else if o.as_xml_object().is_some() || o.as_xml_list_object().is_some() {
+                    if o.instance_class() == classes.xml_list
+                        || o.instance_class() == classes.xml
+                    {
+                        istr!(activation, "xml")
+                    } else {
+                        // Subclasses always have a typeof = "object"
+                        istr!(activation, "object")
+                    }
+                } else {
+                    istr!(activation, "object")
+                }
+            }
+            ValueEnum::String(_) => istr!(activation, "string"),
+        }
+    }
+
     /// Coerce the value to another value by type name.
     ///
     /// This function implements a handful of coercion rules that appear to be
@@ -1941,36 +1983,31 @@ impl<'gc> Value<'gc> {
         activation: &mut Activation<'_, 'gc>,
         class: Class<'gc>,
     ) -> Result<Value<'gc>, Error<'gc>> {
-        if class.is_builtin_int() {
-            return Ok(self.coerce_to_i32(activation)?.into());
+        // ONE builtin-type load + match instead of up to seven sequential
+        // `is_builtin_*` calls (each re-read the same Cell) — this runs on every
+        // argument/slot/return coercion, so the dispatch itself showed up in
+        // gameplay profiles. Order preserved: the numeric/boolean coercions come
+        // before the undefined/null check, `String`/`Object` after it.
+        let builtin = class.builtin_type();
+        match builtin {
+            Some(BuiltinType::Int) => return Ok(self.coerce_to_i32(activation)?.into()),
+            Some(BuiltinType::Uint) => return Ok(self.coerce_to_u32(activation)?.into()),
+            Some(BuiltinType::Number) => return Ok(self.coerce_to_number(activation)?.into()),
+            Some(BuiltinType::Boolean) => return Ok(self.coerce_to_boolean().into()),
+            _ => {}
         }
 
-        if class.is_builtin_uint() {
-            return Ok(self.coerce_to_u32(activation)?.into());
-        }
-
-        if class.is_builtin_number() {
-            return Ok(self.coerce_to_number(activation)?.into());
-        }
-
-        if class.is_builtin_boolean() {
-            return Ok(self.coerce_to_boolean().into());
-        }
-
-        if matches!(self.unpack(), ValueEnum::Undefined) || matches!(self.unpack(), ValueEnum::Null)
-        {
-            if class.is_builtin_void() {
+        if matches!(self.unpack(), ValueEnum::Undefined | ValueEnum::Null) {
+            if matches!(builtin, Some(BuiltinType::Void)) {
                 return Ok(Value::Undefined);
             }
             return Ok(Value::Null);
         }
 
-        if class.is_builtin_string() {
-            return Ok(self.coerce_to_string(activation)?.into());
-        }
-
-        if class.is_builtin_object() {
-            return Ok(*self);
+        match builtin {
+            Some(BuiltinType::String) => return Ok(self.coerce_to_string(activation)?.into()),
+            Some(BuiltinType::Object) => return Ok(*self),
+            _ => {}
         }
 
         if let Some(object) = self.as_object()
@@ -2184,11 +2221,26 @@ impl<'gc> Value<'gc> {
             return Ok(a == b);
         }
 
+        // Unpack once and reuse (both the E4X special-cases and the final match
+        // need it); `ValueEnum` is `Copy`.
+        let su = self.unpack();
+        let ou = other.unpack();
+
+        // Fast path: identical objects are equal by reflexivity — even for XML,
+        // where `==` is a content comparison — so short-circuit before the E4X
+        // downcasts below (which are pure overhead for the common plain-object
+        // `a == b` / `x == null` compares).
+        if let (ValueEnum::Object(a), ValueEnum::Object(b)) = (su, ou) {
+            if Object::ptr_eq(a, b) {
+                return Ok(true);
+            }
+        }
+
         // ECMA-357 extends the abstract equality algorithm with steps
         // for XML and XMLList types. Because they are objects in Ruffle we
         // have to be a bit more complicated and factor out the code into
         // a separate method.
-        if let ValueEnum::Object(obj) = self.unpack() {
+        if let ValueEnum::Object(obj) = su {
             if let Some(xml_list_obj) = obj.as_xml_list_object() {
                 return xml_list_obj.equals(other, activation);
             }
@@ -2198,7 +2250,7 @@ impl<'gc> Value<'gc> {
             }
 
             if let Some(self_qname) = obj.as_qname_object()
-                && let ValueEnum::Object(o) = other.unpack()
+                && let ValueEnum::Object(o) = ou
                 && let Some(other_qname) = o.as_qname_object()
             {
                 return Ok(self_qname.uri(activation.strings())
@@ -2208,7 +2260,7 @@ impl<'gc> Value<'gc> {
             }
 
             if let Some(self_ns) = obj.as_namespace_object()
-                && let ValueEnum::Object(o) = other.unpack()
+                && let ValueEnum::Object(o) = ou
                 && let Some(other_ns) = o.as_namespace_object()
             {
                 return Ok(self_ns.namespace().as_uri(activation.strings())
@@ -2216,7 +2268,7 @@ impl<'gc> Value<'gc> {
             }
         }
 
-        if let ValueEnum::Object(obj) = other.unpack() {
+        if let ValueEnum::Object(obj) = ou {
             if let Some(xml_list_obj) = obj.as_xml_list_object() {
                 return xml_list_obj.equals(self, activation);
             }
@@ -2226,7 +2278,7 @@ impl<'gc> Value<'gc> {
             }
         }
 
-        match (&self.unpack(), &other.unpack()) {
+        match (&su, &ou) {
             (ValueEnum::Undefined, ValueEnum::Undefined) => Ok(true),
             (ValueEnum::Null, ValueEnum::Null) => Ok(true),
             (ValueEnum::Integer(a), ValueEnum::Integer(b)) => Ok(a == b),
@@ -2323,6 +2375,66 @@ impl<'gc> Value<'gc> {
         }
 
         Ok(Some(num_self < num_other))
+    }
+
+    /// The AVM2 `add` operation (`self + other`): numeric addition or string
+    /// concatenation, with E4X XML list handling and the general `ToPrimitive`
+    /// fallback. Shared by the interpreter's `op_add` and the JIT's `add` helper.
+    pub fn add(
+        self,
+        other: Value<'gc>,
+        activation: &mut Activation<'_, 'gc>,
+    ) -> Result<Value<'gc>, Error<'gc>> {
+        Ok(match (self.unpack(), other.unpack()) {
+            (ValueEnum::Integer(n1), ValueEnum::Integer(n2)) => {
+                if let Some(res) = n1.checked_add(n2) {
+                    res.into()
+                } else {
+                    ((n1 as i64 + n2 as i64) as f64).into()
+                }
+            }
+            (ValueEnum::Number(n1), ValueEnum::Number(n2)) => (n1 + n2).into(),
+            (ValueEnum::String(s), _) => Value::String(AvmString::concat(
+                activation.gc(),
+                s,
+                other.coerce_to_string(activation)?,
+            )),
+            (_, ValueEnum::String(s)) => Value::String(AvmString::concat(
+                activation.gc(),
+                self.coerce_to_string(activation)?,
+                s,
+            )),
+            (ValueEnum::Object(o1), ValueEnum::Object(o2))
+                if (o1.as_xml_list_object().is_some() || o1.as_xml_object().is_some())
+                    && (o2.as_xml_list_object().is_some() || o2.as_xml_object().is_some()) =>
+            {
+                let list = XmlListObject::new(activation, None, None);
+                // NOTE: `append` correctly sets target property/object.
+                list.append(o1.into(), activation.gc());
+                list.append(o2.into(), activation.gc());
+                list.into()
+            }
+            _ => {
+                let prim1 = self.coerce_to_primitive(None, activation)?;
+                let prim2 = other.coerce_to_primitive(None, activation)?;
+
+                match (prim1.unpack(), prim2.unpack()) {
+                    (ValueEnum::String(s), _) => Value::String(AvmString::concat(
+                        activation.gc(),
+                        s,
+                        prim2.coerce_to_string(activation)?,
+                    )),
+                    (_, ValueEnum::String(s)) => Value::String(AvmString::concat(
+                        activation.gc(),
+                        prim1.coerce_to_string(activation)?,
+                        s,
+                    )),
+                    _ => Value::Number(
+                        prim1.coerce_to_number(activation)? + prim2.coerce_to_number(activation)?,
+                    ),
+                }
+            }
+        })
     }
 }
 

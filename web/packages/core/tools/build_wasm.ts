@@ -137,8 +137,14 @@ function buildWasm(
             "link-arg=--shared-memory",
             "-C",
             "link-arg=--import-memory",
+            // 4 GiB — the wasm32 maximum. domainMemory's stable base commits a
+            // 1 GiB reservation (see core `SHARED_RESERVE`); under the previous
+            // 2 GiB cap that was HALF the address space, and content pushing
+            // past ~1.75 GiB hit `handle_alloc_error` aborts (the JIT now backs
+            // off first — `heap_exhausted` — but the room was simply too small).
+            // Untouched pages cost no resident memory; browsers back them lazily.
             "-C",
-            "link-arg=--max-memory=2147483648",
+            "link-arg=--max-memory=4294967296",
             "-C",
             "link-arg=--export=__heap_base",
             "-C",
@@ -149,6 +155,15 @@ function buildWasm(
             "link-arg=--export=__tls_size",
             "-C",
             "link-arg=--export=__tls_align",
+        );
+        // wasm-opt must be told about the post-MVP features the shared-memory
+        // build uses, or it rejects the atomics / shared memory. With these it can
+        // optimise the threaded module too (exports like __tls_base/__heap_base are
+        // roots, so DCE keeps them).
+        wasmOptFlags.push(
+            "--enable-threads",
+            "--enable-bulk-memory",
+            "--enable-mutable-globals",
         );
     } else if (extensions) {
         rustFlags.push(
@@ -187,16 +202,12 @@ function buildWasm(
         dir: "dist",
         flags: wasmBindgenFlags,
     });
-    if (optimise && !threads) {
+    if (optimise) {
         console.log(`Running wasm-opt on ${flavor}...`);
         runWasmOpt({
             path: `dist/${filename}_bg.wasm`,
             flags: wasmOptFlags,
         });
-    } else if (threads) {
-        // Skip wasm-opt for the shared-memory build: its DCE can strip the
-        // __tls_*/__heap_base exports the thread bootstrap relies on.
-        console.log("Skipping wasm-opt for threaded (shared-memory) build.");
     }
 }
 function detectWasmOpt() {

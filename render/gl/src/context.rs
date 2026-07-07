@@ -142,8 +142,35 @@ where
 /// Creates a GL context from an HTML canvas, preferring WebGL2 and falling back
 /// to a fully-featured WebGL1 path.
 #[cfg(target_family = "wasm")]
+/// A canvas that can vend a WebGL context: either the on-page
+/// [`HtmlCanvasElement`] (renderer on the main thread) or an [`OffscreenCanvas`]
+/// (renderer running on a worker, e.g. the player-in-worker path).
+///
+/// [`OffscreenCanvas`]: web_sys::OffscreenCanvas
+#[cfg(target_family = "wasm")]
+pub(crate) enum WebGlCanvas<'a> {
+    Html(&'a HtmlCanvasElement),
+    Offscreen(&'a web_sys::OffscreenCanvas),
+}
+
+#[cfg(target_family = "wasm")]
+impl WebGlCanvas<'_> {
+    fn get_context_with_context_options(
+        &self,
+        context_id: &str,
+        context_options: &JsValue,
+    ) -> Result<Option<js_sys::Object>, JsValue> {
+        match self {
+            WebGlCanvas::Html(c) => c.get_context_with_context_options(context_id, context_options),
+            WebGlCanvas::Offscreen(c) => {
+                c.get_context_with_context_options(context_id, context_options)
+            }
+        }
+    }
+}
+
 pub(crate) fn create_for_webgl(
-    canvas: &HtmlCanvasElement,
+    canvas: WebGlCanvas<'_>,
     is_transparent: bool,
     quality: StageQuality,
 ) -> Result<CreatedContext, Error> {

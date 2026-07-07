@@ -125,7 +125,7 @@ pub use crate::avm2::object::regexp_object::{RegExpObject, reg_exp_allocator};
 pub use crate::avm2::object::responder_object::{ResponderObject, responder_allocator};
 pub use crate::avm2::object::script_object::{
     ScriptObject, ScriptObjectData, ScriptObjectHandle, ScriptObjectWrapper, get_dynamic_property,
-    scriptobject_allocator,
+    jit_slots_layout, scriptobject_allocator,
 };
 pub use crate::avm2::object::security_domain_object::SecurityDomainObject;
 pub use crate::avm2::object::shader_data_object::{ShaderDataObject, shader_data_allocator};

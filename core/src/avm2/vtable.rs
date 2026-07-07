@@ -14,6 +14,7 @@ use crate::string::{AvmString, StringContext};
 use gc_arena::barrier::{field, unlock};
 use gc_arena::lock::Lock;
 use gc_arena::{Collect, Gc, Mutation};
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 #[derive(Collect, Clone, Copy)]
@@ -60,6 +61,23 @@ struct VTableData<'gc> {
     /// `HashMap` so the entries can be mutated in place through the gc barrier
     /// (see `replace_scopes_with`). Overrides are rare, so linear scan is fine.
     method_overrides: Box<[MethodOverride<'gc>]>,
+
+    /// Lazily-built flat dispatch cache for **inherited** `disp_id`s
+    /// (`< method_base`): `disp_id` → the resolved `ClassBoundMethod`'s address
+    /// (null = absent). Built on the first inherited lookup, so the resolution
+    /// cost is paid ONCE per class — instead of a parent-chain walk plus an
+    /// override scan per level on EVERY `callmethod` (`get_full_method` was the
+    /// bulk of `call_method_with_args`, which dominated Starling gameplay
+    /// profiles: deep display-list hierarchies call inherited methods constantly).
+    ///
+    /// Untraced raw pointers are sound here: every target lives in the
+    /// `own_methods`/`method_overrides` of a vtable on this vtable's `parent`
+    /// chain — kept alive by those traced fields — and gc-arena never moves
+    /// allocations. Post-construction method mutation is interior-only
+    /// (`replace_scopes_with` sets the `scope` locks in place), so cached
+    /// addresses never go stale.
+    #[collect(require_static)]
+    flat_methods: RefCell<Option<Box<[*const ()]>>>,
 }
 
 #[derive(Collect, Clone)]
@@ -272,9 +290,41 @@ impl<'gc> VTable<'gc> {
     }
 
     pub fn get_full_method(self, disp_id: usize) -> Option<&'gc ClassBoundMethod<'gc>> {
-        // Walk the copy-on-write parent chain: methods owned by this class live
-        // in `own_methods`, overridden inherited methods in `method_overrides`,
-        // and everything else is resolved from the superclass vtable.
+        let data = Gc::as_ref(self.0);
+        // Methods owned by this class: a direct index — no walk, no cache.
+        if disp_id >= data.method_base {
+            return data.own_methods.get(disp_id - data.method_base);
+        }
+        // Inherited method: resolve through the flat dispatch cache, built on
+        // the first inherited lookup (see `flat_methods`).
+        let decode = |ptr: *const ()| -> Option<&'gc ClassBoundMethod<'gc>> {
+            if ptr.is_null() {
+                None
+            } else {
+                // SAFETY: the address was taken from a live `ClassBoundMethod`
+                // owned by a parent-chain vtable (see `flat_methods`).
+                Some(unsafe { &*(ptr as *const ClassBoundMethod<'gc>) })
+            }
+        };
+        if let Some(flat) = data.flat_methods.borrow().as_ref() {
+            return decode(*flat.get(disp_id)?);
+        }
+        let flat: Box<[*const ()]> = (0..data.method_base)
+            .map(|id| {
+                self.get_full_method_uncached(id)
+                    .map_or(std::ptr::null(), |m| std::ptr::from_ref(m) as *const ())
+            })
+            .collect();
+        let result = flat.get(disp_id).and_then(|&ptr| decode(ptr));
+        *data.flat_methods.borrow_mut() = Some(flat);
+        result
+    }
+
+    /// The cache-miss resolution behind [`Self::get_full_method`]: walk the
+    /// copy-on-write parent chain — methods owned by a class live in its
+    /// `own_methods`, overridden inherited methods in its `method_overrides`,
+    /// and everything else resolves from the superclass vtable.
+    fn get_full_method_uncached(self, disp_id: usize) -> Option<&'gc ClassBoundMethod<'gc>> {
         let mut vt = self;
         loop {
             let data = Gc::as_ref(vt.0);
@@ -711,6 +761,7 @@ impl<'gc> VTable<'gc> {
             method_base,
             own_methods: own_methods.into_boxed_slice(),
             method_overrides: method_overrides.into_boxed_slice(),
+            flat_methods: RefCell::new(None),
         })
     }
 

@@ -138,6 +138,29 @@ impl<'gc> ScriptObject<'gc> {
     }
 }
 
+/// AVM2-JIT layout ABI for the inline `getslot` fast path: byte offsets, within
+/// an object's `ScriptObjectData` prefix (every `Object` variant's data starts
+/// with it, `#[repr(C)]`), of the slots slice's **data pointer** and **length**
+/// words. The `Box<[T]>` fat-pointer word order isn't guaranteed by rustc, so it
+/// is probed at runtime; `None` if the probe finds neither order (→ the JIT
+/// keeps its helper path). `Value` slots are 8 bytes (`Lock<Value>` is
+/// transparent), so slot `i`'s bits sit at `slots_ptr + i * 8`.
+pub fn jit_slots_layout() -> Option<(u32, u32)> {
+    let slots_off = std::mem::offset_of!(ScriptObjectData<'static, Erased>, slots) as u32;
+    let probe: Box<[u64]> = vec![7u64; 3].into_boxed_slice();
+    let data_addr = probe.as_ptr() as usize;
+    // SAFETY: reading a Box<[u64]>'s two words as integers is a plain bit copy.
+    let words: [usize; 2] = unsafe { std::mem::transmute_copy(&probe) };
+    let word = size_of::<usize>() as u32;
+    if words == [data_addr, 3] {
+        Some((slots_off, slots_off + word))
+    } else if words == [3, data_addr] {
+        Some((slots_off + word, slots_off))
+    } else {
+        None
+    }
+}
+
 impl<'gc, K> ScriptObjectData<'gc, K> {
     #[inline(always)]
     pub fn kind(&self) -> ObjectKind {

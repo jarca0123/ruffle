@@ -54,6 +54,28 @@ pub enum ObjectEncoding {
     Amf3 = 3,
 }
 
+thread_local! {
+    /// Verify-mode domain-memory write log: `(addr, pre-write bytes)`, most-recent
+    /// last. Armed by [`dm_log_start`]. Both the interpreter's `si*` and the JIT's
+    /// `dm_store` helper funnel through [`ByteArrayStorage::dm_set`]/
+    /// [`ByteArrayStorage::dm_write`], so this single per-thread log captures the
+    /// writes of *both* engines — letting the JIT's call-aware verifier roll back a
+    /// run's own (and its callees') domain-memory writes precisely, without a
+    /// whole-buffer restore that would clobber other workers' concurrent writes.
+    static DM_WRITE_LOG: std::cell::RefCell<Option<Vec<(usize, Vec<u8>)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms the domain-memory write log (JIT verify). See [`DM_WRITE_LOG`].
+pub fn dm_log_start() {
+    DM_WRITE_LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
+}
+
+/// Disarms and returns the `(addr, pre-write bytes)` writes since [`dm_log_start`].
+pub fn dm_log_take() -> Vec<(usize, Vec<u8>)> {
+    DM_WRITE_LOG.with(|l| l.borrow_mut().take().unwrap_or_default())
+}
+
 #[derive(Clone, Debug)]
 pub struct ByteArrayStorage {
     /// Underlying ByteArray
@@ -145,6 +167,50 @@ impl ByteArrayStorage {
         }
     }
 
+    /// Set the shared logical length (JIT verify: roll a run's heap growth back so
+    /// each bracketed re-run starts from the same `sbrk` break). Shared only —
+    /// the allocator's grow decision reads [`Self::dm_len`], i.e. the shared length.
+    pub fn dm_set_len(&mut self, len: usize) {
+        if let Some(s) = &self.shared {
+            s.set_len(len);
+        }
+    }
+
+    /// For the JIT's **inline** `li*`/`si*` fast path: ensures domainMemory is
+    /// `shareable` and returns the address of its stable `[base, cap]`
+    /// **descriptor cell** (see [`SharedByteBuffer::desc_ptr`]). The emitted
+    /// code loads base+cap from the cell on every access, so the buffer itself
+    /// may move on growth (no reservation) — even under a live JIT frame. The
+    /// second element is unused (kept for the run ABI). `None` if not shareable.
+    pub fn dm_base_len(&mut self) -> Option<(usize, usize)> {
+        self.make_shareable();
+        self.shared.as_ref().map(|s| (s.desc_ptr(), 0))
+    }
+
+    /// Snapshot the whole domainMemory (the *shared* buffer when shareable — where
+    /// the JIT's inline `si*` writes land — else the local bytes). For the JIT's
+    /// full-domain-memory differential verifier.
+    pub fn dm_snapshot(&self) -> Vec<u8> {
+        match &self.shared {
+            Some(s) => s.snapshot(),
+            None => self.bytes.clone(),
+        }
+    }
+
+    /// Restore domainMemory from a [`Self::dm_snapshot`] (verifier: reset to the
+    /// pre-JIT state before re-running the interpreter).
+    pub fn dm_restore(&mut self, data: &[u8]) {
+        match &self.shared {
+            Some(s) => {
+                s.write(0, data);
+            }
+            None => {
+                let n = data.len().min(self.bytes.len());
+                self.bytes[..n].copy_from_slice(&data[..n]);
+            }
+        }
+    }
+
     /// Read a single domain-memory byte.
     pub fn dm_get(&self, index: usize) -> Option<u8> {
         match &self.shared {
@@ -163,13 +229,17 @@ impl ByteArrayStorage {
                 let mut b = [0u8; N];
                 s.read(index, &mut b).then_some(b)
             }
-            None => self.bytes.get(index..index + N).map(|s| s.try_into().unwrap()),
+            None => index
+                .checked_add(N)
+                .and_then(|end| self.bytes.get(index..end))
+                .map(|s| s.try_into().unwrap()),
         }
     }
 
     /// Write domain-memory bytes at `index` (non-growing); also updates the
     /// local mirror.
     pub fn dm_write(&mut self, index: usize, data: &[u8]) -> Result<(), ByteArrayError> {
+        self.dm_log_write(index, data.len());
         if let Some(s) = &self.shared {
             if !s.write(index, data) {
                 return Err(ByteArrayError::IndexOutOfBounds);
@@ -180,11 +250,25 @@ impl ByteArrayStorage {
 
     /// Write a single domain-memory byte at `index` (non-growing).
     pub fn dm_set(&mut self, index: usize, value: u8) {
+        self.dm_log_write(index, 1);
         if let Some(s) = &self.shared {
             s.write(index, &[value]);
         }
         if index < self.bytes.len() {
             self.bytes[index] = value;
+        }
+    }
+
+    /// If the verify write-log is armed, record the `n` pre-write bytes at `index`
+    /// so the caller can restore exactly this range later. Cheap no-op otherwise.
+    fn dm_log_write(&self, index: usize, n: usize) {
+        if DM_WRITE_LOG.with(|l| l.borrow().is_some()) {
+            let old: Vec<u8> = (0..n).map(|i| self.dm_get(index + i).unwrap_or(0)).collect();
+            DM_WRITE_LOG.with(|l| {
+                if let Some(log) = l.borrow_mut().as_mut() {
+                    log.push((index, old));
+                }
+            });
         }
     }
 

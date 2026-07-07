@@ -1,9 +1,9 @@
 use crate::avm2::op::Op;
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use fnv::FnvHashSet;
 
-pub fn eliminate_dead_code(ops: &[Cell<Op<'_>>], jump_targets: &HashSet<usize>) {
+pub fn eliminate_dead_code(ops: &[Cell<Op<'_>>], jump_targets: &FnvHashSet<usize>) {
     // Remove jumps and the code that they jump over when the code inside the
     // jump is unreachable
     for (i, op) in ops.iter().enumerate() {

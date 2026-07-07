@@ -56,7 +56,17 @@ pub fn wait<'gc>(
     };
 
     match this_condition(this).shared_condition() {
-        Some(cond) => Ok(cond.wait(timeout_ms).into()),
+        Some(cond) => {
+            let woken = cond.wait(timeout_ms);
+            // If the worker was terminated while waiting, `wait` returned without
+            // re-acquiring the mutex. Raise an uncatchable error (avmplus's
+            // interrupt) so the whole AS3/FlasCC stack unwinds out to the worker's
+            // run loop, which then exits.
+            if crate::avm2::worker_shared::worker_terminate_requested() {
+                return Err(Error::rust_error("worker terminated".into()));
+            }
+            Ok(woken.into())
+        }
         None => Ok(false.into()),
     }
 }
