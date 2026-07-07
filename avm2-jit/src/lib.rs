@@ -764,10 +764,10 @@ fn multiname_table(method: Method<'_>) -> Vec<*const ()> {
             // Keep in sync with the ops `translate::boxed_op` assigns a `k` to (it
             // bumps `next_mn` for exactly these, in op order): property reads and
             // writes, multiname calls, and the super/delete vcall kinds. A compiled
-            // method's non-`Fast` multinames are all non-lazy (lazy ones make
-            // `boxed_op` decline), so the sets align.
+            // method's non-`Fast` multinames are all non-lazy (lazy ones — including
+            // every `GetPropertySlow`/`SetPropertySlow` — make `boxed_op` decline),
+            // so the sets align.
             Op::GetPropertyStatic { multiname }
-            | Op::GetPropertySlow { multiname }
             | Op::GetPropertyFast { multiname }
             | Op::CallProperty { multiname, .. }
             | Op::CallPropVoid { multiname, .. }

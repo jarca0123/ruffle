@@ -146,6 +146,8 @@ const GET_OUTER_SCOPE: u32 = 24; // getouterscope (read a captured/outer scope b
 const COERCE_S: u32 = 25; // coerces (ToString; throwing toString → PENDING_ERROR)
 const DM_LOADF32: u32 = 26; // lf32 fallback (inline dm miss → storage read)
 const DM_LOADF64: u32 = 27; // lf64 fallback
+const INCREMENT_I: u32 = 28; // increment_i (wrapping ToInt32+1) — inline inc's non-int fallback
+const DECREMENT_I: u32 = 29; // decrement_i (wrapping ToInt32-1) — inline dec's non-int fallback
 
 /// Pushes the `Value` (i64) bits of the `f64` already held in `SCRATCH_F64` —
 /// canonicalizing NaN to `CANON_NAN` so it doesn't collide with Ruffle's
@@ -209,6 +211,9 @@ pub(crate) fn helper_count(ops: &[JitOp]) -> u32 {
             JitOp::CoerceInt(true) => Some(COERCE_I + 1),
             JitOp::CoerceInt(false) => Some(COERCE_U + 1),
             JitOp::CoerceBool => Some(TO_BOOLEAN + 1),
+            // The inline int inc/dec's non-int fallback (wrapping ToInt32 ± 1).
+            JitOp::IncrementIBoxed | JitOp::IncDecLocalIValue(_, true) => Some(INCREMENT_I + 1),
+            JitOp::DecrementIBoxed | JitOp::IncDecLocalIValue(_, false) => Some(DECREMENT_I + 1),
             // `lookupswitch` coerces its selector to an i32 via the `coerce_i`
             // (ToInt32) helper before the `br_table`, so it must import `h0..=h12`.
             JitOp::LookupSwitch(_) => Some(COERCE_I + 1),
@@ -297,6 +302,10 @@ fn helper2_count(ops: &[JitOp]) -> u32 {
             | JitOp::BitOpInt(i)
             | JitOp::ArithInt(i)
             | JitOp::ArithNum(i) => Some(i + 1),
+            // The inline int arithmetic's non-int fallback (wrapping ToInt32 op).
+            JitOp::AddIBoxed => Some(H2_ADD_I + 1),
+            JitOp::SubtractIBoxed => Some(H2_SUBTRACT_I + 1),
+            JitOp::MultiplyIBoxed => Some(H2_MULTIPLY_I + 1),
             _ => None,
         })
         .max()
@@ -389,6 +398,13 @@ fn dm_throws(ops: &[JitOp]) -> bool {
 const H2_AS_TYPE_LATE: u32 = 16;
 const H2_IS_TYPE_LATE: u32 = 17;
 
+/// The wrapping-int (`_i`) arithmetic helper kinds — the `AddIBoxed`/
+/// `SubtractIBoxed`/`MultiplyIBoxed` inline ops' non-int fallback (`ToInt32` both
+/// operands, wrapping i32 op). Keep in sync with [`crate::helpers::HELPERS2`].
+const H2_ADD_I: u32 = 19;
+const H2_SUBTRACT_I: u32 = 20;
+const H2_MULTIPLY_I: u32 = 21;
+
 /// Whether `op` is a throwing arity-2 helper (`astypelate`/`istypelate`) — these
 /// stash a thrown error in `PENDING_ERROR`, so they must be followed by a `perr`
 /// bail/dispatch, like `coerce`/`coerces`.
@@ -427,7 +443,7 @@ fn is_throwing_prop(op: JitOp) -> bool {
 /// `compile_method` declines those methods.
 pub(crate) fn is_throwing_call_or_dm(op: JitOp) -> bool {
     is_self_bailing_call(op)
-        || matches!(op, JitOp::CoerceString | JitOp::Coerce(_))
+        || matches!(op, JitOp::CoerceString | JitOp::Coerce(_) | JitOp::CoerceInt(_))
         || is_dm_op(op)
         || is_throwing_h2(op)
         || is_throwing_prop(op)
@@ -619,6 +635,11 @@ pub struct Manifest {
     /// Whether the method has any [`JitOp::VCall`] → needs the `vc` import, the
     /// `pca` spill import, and the `perr` import (every kind can throw out of band).
     pub has_vcall: bool,
+    /// Whether the method has an inline `CoerceInt` (`coerce_i`/`coerce_u`) → needs
+    /// the `perr` import: an `Object`→primitive coercion whose `valueOf`/`toString`
+    /// don't yield a primitive throws `#1050` via `PENDING_ERROR` (the helper's
+    /// fallback), so it's dispatched/bailed like any other throwing op.
+    pub has_coerce_int: bool,
 }
 
 impl Manifest {
@@ -655,6 +676,7 @@ impl Manifest {
             has_coerce,
             h2_throws,
             has_vcall,
+            has_coerce_int,
         } = *m;
         self.num_helpers = self.num_helpers.max(num_helpers);
         self.has_getprop |= has_getprop;
@@ -675,6 +697,7 @@ impl Manifest {
         self.has_coerce |= has_coerce;
         self.h2_throws |= h2_throws;
         self.has_vcall |= has_vcall;
+        self.has_coerce_int |= has_coerce_int;
     }
 
     pub fn needs_perr(&self) -> bool {
@@ -686,6 +709,7 @@ impl Manifest {
             || self.dm_throws
             || self.has_coerce_s
             || self.has_coerce
+            || self.has_coerce_int
             || self.h2_throws
             || self.has_getprop
             || self.has_getprop_fast
@@ -727,6 +751,7 @@ pub(crate) fn manifest(ops: &[JitOp]) -> Manifest {
         has_coerce: has_coerce(ops),
         h2_throws: h2_throws(ops),
         has_vcall: ops.iter().any(|op| matches!(op, JitOp::VCall(..))),
+        has_coerce_int: ops.iter().any(|op| matches!(op, JitOp::CoerceInt(_))),
     }
 }
 
@@ -1484,8 +1509,34 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
             body.instruction(&Instruction::LocalGet(SCRATCH64)); // passthrough
             body.instruction(&Instruction::Else);
+            // **Numeric middle path**, pure wasm: numeric with |x| < 2^63 → inline
+            // `ToInt32` (`trunc_sat` + `wrap`). `coerce_i` boxes it as int;
+            // `coerce_u`'s `ToUint32` is the same 32 bits — non-negative → int box,
+            // negative → the `uint` is 2^31..2^32, boxed as `Number`
+            // (`f64.convert_i32_u`), matching `Value::from(u32)`. This covers the
+            // hot `Number`-boxed results (and `coerce_u` of a negative int)
+            // without a helper crossing; NaN/±Inf/huge/non-numeric → the helper.
+            emit_is_int32_able(body, SCRATCH64);
+            body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+            emit_to_int32(body, SCRATCH64);
+            if signed {
+                emit_box_int(body);
+            } else {
+                body.instruction(&Instruction::LocalSet(SCRATCH)); // t = ToInt32
+                body.instruction(&Instruction::LocalGet(SCRATCH));
+                emit_box_int(body); // val1: int box (t >= 0)
+                body.instruction(&Instruction::LocalGet(SCRATCH));
+                body.instruction(&Instruction::F64ConvertI32U);
+                body.instruction(&Instruction::I64ReinterpretF64); // val2: Number box
+                body.instruction(&Instruction::LocalGet(SCRATCH));
+                body.instruction(&Instruction::I32Const(0));
+                body.instruction(&Instruction::I32GeS); // selector: t >= 0
+                body.instruction(&Instruction::Select);
+            }
+            body.instruction(&Instruction::Else);
             body.instruction(&Instruction::LocalGet(SCRATCH64));
             body.instruction(&Instruction::Call(if signed { COERCE_I } else { COERCE_U }));
+            body.instruction(&Instruction::End);
             body.instruction(&Instruction::End);
             // net 0 (pop one, push one)
         }
@@ -1536,23 +1587,66 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             if *depth < 2 {
                 return None;
             }
-            // Stack [a_i64, b_i64] (int `Value`s). Unbox both to i32, op, re-box.
-            body.instruction(&Instruction::I32WrapI64); // b_i32
-            body.instruction(&Instruction::LocalSet(SCRATCH)); // stash b
-            body.instruction(&Instruction::I32WrapI64); // a_i32
-            body.instruction(&Instruction::LocalGet(SCRATCH)); // a_i32, b_i32
-            body.instruction(&match op {
+            // Stack [v1, v2]. Stash (A = v1, B = v2). Both int-boxed → the wrapping
+            // i32 op inline; else → the `_i` helper (wrapping `ToInt32` of both — a
+            // `uint`/`Number`-boxed operand's low 32 box bits are NOT its `ToInt32`,
+            // they're f64-bit garbage; blindly wrapping them corrupted PRNG state in
+            // the `rng` test).
+            body.instruction(&Instruction::LocalSet(SCRATCH64)); // B = v2
+            body.instruction(&Instruction::LocalSet(SCRATCH64_2)); // A = v1
+            emit_is_int(body, SCRATCH64_2);
+            emit_is_int(body, SCRATCH64);
+            body.instruction(&Instruction::I32And);
+            body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+            body.instruction(&Instruction::LocalGet(SCRATCH64_2)); // A
+            body.instruction(&Instruction::I32WrapI64); // a i32
+            body.instruction(&Instruction::LocalGet(SCRATCH64)); // B
+            body.instruction(&Instruction::I32WrapI64); // b i32
+            let arith = match op {
                 JitOp::AddIBoxed => Instruction::I32Add,
                 JitOp::SubtractIBoxed => Instruction::I32Sub,
                 _ => Instruction::I32Mul,
-            });
+            };
+            body.instruction(&arith);
             emit_box_int(body);
+            body.instruction(&Instruction::Else);
+            // **Numeric middle path**, pure wasm: both numeric with |x| < 2^63 →
+            // inline `ToInt32` (`trunc_sat` + `wrap`), wrapping i32 op, int box.
+            // Covers the hot `uint`-in-`Number`-box operands without a helper
+            // crossing; NaN/±Inf/huge (and non-numerics) → the `_i` helper.
+            emit_is_int32_able(body, SCRATCH64_2);
+            emit_is_int32_able(body, SCRATCH64);
+            body.instruction(&Instruction::I32And);
+            body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+            emit_to_int32(body, SCRATCH64_2); // a
+            emit_to_int32(body, SCRATCH64); // b
+            body.instruction(&arith);
+            emit_box_int(body);
+            body.instruction(&Instruction::Else);
+            body.instruction(&Instruction::LocalGet(SCRATCH64_2)); // v1
+            body.instruction(&Instruction::LocalGet(SCRATCH64)); // v2
+            body.instruction(&Instruction::Call(
+                lay.t_base
+                    + match op {
+                        JitOp::AddIBoxed => H2_ADD_I,
+                        JitOp::SubtractIBoxed => H2_SUBTRACT_I,
+                        _ => H2_MULTIPLY_I,
+                    },
+            ));
+            body.instruction(&Instruction::End);
+            body.instruction(&Instruction::End);
             *depth -= 1;
         }
         JitOp::IncrementIBoxed | JitOp::DecrementIBoxed => {
             if *depth < 1 {
                 return None;
             }
+            // int-boxed → inline wrapping i32 `±1`; else → the `increment_i`/
+            // `decrement_i` helper (wrapping `ToInt32 ± 1` — see `AddIBoxed`).
+            body.instruction(&Instruction::LocalSet(SCRATCH64));
+            emit_is_int(body, SCRATCH64);
+            body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+            body.instruction(&Instruction::LocalGet(SCRATCH64));
             body.instruction(&Instruction::I32WrapI64);
             body.instruction(&Instruction::I32Const(1));
             body.instruction(&match op {
@@ -1560,6 +1654,14 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
                 _ => Instruction::I32Sub,
             });
             emit_box_int(body);
+            body.instruction(&Instruction::Else);
+            body.instruction(&Instruction::LocalGet(SCRATCH64));
+            body.instruction(&Instruction::Call(if matches!(op, JitOp::IncrementIBoxed) {
+                INCREMENT_I
+            } else {
+                DECREMENT_I
+            }));
+            body.instruction(&Instruction::End);
         }
         JitOp::PushScopeReal => {
             if *depth < 1 {
@@ -1610,11 +1712,16 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             body.instruction(&Instruction::Call(lay.coerce_index));
         }
         JitOp::IncDecLocalIValue(index, inc) => {
-            // `local[index] ±= 1` in place: load the int-boxed local, `±1`, re-box,
-            // store. No operand-stack effect.
+            // `local[index] ±= 1` in place: load the local, `±1` (inline when
+            // int-boxed, the wrapping-`ToInt32` helper otherwise — see
+            // `IncrementIBoxed`), re-box, store. No operand-stack effect.
             body.instruction(&Instruction::LocalGet(STATE_PTR)); // store address
             body.instruction(&Instruction::LocalGet(STATE_PTR));
             body.instruction(&Instruction::I64Load(slot(index)));
+            body.instruction(&Instruction::LocalSet(SCRATCH64));
+            emit_is_int(body, SCRATCH64);
+            body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+            body.instruction(&Instruction::LocalGet(SCRATCH64));
             body.instruction(&Instruction::I32WrapI64);
             body.instruction(&Instruction::I32Const(1));
             body.instruction(&if inc {
@@ -1625,6 +1732,10 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             body.instruction(&Instruction::I64ExtendI32U);
             body.instruction(&Instruction::I64Const(VALUE_INT_MARK as i64));
             body.instruction(&Instruction::I64Or);
+            body.instruction(&Instruction::Else);
+            body.instruction(&Instruction::LocalGet(SCRATCH64));
+            body.instruction(&Instruction::Call(if inc { INCREMENT_I } else { DECREMENT_I }));
+            body.instruction(&Instruction::End);
             body.instruction(&Instruction::I64Store(slot(index)));
         }
         JitOp::GetScriptGlobals(k) => {
@@ -2208,6 +2319,31 @@ fn emit_is_numeric(body: &mut Function, local: u32) {
     body.instruction(&Instruction::I64Const(VALUE_INT_MARK as i64));
     body.instruction(&Instruction::I64Eq); // is_int
     body.instruction(&Instruction::I32Or);
+}
+
+/// Pushes i32 `1` if the `Value` in `local` is numeric with `|numval| < 2^63` —
+/// the precondition for the pure-wasm `ToInt32` ([`emit_to_int32`]). NaN and ±Inf
+/// fail the `<` compare, so they (like non-numerics) fall to the helper path.
+/// (On a non-numeric value `emit_numval` reinterprets pointer bits as f64 —
+/// garbage but pure, and the `is_numeric` conjunct zeroes the result.)
+fn emit_is_int32_able(body: &mut Function, local: u32) {
+    emit_is_numeric(body, local);
+    emit_numval(body, local);
+    body.instruction(&Instruction::F64Abs);
+    body.instruction(&Instruction::F64Const(9_223_372_036_854_775_808.0)); // 2^63
+    body.instruction(&Instruction::F64Lt);
+    body.instruction(&Instruction::I32And);
+}
+
+/// Pushes the wrapping ECMA `ToInt32` (i32) of the numeric `Value` in `local`,
+/// pure wasm — no helper crossing. Caller must guarantee
+/// [`emit_is_int32_able`]: then `i64.trunc_sat_f64_s` is exact (no saturation)
+/// and its low 32 bits are exactly `ToInt32` (mod 2^32, two's complement) —
+/// including the hot `uint`-in-`Number`-box case (2^31..2^32).
+fn emit_to_int32(body: &mut Function, local: u32) {
+    emit_numval(body, local);
+    body.instruction(&Instruction::I64TruncSatF64S);
+    body.instruction(&Instruction::I32WrapI64);
 }
 
 /// Pushes the `f64` numeric value of the (caller-guaranteed numeric) `Value` in
@@ -3449,16 +3585,42 @@ mod tests {
 
         // (signed, fallback_helper_index, cases)
         let variants: &[(bool, u32, &[(u64, u64)])] = &[
-            // coerce_i: int passes through; a Number hits the helper (h12).
-            (true, 12, &[(int(5), int(5)), (int(-7), int(-7)), (num(3.14), FALLBACK)]),
-            // coerce_u: non-negative int passes through; a negative int or a Number
-            // hits the helper (h11).
-            (false, 11, &[(int(5), int(5)), (int(-1), FALLBACK), (num(1.0), FALLBACK)]),
+            // coerce_i: int passes through; a finite Number takes the inline
+            // `ToInt32` (trunc toward zero, wrapping mod 2^32); NaN/±Inf hit the
+            // helper (h12).
+            (
+                true,
+                12,
+                &[
+                    (int(5), int(5)),
+                    (int(-7), int(-7)),
+                    (num(3.14), int(3)),
+                    (num(-3.99), int(-3)),
+                    (num(4294967296.0), int(0)), // 2^32 wraps to 0
+                    (num(f64::NAN), FALLBACK),
+                    (num(f64::INFINITY), FALLBACK),
+                ],
+            ),
+            // coerce_u: non-negative int passes through; a negative int / finite
+            // Number takes the inline `ToUint32` (int box when ≤ i32::MAX, else a
+            // `Number` box); NaN hits the helper (h11).
+            (
+                false,
+                11,
+                &[
+                    (int(5), int(5)),
+                    (int(-1), num(4294967295.0)),
+                    (num(1.0), int(1)),
+                    (num(2147483648.0), num(2147483648.0)),
+                    (num(f64::NAN), FALLBACK),
+                ],
+            ),
         ];
         for &(signed, fb_idx, cases) in variants {
             let ops = [JitOp::GetLocalValue(1), JitOp::CoerceInt(signed), JitOp::ReturnValueBoxed];
             let m = manifest(&ops);
             assert_eq!(m.num_helpers, fb_idx + 1); // h0..h{fb_idx}
+            assert!(m.needs_perr()); // CoerceInt is a throwing op (helper can #1050)
             let bytes = compile(&ops).expect("compiles");
             for &(a, want) in cases {
                 let engine = Engine::default();
@@ -3475,6 +3637,8 @@ mod tests {
                     };
                     externs.push(f.into());
                 }
+                // `perr` (no pending error) — imported right after the h helpers.
+                externs.push(Func::wrap(&mut store, || -> i32 { 0 }).into());
                 externs.push(memory.into());
                 let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
                 let run = instance
@@ -4139,9 +4303,12 @@ mod tests {
         assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).unwrap() as u64, 2 | 0xABC0);
     }
 
-    // Boxed in-place int local inc/dec: `local0 = 5; ++;++;-- → 6`.
+    // Boxed in-place int local inc/dec: `local0 = 5; ++;++;-- → 6`. The non-int
+    // fallback pulls in the `increment_i`/`decrement_i` helper imports (h28/h29),
+    // stubbed as identity here — the int-boxed input must never reach them.
     #[test]
     fn lowers_inc_dec_local_i() {
+        use wasmi::{Engine, Func, Instance, Memory, MemoryType as WMemoryType, Module, Store};
         let ops = [
             JitOp::IncDecLocalIValue(0, true),
             JitOp::IncDecLocalIValue(0, true),
@@ -4149,8 +4316,25 @@ mod tests {
             JitOp::GetLocalValue(0),
             JitOp::ReturnValueBoxed,
         ];
+        let m = manifest(&ops);
+        assert_eq!(m.num_helpers, DECREMENT_I + 1); // h0..h29 (inc/dec_i fallbacks)
         let bytes = compile(&ops).expect("compiles");
-        assert_eq!(run(&bytes, &[VALUE_INT_MARK | 5]), VALUE_INT_MARK | 6);
+
+        let engine = Engine::default();
+        let module = Module::new(&engine, &bytes).expect("valid wasm");
+        let mut store = Store::new(&engine, ());
+        let memory = Memory::new(&mut store, WMemoryType::new(1, None).unwrap()).unwrap();
+        memory.write(&mut store, 0, &(VALUE_INT_MARK | 5).to_le_bytes()).unwrap();
+        let mut externs: Vec<wasmi::Extern> = Vec::new();
+        for _ in 0..m.num_helpers {
+            externs.push(Func::wrap(&mut store, |a: i64| -> i64 { a }).into());
+        }
+        externs.push(memory.into());
+        let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
+        let run = instance
+            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .expect("run export");
+        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).unwrap() as u64, VALUE_INT_MARK | 6);
     }
 
     // Boxed primitive constant push: `PushConst(bits)` puts exactly `bits` on the
@@ -4249,6 +4433,7 @@ mod tests {
     // difference on the stack, must round-trip through the box.
     #[test]
     fn lowers_boxed_int_arithmetic() {
+        use wasmi::{Engine, Func, Instance, Memory, MemoryType as WMemoryType, Module, Store};
         let ops = [
             JitOp::GetLocalValue(1),
             JitOp::GetLocalValue(2),
@@ -4259,14 +4444,54 @@ mod tests {
             JitOp::IncrementIBoxed,
             JitOp::ReturnValueBoxed,
         ];
+        let m = manifest(&ops);
+        assert_eq!(m.num_helpers, INCREMENT_I + 1); // h0..h28 (increment_i fallback)
+        assert_eq!(m.num_helpers2, H2_MULTIPLY_I + 1); // t0..t21 (_i helper fallbacks)
         let bytes = compile(&ops).expect("compiles");
+
+        // The h stubs are identity, the t stubs a sentinel: int-boxed and finite
+        // `Number` operands must stay on the inline paths and never reach either.
+        let run = |slots: &[u64]| -> u64 {
+            let engine = Engine::default();
+            let module = Module::new(&engine, &bytes).expect("valid wasm");
+            let mut store = Store::new(&engine, ());
+            let memory = Memory::new(&mut store, WMemoryType::new(1, None).unwrap()).unwrap();
+            let mut buf = Vec::new();
+            for s in slots {
+                buf.extend_from_slice(&s.to_le_bytes());
+            }
+            memory.write(&mut store, 0, &buf).unwrap();
+            let mut externs: Vec<wasmi::Extern> = Vec::new();
+            for _ in 0..m.num_helpers {
+                externs.push(Func::wrap(&mut store, |a: i64| -> i64 { a }).into());
+            }
+            for _ in 0..m.num_helpers2 {
+                externs.push(Func::wrap(&mut store, |_a: i64, _b: i64| -> i64 { 0xDEAD }).into());
+            }
+            externs.push(memory.into());
+            let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
+            let run = instance
+                .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+                .expect("run export");
+            run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs") as u64
+        };
+
         // a=10, b=3: (10-3)*10 + 1 = 71.
         let slots = [int_value_bits(0), int_value_bits(10), int_value_bits(3), int_value_bits(0)];
-        assert_eq!(run(&bytes, &slots), int_value_bits(71));
+        assert_eq!(run(&slots), int_value_bits(71));
         // And local3 got the difference (7), stored mid-expression.
         let neg = [int_value_bits(0), int_value_bits(-2), int_value_bits(5), int_value_bits(0)];
         // (-2 - 5) * -2 + 1 = 15.
-        assert_eq!(run(&bytes, &neg), int_value_bits(15));
+        assert_eq!(run(&neg), int_value_bits(15));
+        // A `uint`-in-`Number`-box operand (4294967295 → ToInt32 = -1) takes the
+        // inline numeric middle path: (-1 - 3) * -1 + 1 = 5.
+        let unsigned = [
+            int_value_bits(0),
+            4294967295.0f64.to_bits(),
+            int_value_bits(3),
+            int_value_bits(0),
+        ];
+        assert_eq!(run(&unsigned), int_value_bits(5));
     }
 
     #[test]

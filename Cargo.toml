@@ -177,6 +177,28 @@ opt-level = 3
 [profile.dev.package.nihav_duck]
 opt-level = 3
 
+# The AVM2 JIT executes its emitted modules through the wasmi interpreter on
+# native (tests). Unoptimized wasmi is 10-50x slower — enough that exception-heavy
+# JIT'd content (the avmplus mops range tests: ~800k throw/catch through JIT'd
+# `li*`) blows test timeouts that pass fine optimized.
+[profile.dev.package.wasmi]
+opt-level = 3
+
+[profile.dev.package.wasmi_core]
+opt-level = 3
+
+[profile.dev.package.wasmi_collections]
+opt-level = 3
+
+[profile.dev.package.wasmi_ir]
+opt-level = 3
+
+# The JIT's own per-call path (run context install, register snapshot, helper
+# dispatch) runs once per JIT'd method invocation — millions per exception-heavy
+# test — so it gets the same treatment as wasmi.
+[profile.dev.package.ruffle_avm2_jit]
+opt-level = 3
+
 # TODO: Set rustflags here instead of in tools/build_wasm.ts, when that
 # feature becomes stable. See: https://github.com/rust-lang/cargo/issues/10271
 # Until then, these custom profiles let cargo keep the build cache alive

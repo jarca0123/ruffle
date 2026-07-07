@@ -259,10 +259,19 @@ pub fn translate_boxed(ops: &[Op]) -> Option<(Vec<JitOp>, Vec<SwitchTable>)> {
     // AND per-read helper crossings; `get_scope_object` was the hottest helper
     // in an OpenTTD gameplay profile).
     let scope_this = scope_is_this(ops);
-    // Whether the method reads scopes: only then does `pushscope` need to touch
-    // the real scope stack (otherwise it just discards, as before).
-    let needs_scope =
-        !scope_this && ops.iter().any(|op| matches!(op, Op::GetScopeObject { .. }));
+    // Whether the method reads OR captures scopes: only then does `pushscope`
+    // need to touch the real scope stack (otherwise it just discards, as before).
+    // `newclass` *captures* the current scope chain (`ClassObject::from_class` →
+    // `create_scopechain`) as the class's outer scope — every method of the new
+    // class resolves outer scopes through it. Discarding the pushes there compiled
+    // a wrong (shorter) class scope into being: the class's methods then read the
+    // wrong outer scope and e.g. `getglobalslot` hit the class object instead of
+    // the global (`#1026 Slot N exceeds slotCount=0 of Test$`). `NewClass` is the
+    // only scope-capturing op that compiles (`newfunction`/`callstatic`/`findprop*`
+    // all decline); the capture needs the real stack even when `scope_this` holds.
+    let captures_scope = ops.iter().any(|op| matches!(op, Op::NewClass { .. }));
+    let needs_scope = captures_scope
+        || (!scope_this && ops.iter().any(|op| matches!(op, Op::GetScopeObject { .. })));
     let mut next_mn: u32 = 0;
     let mut next_script: u32 = 0;
     let mut next_string: u32 = 0;
@@ -439,15 +448,18 @@ fn boxed_op(
         Op::LShift => JitOp::CallHelper2(LSHIFT),
         Op::RShift => JitOp::CallHelper2(RSHIFT),
         Op::URShift => JitOp::CallHelper2(URSHIFT),
-        // Static/slow property reads carry a resolved (non-lazy) multiname; a
-        // slow read's `fill_with_runtime_params` is a no-op for it. `Fast`
-        // (dictionary/index) reads take a runtime name off the stack — not yet
-        // supported.
-        Op::GetPropertyStatic { .. } | Op::GetPropertySlow { .. } => {
+        // Static property reads carry a resolved (non-lazy) multiname — the
+        // verifier only emits `GetPropertyStatic` for those. `Slow` reads are the
+        // opposite: *always* lazy (a runtime namespace, or a runtime name that
+        // isn't a valid dynamic name), so the interpreter pops the runtime
+        // params off the operand stack in `fill_with_runtime_params` — which the
+        // `GetProperty(k)` helper doesn't model. They decline (below).
+        Op::GetPropertyStatic { .. } => {
             let k = *next_mn;
             *next_mn += 1;
             JitOp::GetProperty(k)
         }
+        Op::GetPropertySlow { .. } => return None,
         // Dynamic-name read (`arr[i]`): the lazy multiname `k` (name off the stack) —
         // the `get_property_fast` helper does the fast index/dictionary path or fills
         // the multiname. Bumps the same multiname counter as the static reads.

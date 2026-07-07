@@ -19,21 +19,98 @@
 /// order) to [`crate::helpers`], which reach the current activation via
 /// [`crate::helpers::with_activation`] set by the caller. `None` if the module
 /// fails to compile/instantiate/run.
+/// A ready-to-call wasmi instance for one compiled method: the store owns the
+/// instance, its frame memory, and the bound helper imports; `run` is the typed
+/// export. Pooled per method and reused across calls — the module has **no
+/// globals**, so its only state is the frame memory, which every call overwrites
+/// (registers at offset 0) before running.
+#[cfg(not(target_arch = "wasm32"))]
+struct PooledRun {
+    store: wasmi::Store<()>,
+    memory: wasmi::Memory,
+    run: wasmi::TypedFunc<(i32, i32, i32, i32, i32), i64>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// The single shared wasmi engine — modules and stores must share one.
+    static NATIVE_ENGINE: wasmi::Engine = wasmi::Engine::default();
+    /// Compiled wasmi modules, keyed by `bytes.as_ptr()` (stable/unique — the
+    /// `Rc<[u8]>` lives in `WasmJit`'s never-evicted cache, mirroring the web
+    /// `MODULE_CACHE`). `Module::new` (validation + translation) is the costly
+    /// step and used to run **per call** — hot methods called thousands of times
+    /// (the avmplus `Date` suites, `rng`) re-translated their module every
+    /// invocation and blew the script-execution time limit.
+    static NATIVE_MODULES: std::cell::RefCell<fnv::FnvHashMap<usize, wasmi::Module>> =
+        std::cell::RefCell::new(fnv::FnvHashMap::default());
+    /// Ready instances per method (same key). Popped for the duration of a call
+    /// and pushed back after, so a re-entrant call (a helper running AS3 that
+    /// re-enters the same JIT'd method) finds the pool empty and builds a fresh
+    /// instance instead of aliasing a live frame. Building one
+    /// (`Store` + `Memory` + ~a dozen `Func::wrap` + `Instance::new`) per CALL —
+    /// millions of them in the avmplus mops range tests, which throw/catch
+    /// `#1506` ~800k times through JIT'd `LI*` — was the dominant cost; pooled,
+    /// a call is a regs memcpy + the wasmi call.
+    static NATIVE_INSTANCES: std::cell::RefCell<fnv::FnvHashMap<usize, Vec<PooledRun>>> =
+        std::cell::RefCell::new(fnv::FnvHashMap::default());
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub fn run(bytes: &[u8], regs: &[u64], m: &crate::lower::Manifest) -> Option<u64> {
-    use wasmi::{Engine, Extern, Func, Instance, Memory, MemoryType, Module, Store};
+    let key = bytes.as_ptr() as usize;
+    let pooled = NATIVE_INSTANCES.with(|p| p.borrow_mut().get_mut(&key).and_then(Vec::pop));
+    let mut pr = match pooled {
+        Some(pr) => pr,
+        None => build_instance(bytes, m)?,
+    };
 
-    let engine = Engine::default();
-    let module = Module::new(&engine, bytes).ok()?;
+    // Write the frame registers at offset 0. `Value` bit patterns are written
+    // little-endian; on LE hosts that's the in-memory representation, so write
+    // the slice directly.
+    #[cfg(target_endian = "little")]
+    // SAFETY: viewing `[u64]` as bytes is always valid.
+    let buf = unsafe { std::slice::from_raw_parts(regs.as_ptr().cast::<u8>(), regs.len() * 8) };
+    #[cfg(not(target_endian = "little"))]
+    let buf = &{
+        let mut v = Vec::with_capacity(regs.len() * 8);
+        for r in regs {
+            v.extend_from_slice(&r.to_le_bytes());
+        }
+        v
+    }[..];
+    pr.memory.write(&mut pr.store, 0, buf).ok()?;
+
+    // `run(state_ptr, dm_base, dm_len, regs_ptr, regs_len)`. Native production
+    // modules use the helper path for domainMemory (never `has_dm`) and the frame
+    // was written into the wasmi memory above (no register-copy prologue on
+    // native), so everything but `state_ptr` is unused → 0.
+    let result = pr.run.call(&mut pr.store, (0, 0, 0, 0, 0)).ok();
+    // Return the instance to the pool even on a trap — traps don't poison a
+    // wasmi store, and the next call rewrites the frame anyway.
+    NATIVE_INSTANCES.with(|p| p.borrow_mut().entry(key).or_default().push(pr));
+    result.map(|v| v as u64)
+}
+
+/// Builds a [`PooledRun`] for `bytes`: compiles the module (cached), creates a
+/// store + frame memory, binds the helper imports, and instantiates.
+#[cfg(not(target_arch = "wasm32"))]
+fn build_instance(bytes: &[u8], m: &crate::lower::Manifest) -> Option<PooledRun> {
+    use wasmi::{Extern, Func, Instance, Memory, MemoryType, Module, Store};
+
+    let engine = NATIVE_ENGINE.with(Clone::clone);
+    let module = NATIVE_MODULES.with(|cache| {
+        match cache.borrow_mut().entry(bytes.as_ptr() as usize) {
+            std::collections::hash_map::Entry::Occupied(e) => Some(e.get().clone()),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let module = Module::new(&engine, bytes).ok()?;
+                Some(v.insert(module).clone())
+            }
+        }
+    })?;
     let mut store = Store::new(&engine, ());
 
     // One 64 KiB page holds 8192 slots — far more than any real frame.
     let memory = Memory::new(&mut store, MemoryType::new(1, None).ok()?).ok()?;
-    let mut buf = Vec::with_capacity(regs.len() * 8);
-    for r in regs {
-        buf.extend_from_slice(&r.to_le_bytes());
-    }
-    memory.write(&mut store, 0, &buf).ok()?;
 
     // Imports in declaration order — matching `lower::compile`: arity-1 helpers
     // h0..h{N-1}, then (if used) arity-2 `gp`/`gs`, then the used arity-3 set
@@ -142,15 +219,11 @@ pub fn run(bytes: &[u8], regs: &[u64], m: &crate::lower::Manifest) -> Option<u64
     externs.push(memory.into());
 
     let instance = Instance::new(&mut store, &module, &externs).ok()?;
-    // `run(state_ptr, dm_base, dm_len, regs_ptr, regs_len)`. Native production
-    // modules use the helper path for domainMemory (never `has_dm`) and the frame
-    // was written into the wasmi memory above (no register-copy prologue on
-    // native), so everything but `state_ptr` is unused → 0.
     // (The inline dm path + memory 1 is exercised by `lower::tests::lowers_dm_inline`.)
     let run = instance
         .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
         .ok()?;
-    Some(run.call(&mut store, (0, 0, 0, 0, 0)).ok()? as u64)
+    Some(PooledRun { store, memory, run })
 }
 
 /// Web execution: hand the emitted bytes to the browser's own WASM engine.

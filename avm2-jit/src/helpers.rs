@@ -387,21 +387,26 @@ fn to_boolean(v: i64) -> i64 {
     to_value(v).coerce_to_boolean() as i64
 }
 
-/// Helper 11 — `coerce_u` (`convert_u`/`coerce_u`): `ToUint32(v)` as a `uint`.
+/// Helper 11 — `coerce_u` (`convert_u`/`coerce_u`): `ToUint32(v)` as a `uint`. A
+/// throwing coercion (`Object`→primitive with non-primitive `valueOf`/`toString`,
+/// `#1050`) stashes into `PENDING_ERROR`; the emitted code bails/dispatches after
+/// (`CoerceInt` is a throwing op). Swallowing it (returning the un-coerced input)
+/// let a bogus value flow on — a real divergence (`coerce_to_primitive_side_effects`).
 fn coerce_u(v: i64) -> i64 {
     let activation = unsafe { activation() };
     match to_value(v).coerce_to_u32(activation) {
         Ok(u) => from_value(Value::from(u)),
-        Err(_) => v,
+        Err(e) => stash_pending_error(e),
     }
 }
 
-/// Helper 12 — `coerce_i` (`convert_i`/`coerce_i`): `ToInt32(v)` as an `int`.
+/// Helper 12 — `coerce_i` (`convert_i`/`coerce_i`): `ToInt32(v)` as an `int`. See
+/// [`coerce_u`] — a throwing coercion (`#1050`) stashes into `PENDING_ERROR`.
 fn coerce_i(v: i64) -> i64 {
     let activation = unsafe { activation() };
     match to_value(v).coerce_to_i32(activation) {
         Ok(n) => from_value(Value::from(n)),
-        Err(_) => v,
+        Err(e) => stash_pending_error(e),
     }
 }
 
@@ -629,6 +634,29 @@ fn dm_load_f64(addr: i64) -> i64 {
     }
 }
 
+/// Helper 28 — `increment_i`: `ToInt32(v) + 1` (wrapping). The inline
+/// `IncrementIBoxed`/`IncLocalI` fast path handles int-boxed values; this
+/// fallback handles the rest (a `uint`/`Number`-boxed value needs the wrapping
+/// `ToInt32`, which a plain low-32-bit wrap gets wrong — that inlined a garbage
+/// result out of f64 bits in the `rng` test's PRNG). Errors swallowed like
+/// [`increment`].
+fn increment_i(v: i64) -> i64 {
+    let activation = unsafe { activation() };
+    match to_value(v).coerce_to_i32(activation) {
+        Ok(n) => from_value(Value::from(n.wrapping_add(1))),
+        Err(_) => v,
+    }
+}
+
+/// Helper 29 — `decrement_i`: `ToInt32(v) - 1` (wrapping). See [`increment_i`].
+fn decrement_i(v: i64) -> i64 {
+    let activation = unsafe { activation() };
+    match to_value(v).coerce_to_i32(activation) {
+        Ok(n) => from_value(Value::from(n.wrapping_sub(1))),
+        Err(_) => v,
+    }
+}
+
 /// A JIT helper: raw `Value` in, raw `Value` out (`i64` bits either way).
 pub(crate) type HelperFn = fn(i64) -> i64;
 
@@ -664,6 +692,8 @@ pub(crate) static HELPERS: &[HelperFn] = &[
     coerce_s,
     dm_load_f32,
     dm_load_f64,
+    increment_i,
+    decrement_i,
 ];
 
 // Binary (arity-2, two-stack) comparison helpers, indexed by `CallHelper2(i)`.
@@ -890,6 +920,41 @@ fn add(v1: i64, v2: i64) -> i64 {
     }
 }
 
+// The `_i` (wrapping-int) arithmetic family — the `AddIBoxed`/`SubtractIBoxed`/
+// `MultiplyIBoxed` inline ops' non-int fallback. `ToInt32` both operands (a
+// `uint`/`Number`-boxed operand needs the wrapping `ToInt32`; a plain low-32-bit
+// wrap of the box read garbage out of f64 bits — the `rng` test's PRNG), then the
+// wrapping i32 op. Coercion order matches each interpreter op (`op_multiply_i`
+// coerces value2 first; `op_add_i`/`op_subtract_i` coerce value1 first). A
+// throwing coercion is swallowed to `0`, like the bit helpers.
+
+/// `HELPERS2[19]` — `add_i`: `ToInt32(v1) + ToInt32(v2)` (wrapping).
+fn add_i(v1: i64, v2: i64) -> i64 {
+    let a = unsafe { activation() };
+    let (Ok(x), Ok(b)) = (to_value(v1).coerce_to_i32(a), to_value(v2).coerce_to_i32(a)) else {
+        return from_value(Value::from(0));
+    };
+    from_value(Value::from(x.wrapping_add(b)))
+}
+
+/// `HELPERS2[20]` — `subtract_i`: `ToInt32(v1) - ToInt32(v2)` (wrapping).
+fn subtract_i(v1: i64, v2: i64) -> i64 {
+    let a = unsafe { activation() };
+    let (Ok(x), Ok(b)) = (to_value(v1).coerce_to_i32(a), to_value(v2).coerce_to_i32(a)) else {
+        return from_value(Value::from(0));
+    };
+    from_value(Value::from(x.wrapping_sub(b)))
+}
+
+/// `HELPERS2[21]` — `multiply_i`: `ToInt32(v1) * ToInt32(v2)` (wrapping).
+fn multiply_i(v1: i64, v2: i64) -> i64 {
+    let a = unsafe { activation() };
+    let (Ok(b), Ok(x)) = (to_value(v2).coerce_to_i32(a), to_value(v1).coerce_to_i32(a)) else {
+        return from_value(Value::from(0));
+    };
+    from_value(Value::from(x.wrapping_mul(b)))
+}
+
 /// A JIT binary helper: `(v1, v2) -> Value` (`i64` each).
 pub(crate) type Helper2Fn = fn(i64, i64) -> i64;
 
@@ -897,7 +962,8 @@ pub(crate) type Helper2Fn = fn(i64, i64) -> i64;
 /// with the `CMP_*` / `BIT_*` / shift / arithmetic constants in [`crate::translate`].
 pub(crate) static HELPERS2: &[Helper2Fn] = &[
     cmp_eq, cmp_lt, cmp_le, cmp_gt, cmp_ge, bit_and, bit_or, bit_xor, lshift, rshift, urshift,
-    multiply, subtract, divide, modulo, strict_equals, as_type_late, is_type_late, add,
+    multiply, subtract, divide, modulo, strict_equals, as_type_late, is_type_late, add, add_i,
+    subtract_i, multiply_i,
 ];
 
 /// The arity-2 getproperty helper (`GetProperty(k)`): reads the receiver `Value`
