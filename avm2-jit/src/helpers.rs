@@ -15,7 +15,8 @@
 use std::cell::{Cell, RefCell};
 
 use ruffle_core::avm2::error::{
-    make_error_1041, make_error_1108, make_error_1127, make_null_or_undefined_error,
+    make_error_1041, make_error_1065, make_error_1108, make_error_1127,
+    make_null_or_undefined_error,
 };
 use ruffle_core::avm2::{
     Activation, ArrayObject, ArrayStorage, Class, ClassObject, Error, FunctionArgs,
@@ -96,9 +97,12 @@ impl RunCtx {
 /// the previous one after — so nested JIT runs (re-entry via a helper call) are
 /// safe. ONE thread-local swap in, one out.
 pub(crate) fn with_run_ctx<R>(ctx: &RunCtx, f: impl FnOnce() -> R) -> R {
-    let prev = RUN_CTX.with(|c| c.replace(std::ptr::from_ref(ctx)));
+    // SAFETY: `RUN_CTX` is a per-thread raw TLS slot; nested runs save/restore the
+    // previous pointer here (LIFO), and no reference into it escapes.
+    let prev = unsafe { RUN_CTX };
+    unsafe { RUN_CTX = std::ptr::from_ref(ctx) };
     let result = f();
-    RUN_CTX.with(|c| c.set(prev));
+    unsafe { RUN_CTX = prev };
     result
 }
 
@@ -108,16 +112,25 @@ pub(crate) fn with_run_ctx<R>(ctx: &RunCtx, f: impl FnOnce() -> R) -> R {
 /// Only call from a helper invoked while inside [`with_run_ctx`]; the returned
 /// reference must not escape the call.
 unsafe fn run_ctx<'a>() -> &'a RunCtx {
-    let ptr = RUN_CTX.with(|c| c.get());
+    let ptr = unsafe { RUN_CTX };
     debug_assert!(!ptr.is_null(), "JIT helper called with no run context installed");
     // SAFETY: delegated to the caller — the context lives on `try_run`'s stack
     // for the whole synchronous run.
     unsafe { &*ptr }
 }
 
+/// The installed [`RunCtx`] (null outside a run). See [`with_run_ctx`]. A raw
+/// `#[thread_local]` (not a `thread_local!` `LocalKey`): every helper reads it, so
+/// the direct TLS load — no per-`.with()` lazy-init check — showed up as a real
+/// win on call-dense (Starling) profiles. Per wasm instance = per worker thread.
+#[thread_local]
+static mut RUN_CTX: *const RunCtx = std::ptr::null();
+/// Mirror of `PENDING_ERROR.is_some()`, read by the emitted `perr` check after
+/// EVERY throwing op — the hottest TLS access, hence a raw `#[thread_local]`.
+#[thread_local]
+static mut PENDING_FLAG: bool = false;
+
 thread_local! {
-    /// The installed [`RunCtx`] (null outside a run). See [`with_run_ctx`].
-    static RUN_CTX: Cell<*const RunCtx> = const { Cell::new(std::ptr::null()) };
     /// The most recently caught exception's `Value` bits, stashed by [`dispatch_exc`]
     /// for the catch block's entry [`pop_caught`] to place on the operand stack.
     static CAUGHT: Cell<i64> = const { Cell::new(0) };
@@ -134,10 +147,6 @@ thread_local! {
     /// takes it via [`take_pending_error`] and propagates it — all within the same
     /// synchronous run, so the erased `'gc` is valid.
     static PENDING_ERROR: RefCell<Option<Error<'static>>> = const { RefCell::new(None) };
-    /// Mirror of `PENDING_ERROR.is_some()`. The emitted `perr` check runs after
-    /// EVERY throwing op, so it reads this plain `Cell` instead of paying a
-    /// `RefCell` borrow per check. Kept in sync by the stash/take sites.
-    static PENDING_FLAG: Cell<bool> = const { Cell::new(false) };
     /// `hasnext2`'s two register outputs `(object bits, index bits)`, stashed by
     /// [`has_next2`] and fetched by [`hn2_object`]/[`hn2_index`] — the op writes
     /// TWO locals plus a pushed Boolean, which doesn't fit one return value. On
@@ -163,8 +172,8 @@ fn coerce_return(value: i64) -> i64 {
             // SAFETY: erase `'gc` for thread-local storage; taken this same run.
             let erased: Error<'static> = unsafe { std::mem::transmute(e) };
             PENDING_ERROR.with(|slot| *slot.borrow_mut() = Some(erased));
-    PENDING_FLAG.with(|f| f.set(true));
-            PENDING_FLAG.with(|f| f.set(true));
+    unsafe { PENDING_FLAG = true };
+            unsafe { PENDING_FLAG = true };
             from_value(Value::Undefined)
         }
     }
@@ -222,8 +231,8 @@ pub(crate) fn coerce(value: i64, k: i64) -> i64 {
             // SAFETY: erase `'gc` for thread-local storage; taken this same run.
             let erased: Error<'static> = unsafe { std::mem::transmute(e) };
             PENDING_ERROR.with(|slot| *slot.borrow_mut() = Some(erased));
-    PENDING_FLAG.with(|f| f.set(true));
-            PENDING_FLAG.with(|f| f.set(true));
+    unsafe { PENDING_FLAG = true };
+            unsafe { PENDING_FLAG = true };
             from_value(Value::Undefined)
         }
     }
@@ -289,8 +298,8 @@ fn dispatch_exc(op_idx: i64) -> i64 {
             // SAFETY: erase `'gc` for thread-local storage; taken this same run.
             let erased: Error<'static> = unsafe { std::mem::transmute(e) };
             PENDING_ERROR.with(|slot| *slot.borrow_mut() = Some(erased));
-    PENDING_FLAG.with(|f| f.set(true));
-            PENDING_FLAG.with(|f| f.set(true));
+    unsafe { PENDING_FLAG = true };
+            unsafe { PENDING_FLAG = true };
             -1
         }
     }
@@ -320,7 +329,7 @@ fn throw_value(bits: i64) -> i64 {
     // SAFETY: erase `'gc` for thread-local storage; `try_run` takes it this same run.
     let erased: Error<'static> = unsafe { std::mem::transmute(error) };
     PENDING_ERROR.with(|slot| *slot.borrow_mut() = Some(erased));
-    PENDING_FLAG.with(|f| f.set(true));
+    unsafe { PENDING_FLAG = true };
     from_value(Value::Undefined)
 }
 
@@ -524,8 +533,8 @@ fn coerce_s(v: i64) -> i64 {
                 // SAFETY: erase `'gc` for thread-local storage; taken this same run.
                 let erased: Error<'static> = unsafe { std::mem::transmute(e) };
                 PENDING_ERROR.with(|slot| *slot.borrow_mut() = Some(erased));
-    PENDING_FLAG.with(|f| f.set(true));
-            PENDING_FLAG.with(|f| f.set(true));
+    unsafe { PENDING_FLAG = true };
+            unsafe { PENDING_FLAG = true };
                 return from_value(Value::Undefined);
             }
         },
@@ -568,6 +577,10 @@ pub(crate) fn dm_base_len() -> (u32, u32) {
     // so SOME raw-mirror consumer remains unaccounted for. Until every
     // `bytes()`/`bytes_mut()` user is audited for shareable coherence, only
     // buffers that are already shareable get the inline dm fast path.
+    // Use the inline `li*/si*/lf*/sf*` fast path only when the domainMemory is
+    // already shared. Promotion happens eagerly at set-domainMemory time
+    // (`Domain::set_domain_memory`, avmplus's subscribe-at-set model), NOT lazily
+    // here — a mid-frame promotion could desync the render (Starling glitch).
     let mut storage = activation.domain_memory().storage_mut();
     if !storage.is_shareable() {
         return (0, 0);
@@ -590,7 +603,7 @@ fn set_pending_1506(activation: &mut Activation<'_, '_>) {
     // same activation scope (see `call_method`).
     let erased: Error<'static> = unsafe { std::mem::transmute(err) };
     PENDING_ERROR.with(|slot| *slot.borrow_mut() = Some(erased));
-    PENDING_FLAG.with(|f| f.set(true));
+    unsafe { PENDING_FLAG = true };
 }
 
 /// Helper 8 — `li8`: unsigned byte load; throws #1506 on OOB.
@@ -652,7 +665,10 @@ fn dm_load_f32(addr: i64) -> i64 {
     };
     let val = activation.domain_memory().storage().dm_read::<4>(address as usize);
     match val {
-        Some(bytes) => from_value(Value::from(f32::from_le_bytes(bytes) as f64)),
+        Some(bytes) => from_value(Value::number_lossless(
+            activation.gc(),
+            f32::from_le_bytes(bytes) as f64,
+        )),
         None => {
             set_pending_1506(activation);
             from_value(Value::Undefined)
@@ -668,7 +684,12 @@ fn dm_load_f64(addr: i64) -> i64 {
     };
     let val = activation.domain_memory().storage().dm_read::<8>(address as usize);
     match val {
-        Some(bytes) => from_value(Value::from(f64::from_le_bytes(bytes))),
+        // Preserve exact bits (incl. NaN payloads): FlasCC copies raw memory
+        // through `lf64`/`sf64`. See `Value::number_lossless`.
+        Some(bytes) => from_value(Value::number_lossless(
+            activation.gc(),
+            f64::from_le_bytes(bytes),
+        )),
         None => {
             set_pending_1506(activation);
             from_value(Value::Undefined)
@@ -1110,6 +1131,31 @@ pub(crate) fn get_property(receiver: i64, k: i64) -> i64 {
     }
 }
 
+/// The arity-2 findprop helper (`FindProp(k, strict)`): resolve the method's
+/// `k`-th multiname through the scope chain and return the scope object that
+/// defines it. Mirrors `op_find_prop_strict` (`strict != 0`) / `op_find_property`:
+/// a miss throws `#1065` when strict (stashed in `PENDING_ERROR` for the emitted
+/// post-op `perr` bail/dispatch), else falls back to the global scope. Only
+/// non-lazy multinames reach here (translate declines lazy ones), so there's no
+/// `fill_with_runtime_params` step.
+pub(crate) fn find_prop(k: i64, strict: i64) -> i64 {
+    // SAFETY: helpers run only inside `with_run_ctx`.
+    let activation = unsafe { activation() };
+    let mn = unsafe { multiname(k as usize) };
+
+    match activation.find_definition(mn) {
+        Ok(Some(obj)) => from_value(obj),
+        Ok(None) => {
+            if strict != 0 {
+                stash_pending_error(make_error_1065(activation, mn))
+            } else {
+                from_value(activation.global_scope())
+            }
+        }
+        Err(e) => stash_pending_error(e),
+    }
+}
+
 /// `getpropertyfast`: a dynamic-name property read (`arr[i]`, dictionaries). Mirrors
 /// `op_get_property_fast` + its `op_get_property_slow` fallback, but with the
 /// `receiver` + runtime `name` passed as args (not on the operand stack). The fast
@@ -1381,9 +1427,14 @@ fn drain_call_args<'gc>(argc: i64) -> Vec<Value<'gc>> {
         let v = unsafe { &mut *a.get() };
         let len = v.len();
         let n = (argc as usize).min(len);
-        let mut raw = v.split_off(len - n);
-        raw.reverse(); // spilled top-first → restore argument order
-        raw.into_iter().map(to_value).collect()
+        let start = len - n;
+        // Args are spilled top-of-stack-first, so walk the top `n` in reverse to
+        // restore argument order, converting bits→`Value` inline. ONE allocation —
+        // the old `split_off` + `into_iter().collect()` allocated a throwaway
+        // `Vec<i64>` too, per call, on this call-dense hot path.
+        let args: Vec<Value<'gc>> = v[start..].iter().rev().map(|&b| to_value(b)).collect();
+        v.truncate(start);
+        args
     })
 }
 
@@ -1395,7 +1446,7 @@ fn stash_pending_error(e: Error<'_>) -> i64 {
     // same activation scope (see `try_run`).
     let erased: Error<'static> = unsafe { std::mem::transmute(e) };
     PENDING_ERROR.with(|slot| *slot.borrow_mut() = Some(erased));
-    PENDING_FLAG.with(|f| f.set(true));
+    unsafe { PENDING_FLAG = true };
     from_value(Value::Undefined)
 }
 
@@ -1774,17 +1825,17 @@ unsafe fn namespace_at<'gc>(imm: usize) -> Namespace<'gc> {
 /// Whether a call threw during this run (the emitted code checks this after each
 /// call to bail promptly). `1` = pending.
 pub(crate) fn pending_error() -> i32 {
-    PENDING_FLAG.with(|f| f.get()) as i32
+    (unsafe { PENDING_FLAG }) as i32
 }
 
 /// Takes (and clears) the pending thrown error, for `try_run` to propagate.
 pub(crate) fn take_pending_error<'gc>() -> Option<Error<'gc>> {
     // Flag-first: `try_run` clears defensively on EVERY call, so the common
     // no-error case must be one plain `Cell` read, not a `RefCell` borrow.
-    if !PENDING_FLAG.with(|f| f.get()) {
+    if !(unsafe { PENDING_FLAG }) {
         return None;
     }
-    PENDING_FLAG.with(|f| f.set(false));
+    unsafe { PENDING_FLAG = false };
     let erased = PENDING_ERROR.with(|slot| slot.borrow_mut().take())?;
     // SAFETY: reverse of the erasure in `call_method`, within the same run.
     Some(unsafe { std::mem::transmute::<Error<'static>, Error<'gc>>(erased) })

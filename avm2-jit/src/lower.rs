@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, Elements, ElementSection, EntityType, ExportKind,
     ExportSection, Function, FunctionSection, ImportSection, Instruction, MemArg, MemoryType,
-    Module, RefType, TableSection, TableType, TypeSection, ValType,
+    Module, NameMap, NameSection, RefType, TableSection, TableType, TypeSection, ValType,
 };
 
 /// Bit pattern OR-ed onto a 32-bit integer to form an AVM2 int [`Value`].
@@ -299,6 +299,11 @@ pub(crate) fn has_getslot(ops: &[JitOp]) -> bool {
     ops.iter().any(|op| matches!(op, JitOp::GetSlot(_)))
 }
 
+/// Whether this method uses the arity-2 findprop import (`("env","fp")`).
+pub(crate) fn has_findprop(ops: &[JitOp]) -> bool {
+    ops.iter().any(|op| matches!(op, JitOp::FindProp(..)))
+}
+
 /// How many arity-2 two-stack helper imports (`t{i}`) this method uses
 /// (`= max CallHelper2 index + 1`, `0` if none).
 fn helper2_count(ops: &[JitOp]) -> u32 {
@@ -446,6 +451,7 @@ fn is_throwing_prop(op: JitOp) -> bool {
         JitOp::GetProperty(_)
             | JitOp::GetPropertyFast(_)
             | JitOp::GetSlot(_)
+            | JitOp::FindProp(..)
             | JitOp::CallHelper3(0..=SETSLOT_KIND_MAX, _)
     )
 }
@@ -609,6 +615,9 @@ pub struct Manifest {
     pub has_getslot: bool,
     /// Whether the arity-3 `gpf` (getpropertyfast) import is used.
     pub has_getprop_fast: bool,
+    /// Whether the arity-2 `fp` (findprop, `findpropstrict`/`findproperty`) import
+    /// is used.
+    pub has_findprop: bool,
     /// Number of arity-2 two-stack `t{i}` helper imports (`= helper2_count`).
     pub num_helpers2: u32,
     /// Bit `k` set iff ternary helper kind `k` (`HELPERS3[k]`) is used.
@@ -680,6 +689,7 @@ impl Manifest {
             has_getprop,
             has_getslot,
             has_getprop_fast,
+            has_findprop,
             num_helpers2,
             set3_mask,
             has_call,
@@ -702,6 +712,7 @@ impl Manifest {
         self.has_getprop |= has_getprop;
         self.has_getslot |= has_getslot;
         self.has_getprop_fast |= has_getprop_fast;
+        self.has_findprop |= has_findprop;
         self.num_helpers2 = self.num_helpers2.max(num_helpers2);
         self.set3_mask |= set3_mask;
         self.has_call |= has_call;
@@ -736,6 +747,7 @@ impl Manifest {
             || self.has_getprop
             || self.has_getprop_fast
             || self.has_getslot
+            || self.has_findprop
             || self.set3_mask & ((1 << (SETSLOT_KIND_MAX + 1)) - 1) != 0
     }
 }
@@ -758,6 +770,7 @@ pub(crate) fn manifest(ops: &[JitOp]) -> Manifest {
         has_getprop: has_getprop(ops),
         has_getslot: has_getslot(ops),
         has_getprop_fast: has_getprop_fast(ops),
+        has_findprop: has_findprop(ops),
         num_helpers2: helper2_count(ops),
         set3_mask,
         has_call: has_call(ops),
@@ -787,6 +800,9 @@ struct Layout {
     gs_index: u32,
     /// `get_property_fast` import (arity-3; valid only when `has_getprop_fast`).
     gpf_index: u32,
+    /// `find_prop` import (arity-2 `(k, strict) -> object`; valid only when
+    /// `has_findprop`).
+    fp_index: u32,
     /// Base function index of the arity-2 two-stack `t{i}` helpers.
     t_base: u32,
     set3_index: [u32; HELPER3_KINDS],
@@ -830,6 +846,9 @@ fn layout_of(m: &Manifest) -> Layout {
     next += m.has_getslot as u32;
     let gpf_index = next;
     next += m.has_getprop_fast as u32;
+    // `fp` (find_prop) follows the property-read imports.
+    let fp_index = next;
+    next += m.has_findprop as u32;
     let t_base = next;
     next += m.num_helpers2;
     let mut set3_index = [0u32; HELPER3_KINDS];
@@ -864,6 +883,7 @@ fn layout_of(m: &Manifest) -> Layout {
         gp_index,
         gs_index,
         gpf_index,
+        fp_index,
         t_base,
         set3_index,
         call_index,
@@ -1044,6 +1064,13 @@ pub enum JitOp {
     /// calls the arity-3 `gpf` (`get_property_fast`) helper with `(receiver, name, k)`
     /// (`k` = the lazy multiname template), pushing the result. Net -1.
     GetPropertyFast(u32),
+    /// `findpropstrict`/`findproperty` (`bool` = strict): resolve the method's
+    /// `k`-th multiname through the scope chain and push the scope object that has
+    /// it (via the arity-2 `fp` import; `(k, strict) -> object`). Net +1 — takes no
+    /// operand. Strict throws `#1065` on a miss (→ perr bail/dispatch); non-strict
+    /// falls back to the global scope. The FlasCC C-call idiom
+    /// (`findpropstrict F_fn; …; callpropvoid F_fn`) and `getlex`'s first half.
+    FindProp(u32, bool),
     /// Pop the receiver `Value` and push `receiver.get_slot(slot_id)`'s raw
     /// `Value` (via the arity-2 `gs` import). The verifier's resolved form of a
     /// typed property read — a direct slot fetch, no multiname lookup.
@@ -1395,34 +1422,63 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             // Stack: [v1, v2]. Stash (A = v1, B = v2).
             body.instruction(&Instruction::LocalSet(SCRATCH64)); // B = v2
             body.instruction(&Instruction::LocalSet(SCRATCH64_2)); // A = v1
-            // Both int-boxed? → inline i32 bitwise; else → helper fallback. Only int
-            // operands are inlined: their low 32 bits are already the `ToInt32` value,
-            // whereas a `Number` needs the helper's wrapping `ToInt32`.
+
+            // Given two `i32` operands (a, b) on the stack, emit the shift-count
+            // mask (shifts only), the i32 op, and box the result. `urshift`
+            // (index 10) is logical and its `uint` result needs uint-boxing; the
+            // others are signed-i32 results.
+            let emit_op_and_box = |body: &mut Function| {
+                if matches!(index, 8 | 9 | 10) {
+                    // Shift count masked by 0x1F (matching AVM2 / the helper). The
+                    // low 5 bits agree between `ToInt32` and `ToUint32`.
+                    body.instruction(&Instruction::I32Const(0x1F));
+                    body.instruction(&Instruction::I32And);
+                }
+                body.instruction(&match index {
+                    5 => Instruction::I32And,
+                    6 => Instruction::I32Or,
+                    7 => Instruction::I32Xor,
+                    8 => Instruction::I32Shl,
+                    9 => Instruction::I32ShrS,   // rshift (arithmetic)
+                    _ => Instruction::I32ShrU,   // 10 = urshift (logical)
+                });
+                if index == 10 {
+                    emit_urshift_box(body);
+                } else {
+                    emit_box_int(body);
+                }
+            };
+
+            // Tier 1 — both int-boxed: their low 32 bits are already the `ToInt32`
+            // value (`urshift` reads them as `ToUint32`; same bits), so no coercion.
             emit_is_int(body, SCRATCH64_2);
             emit_is_int(body, SCRATCH64);
             body.instruction(&Instruction::I32And);
             body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-            body.instruction(&Instruction::LocalGet(SCRATCH64_2)); // A
-            body.instruction(&Instruction::I32WrapI64); // a i32
-            body.instruction(&Instruction::LocalGet(SCRATCH64)); // B
-            body.instruction(&Instruction::I32WrapI64); // b i32
-            // Shifts mask the count by 0x1F (matching the helper / AVM2).
-            if matches!(index, 8 | 9) {
-                body.instruction(&Instruction::I32Const(0x1F));
-                body.instruction(&Instruction::I32And);
-            }
-            body.instruction(&match index {
-                5 => Instruction::I32And,
-                6 => Instruction::I32Or,
-                7 => Instruction::I32Xor,
-                8 => Instruction::I32Shl,
-                _ => Instruction::I32ShrS, // 9 = rshift (arithmetic)
-            });
-            emit_box_int(body);
+            body.instruction(&Instruction::LocalGet(SCRATCH64_2)); // a
+            body.instruction(&Instruction::I32WrapI64);
+            body.instruction(&Instruction::LocalGet(SCRATCH64)); // b
+            body.instruction(&Instruction::I32WrapI64);
+            emit_op_and_box(body);
             body.instruction(&Instruction::Else);
+            // Tier 2 — both numeric with `|v| < 2^63`: pure-wasm wrapping `ToInt32`
+            // inline (no helper). This is the hot CrossBridge case, where bitwise
+            // ops are applied to `Number`-boxed pointers/ints. Values outside that
+            // range (or non-numeric) fall through to the helper.
+            emit_is_int32_able(body, SCRATCH64_2);
+            emit_is_int32_able(body, SCRATCH64);
+            body.instruction(&Instruction::I32And);
+            body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+            emit_to_int32(body, SCRATCH64_2); // a = ToInt32(A)
+            emit_to_int32(body, SCRATCH64); // b = ToInt32(B)
+            emit_op_and_box(body);
+            body.instruction(&Instruction::Else);
+            // Tier 3 — helper fallback (string/object operands, or out-of-range
+            // `Number`s needing the exact wrapping `ToInt32`).
             body.instruction(&Instruction::LocalGet(SCRATCH64_2)); // v1
             body.instruction(&Instruction::LocalGet(SCRATCH64)); // v2
             body.instruction(&Instruction::Call(lay.t_base + index));
+            body.instruction(&Instruction::End);
             body.instruction(&Instruction::End);
             *depth -= 1;
         }
@@ -1835,6 +1891,17 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             body.instruction(&Instruction::I64Const(k as i64));
             body.instruction(&Instruction::Call(lay.gp_index));
         }
+        JitOp::FindProp(k, strict) => {
+            // No operand: push (k, strict) and call the arity-2 `fp` helper, which
+            // resolves the multiname through the scope chain and pushes the scope
+            // object — net +1. A strict miss (`#1065`) rides `PENDING_ERROR` and is
+            // bailed/dispatched by the compile loop (like `gp`, via
+            // `is_throwing_call_or_dm`).
+            body.instruction(&Instruction::I64Const(k as i64));
+            body.instruction(&Instruction::I64Const(strict as i64));
+            body.instruction(&Instruction::Call(lay.fp_index));
+            *depth += 1;
+        }
         JitOp::GetPropertyFast(k) => {
             if *depth < 2 {
                 return None;
@@ -1946,9 +2013,20 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             }
             // domainMemory is byte-addressed and may be unaligned, so `align: 0`.
             let ma = MemArg { offset: 0, align: 0, memory_index: 1 };
-            // addr `Value` → i32 (low 32 bits = the int for an int-boxed address).
-            body.instruction(&Instruction::I32WrapI64);
-            body.instruction(&Instruction::LocalSet(SCRATCH));
+            // Address = pure-wasm `ToInt32` of the addr `Value` — handles an
+            // *int-boxed* addr AND a `Number`-boxed one (CrossBridge models the
+            // 32-bit machine's pointers as `Number`, so nearly every FlasCC/Lua dm
+            // access has a Number address; the old `is_int`-only fast path bailed
+            // on all of them, making `dm_load*`/`dm_store` the profile's #1 cost).
+            // `emit_to_int32` is exact under `emit_is_int32_able` (numeric AND
+            // `|v| < 2^63`), matching the helper's `coerce_to_i32`; NaN/±Inf/huge
+            // fail that guard and fall to the helper (which throws #1506 on a real
+            // OOB). This also subsumes the earlier #1506 garbage-low-bits guard.
+            body.instruction(&Instruction::LocalSet(SCRATCH64)); // SCRATCH64 = addr Value
+            emit_to_int32(body, SCRATCH64);
+            body.instruction(&Instruction::LocalSet(SCRATCH)); // addr i32 (ToInt32)
+            // Fast path: numeric ToInt32-able addr AND desc != 0 AND in-bounds.
+            emit_is_int32_able(body, SCRATCH64);
             // The descriptor cell (see core `SharedByteBuffer::desc_ptr`): DM_BASE is
             // the ADDRESS of a stable `[base: u32, cap: u32]` pair, re-read on
             // every access so a growth reallocation (the buffer has NO
@@ -1959,6 +2037,7 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             body.instruction(&Instruction::LocalGet(DM_BASE));
             body.instruction(&Instruction::I32Const(0));
             body.instruction(&Instruction::I32Ne);
+            body.instruction(&Instruction::I32And);
             // In-bounds? `(addr as u64) + width <= cap` (64-bit: no wrap).
             body.instruction(&Instruction::LocalGet(SCRATCH));
             body.instruction(&Instruction::I64ExtendI32U);
@@ -1984,11 +2063,10 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             body.instruction(&Instruction::I64Const(VALUE_INT_MARK as i64));
             body.instruction(&Instruction::I64Or);
             body.instruction(&Instruction::Else);
-            // Miss (OOB of the reservation — incl. `dm_len == 0`, an unshared
-            // domainMemory): fall back to the dm helper, which routes through the
-            // real storage (and throws #1506 on a genuine OOB).
-            body.instruction(&Instruction::LocalGet(SCRATCH));
-            emit_box_int(body);
+            // Miss (non-int addr, OOB of the reservation, or `dm_len == 0`): fall
+            // back to the dm helper on the ORIGINAL addr `Value` — it `coerce_to_i32`s
+            // it and routes through real storage (throwing #1506 on a genuine OOB).
+            body.instruction(&Instruction::LocalGet(SCRATCH64));
             body.instruction(&Instruction::Call(match width {
                 1 => DM_LOAD8,
                 2 => DM_LOAD16,
@@ -2002,15 +2080,25 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
                 return None;
             }
             let ma = MemArg { offset: 0, align: 0, memory_index: 1 };
-            // Stack: [value, addr] (addr on top). Unbox both to i32.
-            body.instruction(&Instruction::I32WrapI64);
-            body.instruction(&Instruction::LocalSet(SCRATCH)); // addr
-            body.instruction(&Instruction::I32WrapI64);
-            body.instruction(&Instruction::LocalSet(SCRATCH2)); // value
-            // Descriptor-cell check (see `DmLoad`): desc != 0 AND addr+width <= cap.
+            // Stack: [value, addr] (addr on top). Both addr and stored value go
+            // through pure-wasm `ToInt32` (int OR Number-boxed — see `DmLoad`);
+            // CrossBridge Number-boxes both, so the old int-only path bailed to the
+            // helper on every store. `emit_to_int32` is exact under
+            // `emit_is_int32_able`, matching the helper's `coerce_to_i32`.
+            body.instruction(&Instruction::LocalSet(SCRATCH64)); // SCRATCH64 = addr Value
+            emit_to_int32(body, SCRATCH64);
+            body.instruction(&Instruction::LocalSet(SCRATCH)); // addr i32
+            body.instruction(&Instruction::LocalSet(SCRATCH64_2)); // SCRATCH64_2 = value Value
+            emit_to_int32(body, SCRATCH64_2);
+            body.instruction(&Instruction::LocalSet(SCRATCH2)); // value i32
+            // Fast path: ToInt32-able addr AND value AND desc != 0 AND in-bounds.
+            emit_is_int32_able(body, SCRATCH64);
+            emit_is_int32_able(body, SCRATCH64_2);
+            body.instruction(&Instruction::I32And);
             body.instruction(&Instruction::LocalGet(DM_BASE));
             body.instruction(&Instruction::I32Const(0));
             body.instruction(&Instruction::I32Ne);
+            body.instruction(&Instruction::I32And);
             body.instruction(&Instruction::LocalGet(SCRATCH));
             body.instruction(&Instruction::I64ExtendI32U);
             body.instruction(&Instruction::I64Const(width as i64));
@@ -2032,12 +2120,10 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
                 _ => Instruction::I32Store(ma),
             });
             body.instruction(&Instruction::Else);
-            // Miss: fall back to the ternary `dm_store` helper (real storage;
-            // throws #1506 on a genuine OOB). `(value, addr, width)`.
-            body.instruction(&Instruction::LocalGet(SCRATCH2));
-            emit_box_int(body);
-            body.instruction(&Instruction::LocalGet(SCRATCH));
-            emit_box_int(body);
+            // Miss: fall back to the ternary `dm_store` helper on the ORIGINAL
+            // `Value`s (it coerces). `(value, addr, width)`.
+            body.instruction(&Instruction::LocalGet(SCRATCH64_2)); // value Value
+            body.instruction(&Instruction::LocalGet(SCRATCH64)); // addr Value
             body.instruction(&Instruction::I64Const(width as i64));
             body.instruction(&Instruction::Call(lay.set3_index[DM_STORE_KIND as usize]));
             body.instruction(&Instruction::Drop); // dummy result
@@ -2049,12 +2135,16 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
                 return None;
             }
             let ma = MemArg { offset: 0, align: 0, memory_index: 1 };
-            body.instruction(&Instruction::I32WrapI64);
-            body.instruction(&Instruction::LocalSet(SCRATCH)); // addr
-            // Descriptor-cell check (see `DmLoad`): desc != 0 AND addr+width <= cap.
+            // Address = pure-wasm `ToInt32` (int OR Number-boxed — see `DmLoad`).
+            body.instruction(&Instruction::LocalSet(SCRATCH64)); // SCRATCH64 = addr Value
+            emit_to_int32(body, SCRATCH64);
+            body.instruction(&Instruction::LocalSet(SCRATCH)); // addr i32 (ToInt32)
+            // Fast path: ToInt32-able addr AND desc != 0 AND in-bounds (see `DmLoad`).
+            emit_is_int32_able(body, SCRATCH64);
             body.instruction(&Instruction::LocalGet(DM_BASE));
             body.instruction(&Instruction::I32Const(0));
             body.instruction(&Instruction::I32Ne);
+            body.instruction(&Instruction::I32And);
             body.instruction(&Instruction::LocalGet(SCRATCH));
             body.instruction(&Instruction::I64ExtendI32U);
             body.instruction(&Instruction::I64Const(width as i64));
@@ -2076,12 +2166,27 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             } else {
                 body.instruction(&Instruction::F64Load(ma));
             }
-            emit_box_double(body); // f64 -> `Number` `Value` bits (canonical NaN)
+            // LOSSLESS box (not `emit_box_double`, which canonicalizes NaN):
+            // FlasCC copies raw memory through `lf*`/`sf*`, so a NaN payload must
+            // survive. Non-colliding bits box inline; a colliding negative
+            // quiet-NaN (`bits & BOX_MARK == BOX_MARK`) re-loads via the
+            // `number_lossless` helper (heap-boxes). Mirrors core `op_lf64`.
+            body.instruction(&Instruction::I64ReinterpretF64);
+            body.instruction(&Instruction::LocalTee(SCRATCH64_2)); // keep the bits
+            body.instruction(&Instruction::I64Const(BOX_MARK as i64));
+            body.instruction(&Instruction::I64And);
+            body.instruction(&Instruction::I64Const(BOX_MARK as i64));
+            body.instruction(&Instruction::I64Ne); // non-colliding?
+            body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+            body.instruction(&Instruction::LocalGet(SCRATCH64_2)); // inline raw bits
             body.instruction(&Instruction::Else);
-            // Miss: fall back to the float dm load helper (real storage; #1506
-            // on a genuine OOB).
-            body.instruction(&Instruction::LocalGet(SCRATCH));
-            emit_box_int(body);
+            body.instruction(&Instruction::LocalGet(SCRATCH64)); // original addr Value
+            body.instruction(&Instruction::Call(if width == 4 { DM_LOADF32 } else { DM_LOADF64 }));
+            body.instruction(&Instruction::End);
+            body.instruction(&Instruction::Else);
+            // Miss (non-int addr / OOB / unshared): fall back to the float dm load
+            // helper on the ORIGINAL addr `Value` (it coerces; #1506 on genuine OOB).
+            body.instruction(&Instruction::LocalGet(SCRATCH64));
             body.instruction(&Instruction::Call(if width == 4 { DM_LOADF32 } else { DM_LOADF64 }));
             body.instruction(&Instruction::End);
             // net: pop addr (-1), push result (+1) → depth unchanged.
@@ -2091,14 +2196,32 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
                 return None;
             }
             let ma = MemArg { offset: 0, align: 0, memory_index: 1 };
-            // Stack: [value, addr] (addr on top).
-            body.instruction(&Instruction::I32WrapI64);
-            body.instruction(&Instruction::LocalSet(SCRATCH)); // addr i32
+            // Stack: [value, addr] (addr on top). The addr goes through pure-wasm
+            // `ToInt32` (int OR Number-boxed — CrossBridge Number-boxes it; see
+            // `DmLoad`). The stored value goes through `emit_numval`, which already
+            // handles int OR Number.
+            body.instruction(&Instruction::LocalSet(SCRATCH64_2)); // SCRATCH64_2 = addr Value
+            emit_to_int32(body, SCRATCH64_2);
+            body.instruction(&Instruction::LocalSet(SCRATCH)); // addr i32 (ToInt32)
             body.instruction(&Instruction::LocalSet(SCRATCH64)); // value `Value` bits
-            // Descriptor-cell check (see `DmLoad`): desc != 0 AND addr+width <= cap.
+            // Fast path: ToInt32-able addr AND value is inline-numeric (int or f64)
+            // AND desc != 0 AND in-bounds. A boxed double (colliding NaN) or any
+            // non-numeric box isn't `emit_numval`-safe, so it falls to the coercing
+            // `dm_store_f` helper (which derefs a boxed double).
+            emit_is_int32_able(body, SCRATCH64_2);
+            // value inline-numeric?  is_f64(value) || is_int(value)
+            body.instruction(&Instruction::LocalGet(SCRATCH64));
+            body.instruction(&Instruction::I64Const(BOX_MARK as i64));
+            body.instruction(&Instruction::I64And);
+            body.instruction(&Instruction::I64Const(BOX_MARK as i64));
+            body.instruction(&Instruction::I64Ne); // is_f64(value)
+            emit_is_int(body, SCRATCH64);
+            body.instruction(&Instruction::I32Or);
+            body.instruction(&Instruction::I32And); // int addr AND value numeric
             body.instruction(&Instruction::LocalGet(DM_BASE));
             body.instruction(&Instruction::I32Const(0));
             body.instruction(&Instruction::I32Ne);
+            body.instruction(&Instruction::I32And);
             body.instruction(&Instruction::LocalGet(SCRATCH));
             body.instruction(&Instruction::I64ExtendI32U);
             body.instruction(&Instruction::I64Const(width as i64));
@@ -2121,11 +2244,11 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
                 body.instruction(&Instruction::F64Store(ma));
             }
             body.instruction(&Instruction::Else);
-            // Miss: fall back to the ternary `dm_store_f` helper (real storage;
-            // #1506 on a genuine OOB). `(value Value bits, addr, width)`.
+            // Miss (non-int addr / OOB / unshared): fall back to the ternary
+            // `dm_store_f` helper on the ORIGINAL `Value`s (it coerces).
+            // `(value Value bits, addr Value, width)`.
             body.instruction(&Instruction::LocalGet(SCRATCH64));
-            body.instruction(&Instruction::LocalGet(SCRATCH));
-            emit_box_int(body);
+            body.instruction(&Instruction::LocalGet(SCRATCH64_2));
             body.instruction(&Instruction::I64Const(width as i64));
             body.instruction(&Instruction::Call(lay.set3_index[DM_STORE_F_KIND as usize]));
             body.instruction(&Instruction::Drop); // dummy result
@@ -2324,6 +2447,31 @@ fn emit_box_int(body: &mut Function) {
     body.instruction(&Instruction::I64ExtendI32U);
     body.instruction(&Instruction::I64Const(VALUE_INT_MARK as i64));
     body.instruction(&Instruction::I64Or);
+}
+
+/// Boxes a raw `urshift` result (the i32 on top of the stack, whose bits are the
+/// unsigned `ToUint32` result in `0..2^32`) as a `Value`, matching the helper:
+/// a `uint` that fits AVM2 `int` (`< 2^31`) → an `int` box; otherwise (`>= 2^31`,
+/// which can't be a signed `i32`) → a `Number` box. The `Number` value is always
+/// a finite positive integer in `[2^31, 2^32)`, so a raw `f64` reinterpret is a
+/// valid box (never NaN/`-0`, never in the boxed-double collision range — its
+/// sign bit is `0`). Clobbers `SCRATCH64`.
+fn emit_urshift_box(body: &mut Function) {
+    body.instruction(&Instruction::I64ExtendI32U); // uint as i64 (zero-extended)
+    body.instruction(&Instruction::LocalTee(SCRATCH64));
+    body.instruction(&Instruction::I64Const(0x8000_0000)); // 2^31
+    body.instruction(&Instruction::I64GeU);
+    body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    // >= 2^31: doesn't fit `int` → `Number`.
+    body.instruction(&Instruction::LocalGet(SCRATCH64));
+    body.instruction(&Instruction::F64ConvertI64U); // exact for uint < 2^32
+    body.instruction(&Instruction::I64ReinterpretF64);
+    body.instruction(&Instruction::Else);
+    // < 2^31: fits `int`.
+    body.instruction(&Instruction::LocalGet(SCRATCH64));
+    body.instruction(&Instruction::I32WrapI64);
+    emit_box_int(body);
+    body.instruction(&Instruction::End);
 }
 
 /// Pops the top `Value` (i64), pushes its `ToBoolean` as an i32 `0`/`1` — inline
@@ -2596,6 +2744,8 @@ pub struct GenMember<'a> {
     pub ops: &'a [JitOp],
     pub switches: &'a [SwitchTable],
     pub exceptions: &'a [ExcRange],
+    /// AVM2 method name, emitted into the module's wasm name section for profilers.
+    pub name: &'a str,
 }
 
 /// Compiles MANY methods into ONE module (an "amalgam" generation): every member
@@ -2677,6 +2827,26 @@ pub fn compile_generation(members: &[GenMember<'_>]) -> Option<(Vec<u8>, Manifes
     );
     module.section(&elements);
     module.section(&code);
+
+    // Name section: label each member with its AVM2 method name (prefixed by its
+    // dispatch index for uniqueness/correlation) plus the dispatcher, so profilers
+    // show real names instead of `wasm-function[N]`. Imports occupy `0..run_index`;
+    // members are `run_index..run_index + n`; the dispatcher is last.
+    let mut func_names = NameMap::new();
+    for (i, mem) in members.iter().enumerate() {
+        let idx = lay.run_index + i as u32;
+        let label = if mem.name.is_empty() {
+            format!("jit[{i}]")
+        } else {
+            format!("jit[{i}]:{}", mem.name)
+        };
+        func_names.append(idx, &label);
+    }
+    func_names.append(lay.run_index + n, "jit_dispatch");
+    let mut names = NameSection::new();
+    names.functions(&func_names);
+    module.section(&names);
+
     Some((module.finish(), u))
 }
 
@@ -2731,6 +2901,10 @@ fn emit_imports(m: &Manifest) -> ImportSection {
     // `gpf` (get_property_fast) is arity-3 `(receiver, name, k) -> result` = type 3.
     if m.has_getprop_fast {
         imports.import("env", "gpf", EntityType::Function(3));
+    }
+    // `fp` (find_prop) is arity-2 `(k, strict) -> object` = type 2, after the reads.
+    if m.has_findprop {
+        imports.import("env", "fp", EntityType::Function(2));
     }
     // Then the arity-2 two-stack helpers `t0..t{N}` (compares).
     for i in 0..m.num_helpers2 {
@@ -2827,6 +3001,22 @@ fn emit_body(
     lay: &Layout,
 ) -> Option<Function> {
     let has_handlers = !exceptions.is_empty();
+    // `ReturnValueCoerced` inside a handler range isn't wired for exception
+    // dispatch: its lowering emits a bare `Return` right after `coerce_return`, so
+    // a failed return-type coercion (`#1034`, stashed in `PENDING_ERROR`) would
+    // propagate OUT of the method instead of being caught by the method's OWN
+    // try/catch — the interpreter catches it. Decline such methods (the throwing
+    // `returnvalue` sits literally inside a `try` of a typed-return function; rare).
+    // Every other throwing op in a range dispatches via the compile loop (see
+    // `is_throwing_call_or_dm`); `ReturnValueCoerced` can't, as it's a terminator.
+    if has_handlers
+        && ops.iter().enumerate().any(|(i, op)| {
+            matches!(op, JitOp::ReturnValueCoerced)
+                && exceptions.iter().any(|e| i >= e.from && i < e.to)
+        })
+    {
+        return None;
+    }
     // Distinct catch-target op indices — each is a block leader, and its block
     // materializes the caught exception on entry.
     let catch_targets: std::collections::BTreeSet<usize> =
@@ -3195,10 +3385,10 @@ mod tests {
         let m3 = [JitOp::VCall(vc::NEW_FUNCTION, 0, 0, true), JitOp::ReturnValueBoxed];
         let m4 = [JitOp::GetLocalValue(1), JitOp::CoerceInt(false), JitOp::ReturnValueBoxed];
         let members = [
-            GenMember { ops: &m1, switches: &[], exceptions: &[] },
-            GenMember { ops: &m2, switches: &[], exceptions: &[] },
-            GenMember { ops: &m3, switches: &[], exceptions: &[] },
-            GenMember { ops: &m4, switches: &[], exceptions: &[] },
+            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "" },
+            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "" },
+            GenMember { ops: &m3, switches: &[], exceptions: &[], name: "" },
+            GenMember { ops: &m4, switches: &[], exceptions: &[], name: "" },
         ];
         let (bytes, _union) = compile_generation(&members).expect("generation compiles");
         let engine = Engine::default();
@@ -4857,8 +5047,8 @@ mod tests {
         ];
         let m1 = [JitOp::GetLocalValue(1), JitOp::CallHelper(0), JitOp::ReturnValueBoxed];
         let members = [
-            GenMember { ops: &m0, switches: &[], exceptions: &[] },
-            GenMember { ops: &m1, switches: &[], exceptions: &[] },
+            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "" },
+            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "" },
         ];
         let (bytes, union) = compile_generation(&members).expect("generation compiles");
         assert_eq!(union.num_helpers, 1); // the union carries m1's h0
@@ -4918,9 +5108,9 @@ mod tests {
             JitOp::ReturnValueBoxed,
         ];
         let members = [
-            GenMember { ops: &m0, switches: &[], exceptions: &[] },
-            GenMember { ops: &m1, switches: &[], exceptions: &[] },
-            GenMember { ops: &m2, switches: &[], exceptions: &[] },
+            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "" },
+            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "" },
+            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "" },
         ];
         let (bytes, union) = compile_generation(&members).expect("generation compiles");
         assert!(union.has_vcall && union.has_getslot && union.has_call && union.has_coerce);

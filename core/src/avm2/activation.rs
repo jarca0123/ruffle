@@ -692,7 +692,16 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         loop {
             let op = &opcodes[ip];
             ip += 1;
-            avm_debug!(self.avm2(), "Opcode: {op:?}");
+            // Enriched op trace: the executing method's name (a FlasCC `F_*`
+            // function, e.g. `F_luaK_code`) + the op's ip, so a flat op stream can
+            // be correlated to a specific C function. Only formatted when AVM
+            // debugging is on (Ctrl+Alt+D / `RUFFLE_AVM_DEBUG`).
+            avm_debug!(
+                self.avm2(),
+                "[{}] ip={} {op:?}",
+                method.method_name(),
+                ip - 1
+            );
 
             let result = match op {
                 Op::PushDouble { value } => self.op_push_double(*value),
@@ -2772,6 +2781,8 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         }
 
         dm.dm_set(address, val as u8);
+        drop(dm);
+        avm_debug!(self.avm2(), "si8 @{address} = {} ({:#x})", val as u8, val as u8);
 
         Ok(())
     }
@@ -2791,6 +2802,8 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         }
         dm.dm_write(address, &val.to_le_bytes())
             .map_err(|e| e.to_avm(self))?;
+        drop(dm);
+        avm_debug!(self.avm2(), "si16 @{address} = {val} ({val:#x})");
 
         Ok(())
     }
@@ -2810,6 +2823,8 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         }
         dm.dm_write(address, &val.to_le_bytes())
             .map_err(|e| e.to_avm(self))?;
+        drop(dm);
+        avm_debug!(self.avm2(), "si32 @{address} = {val} ({val:#x})");
 
         Ok(())
     }
@@ -2864,6 +2879,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let val = dm.dm_get(address);
 
         if let Some(val) = val {
+            avm_debug!(self.avm2(), "li8 @{address} = {val} ({val:#x})");
             self.push_stack(val);
         } else {
             return Err(make_error_1506(self));
@@ -2885,8 +2901,12 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             return Err(make_error_1506(self));
         }
 
-        let val = dm.dm_read::<2>(address).ok_or_else(|| make_error_1506(self))?;
+        let val = dm.dm_read::<2>(address).ok_or_else(|| {
+            make_error_1506(self)
+        })?;
         let value = u16::from_le_bytes(val);
+        drop(dm);
+        avm_debug!(self.avm2(), "li16 @{address} = {value} ({value:#x})");
         self.push_stack(value);
 
         Ok(())
@@ -2905,8 +2925,13 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             return Err(make_error_1506(self));
         }
 
-        let val = dm.dm_read::<4>(address).ok_or_else(|| make_error_1506(self))?;
-        self.push_stack(i32::from_le_bytes(val));
+        let val = dm.dm_read::<4>(address).ok_or_else(|| {
+            make_error_1506(self)
+        })?;
+        drop(dm);
+        let v = i32::from_le_bytes(val);
+        avm_debug!(self.avm2(), "li32 @{address} = {v} ({v:#x})");
+        self.push_stack(v);
         Ok(())
     }
 
@@ -2923,8 +2948,16 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             return Err(make_error_1506(self));
         }
 
-        let val = dm.dm_read::<4>(address).ok_or_else(|| make_error_1506(self))?;
-        self.push_stack(f32::from_le_bytes(val));
+        let val = dm.dm_read::<4>(address).ok_or_else(|| {
+            make_error_1506(self)
+        })?;
+        drop(dm);
+        // Preserve the EXACT bits, like `op_lf64`: promote the f32 to f64 and box
+        // losslessly. `push_stack(f32)` went through `Value::from` which
+        // canonicalizes a NaN payload — a divergence on the FlasCC raw-memory
+        // copy-through path (and the mops float round-trip).
+        let v = Value::number_lossless(self.gc(), f32::from_le_bytes(val) as f64);
+        self.push_stack(v);
 
         Ok(())
     }
@@ -2942,8 +2975,16 @@ impl<'a, 'gc> Activation<'a, 'gc> {
             return Err(make_error_1506(self));
         }
 
-        let val = dm.dm_read::<8>(address).ok_or_else(|| make_error_1506(self))?;
-        self.push_stack(f64::from_le_bytes(val));
+        let val = dm.dm_read::<8>(address).ok_or_else(|| {
+            make_error_1506(self)
+        })?;
+        drop(dm);
+        // Preserve the EXACT bits: FlasCC copies raw memory through `lf64`/`sf64`,
+        // so a NaN-payload word (e.g. a Lua compiler struct field) must survive the
+        // round-trip. `Value::Number` would canonicalize it; `number_lossless` keeps
+        // it (heap-boxing only the rare colliding pattern).
+        let v = Value::number_lossless(self.gc(), f64::from_le_bytes(val));
+        self.push_stack(v);
         Ok(())
     }
 

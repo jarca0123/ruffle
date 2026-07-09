@@ -169,7 +169,7 @@ pub fn get_shader_args<'gc>(
                             ImageInputTexture::Bitmap(
                                 bitmap.bitmap_handle(activation.gc(), activation.context.renderer),
                             )
-                        } else if let Some(byte_array) = input.as_bytearray() {
+                        } else if let Some(mut byte_array) = input.as_bytearray_mut() {
                             assert_eq!(byte_array.endian(), Endian::Little);
 
                             let (bytes, _) = byte_array.bytes().as_chunks::<4>();

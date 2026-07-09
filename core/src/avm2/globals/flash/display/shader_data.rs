@@ -26,7 +26,7 @@ pub fn _set_byte_code<'gc>(
     let this = this.as_object().unwrap();
 
     let bytecode = args.get_object(activation, 0, "bytecode")?;
-    let bytecode = bytecode.as_bytearray().unwrap();
+    let mut bytecode = bytecode.as_bytearray_mut().unwrap();
     let shader = parse_shader(bytecode.bytes(), true).map_err(|err| {
         tracing::warn!("Failed to parse a Pixel Bender shader: {err}");
         match err {

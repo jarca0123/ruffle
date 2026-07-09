@@ -10,7 +10,7 @@ use crate::avm2::function::{FunctionArgs, exec};
 use crate::avm2::object::{NamespaceObject, Object, TObject, XmlListObject};
 use crate::avm2::property::Property;
 use crate::avm2::script::TranslationUnit;
-use crate::avm2::vtable::VTable;
+use crate::avm2::vtable::{ClassBoundMethod, VTable};
 use crate::avm2::{Error, Multiname};
 use crate::ecma_conversions::{f64_to_wrapping_i32, f64_to_wrapping_u32};
 use crate::string::{AvmAtom, AvmString, WStr};
@@ -19,6 +19,7 @@ use num_bigint::BigInt;
 use num_traits::{ToPrimitive, Zero};
 use ruffle_macros::istr;
 use gc_arena::Gc;
+use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::mem::size_of;
 use swf::avm2::types::DefaultValue as AbcDefaultValue;
@@ -106,6 +107,11 @@ const TAG_BOOL: u64 = 2;
 const TAG_INT: u64 = 3;
 const TAG_STRING: u64 = 4;
 const TAG_OBJECT: u64 = 5;
+/// A `Number` whose f64 bits collide with the box space (a negative quiet-NaN,
+/// `bits & BOX_MARK == BOX_MARK`) and so can't be stored inline. The payload is a
+/// `Gc<f64>` holding the exact bits. Only produced by [`Value::number_lossless`]
+/// (domainMemory float loads), never by ordinary arithmetic — see there.
+const TAG_BOXED_DOUBLE: u64 = 6;
 
 // The packed value must be exactly pointer-sized — that's the whole point.
 const _: () = assert!(size_of::<Value<'_>>() == 8);
@@ -154,10 +160,22 @@ impl<'gc> Value<'gc> {
         (!self.is_f64() && self.tag() == TAG_INT).then(|| self.payload() as u32 as i32)
     }
 
-    /// The `f64` if this is a packed `Number`, else `None`.
+    /// The `f64` if this is a `Number` — inline, or a heap-boxed colliding NaN
+    /// (see [`TAG_BOXED_DOUBLE`]) — else `None`. Centralising the boxed-double
+    /// deref here keeps every numeric fast path (`coerce_to_*`, `abstract_eq`)
+    /// correct without each having to know about the box.
     #[inline]
     fn packed_f64(self) -> Option<f64> {
-        self.is_f64().then(|| f64::from_bits(self.bits))
+        if self.is_f64() {
+            return Some(f64::from_bits(self.bits));
+        }
+        if self.tag() == TAG_BOXED_DOUBLE {
+            // SAFETY: the payload is a live `Gc<f64>` pointer produced by
+            // `number_lossless`, valid for this `'gc` inside the arena.
+            let ptr: *const f64 = std::ptr::with_exposed_provenance(self.payload() as usize);
+            return Some(unsafe { *ptr });
+        }
+        None
     }
 
     /// The numeric value as `f64` if this is a `Number` *or* an `Integer`, else
@@ -199,6 +217,27 @@ impl<'gc> Value<'gc> {
         }
     }
 
+    /// Construct a `Number` preserving the **exact** f64 bit pattern, including
+    /// arbitrary NaN payloads. Used by domainMemory float loads (`lf32`/`lf64`),
+    /// where the bytes are raw memory that FlasCC/CrossBridge copies *through*
+    /// doubles (`lf64;…;sf64`), so a NaN payload must survive the round-trip.
+    ///
+    /// Ordinary AS3 arithmetic goes through [`Value::Number`], which canonicalizes
+    /// NaN (AS3 has a single observable NaN) — that's correct and allocation-free.
+    /// Here, a value whose bits collide with the box space (a negative quiet-NaN,
+    /// the ~1/4096 of raw patterns where `bits & BOX_MARK == BOX_MARK`) is boxed on
+    /// the heap; everything else — all finite/inf values and positive NaNs — stays
+    /// inline, so the hot path is unchanged.
+    pub fn number_lossless(mc: &gc_arena::Mutation<'gc>, n: f64) -> Self {
+        let bits = n.to_bits();
+        if bits & BOX_MARK != BOX_MARK {
+            Self { bits, _marker: PhantomData }
+        } else {
+            let gc = Gc::new(mc, n);
+            Self::boxed(TAG_BOXED_DOUBLE, Gc::as_ptr(gc).expose_provenance() as u64)
+        }
+    }
+
     /// Unpack back into the wide [`ValueEnum`] for matching.
     #[inline]
     pub fn unpack(self) -> ValueEnum<'gc> {
@@ -219,6 +258,12 @@ impl<'gc> Value<'gc> {
             }),
             TAG_OBJECT => ValueEnum::Object(unsafe {
                 Object::from_gc_ptr(std::ptr::with_exposed_provenance(self.payload() as usize))
+            }),
+            // A colliding NaN kept on the heap to preserve its exact bits.
+            // Widens back to a plain `Number` — callers never see the box.
+            // SAFETY: as in `packed_f64`.
+            TAG_BOXED_DOUBLE => ValueEnum::Number(unsafe {
+                *std::ptr::with_exposed_provenance::<f64>(self.payload() as usize)
             }),
             other => unreachable!("invalid Value tag {other}"),
         }
@@ -288,7 +333,16 @@ impl std::fmt::Debug for Value<'_> {
 unsafe impl<'gc> Collect<'gc> for Value<'gc> {
     #[inline]
     fn trace<T: gc_arena::collect::Trace<'gc>>(&self, cc: &mut T) {
-        // Immediates and numbers hold no pointers.
+        // A boxed double owns a `Gc<f64>` that `unpack` hides as a plain `Number`,
+        // so trace it here from the tag directly — else it would be collected.
+        if !self.is_f64() && self.tag() == TAG_BOXED_DOUBLE {
+            // SAFETY: as in `packed_f64` — a live `Gc<f64>` of this `'gc`.
+            let gc: Gc<'gc, f64> =
+                unsafe { Gc::from_ptr(std::ptr::with_exposed_provenance(self.payload() as usize)) };
+            cc.trace(&gc);
+            return;
+        }
+        // Immediates and inline numbers hold no pointers; String/Object do.
         match self.unpack() {
             ValueEnum::String(s) => cc.trace(&s),
             ValueEnum::Object(o) => cc.trace(&o),
@@ -851,6 +905,53 @@ pub fn abc_default_value<'gc>(
             Ok(NamespaceObject::from_namespace(activation, ns).into())
         }
     }
+}
+
+/// Number of slots in the per-thread method-resolution inline cache (see
+/// [`Value::call_method_with_args`]). Power of two; direct-mapped.
+const RESOLVE_IC_SIZE: usize = 2048;
+
+thread_local! {
+    /// Direct-mapped `(vtable_ptr, disp_id) -> resolved non-arguments
+    /// `ClassBoundMethod` pointer` cache. Keyed by raw pointers: gc_arena is
+    /// non-moving, and a vtable/class lives for the SWF's lifetime — the same
+    /// pointer-stability the JIT's method cache already relies on. Per thread, so
+    /// the worker and main players don't share (and need no locking).
+    static RESOLVE_IC: RefCell<Box<[Option<(usize, usize, *const ())>]>> =
+        RefCell::new(vec![None; RESOLVE_IC_SIZE].into_boxed_slice());
+}
+
+#[inline]
+fn resolve_ic_slot(vt: usize, id: usize) -> usize {
+    // Vtable pointers are ≥ word-aligned (low bits 0), so mix multiplicatively.
+    // `0x9E37_79B9` is the golden-ratio constant that fits `usize` on wasm32 (32-bit)
+    // and native (64-bit) alike.
+    (vt.wrapping_mul(0x9E37_79B9).wrapping_add(id)) & (RESOLVE_IC_SIZE - 1)
+}
+
+/// Look up a cached `(vtable, id)` method resolution.
+///
+/// # Safety of the returned reference
+/// The stored pointer came from a live `&'gc ClassBoundMethod` owned by the vtable
+/// at `vt`. The caller derived `vt` from a live receiver, so that vtable — and the
+/// method it (or a live parent) owns — is alive for `'gc`, and gc_arena never moves
+/// it. A stale entry can only be returned if a freed vtable pointer is reused
+/// (ABA), the same assumption the JIT's method-pointer cache already makes.
+fn resolve_ic_get<'gc>(vt: usize, id: usize) -> Option<&'gc ClassBoundMethod<'gc>> {
+    RESOLVE_IC.with(|ic| match ic.borrow()[resolve_ic_slot(vt, id)] {
+        Some((v, i, p)) if v == vt && i == id => {
+            Some(unsafe { &*(p as *const ClassBoundMethod<'gc>) })
+        }
+        _ => None,
+    })
+}
+
+/// Record a `(vtable, id) -> method` resolution for the fast path above.
+fn resolve_ic_put(vt: usize, id: usize, fm: &ClassBoundMethod<'_>) {
+    let slot = resolve_ic_slot(vt, id);
+    RESOLVE_IC.with(|ic| {
+        ic.borrow_mut()[slot] = Some((vt, id, std::ptr::from_ref(fm) as *const ()));
+    });
 }
 
 impl<'gc> Value<'gc> {
@@ -1682,6 +1783,32 @@ impl<'gc> Value<'gc> {
         // in `as_object` and again in `vtable`, on every resolved method call).
         let object = self.as_object();
 
+        // Resolve the vtable up front — it keys the method-resolution inline cache.
+        // (`object.vtable()` is a field read; the primitive `self.vtable()` was
+        // already computed on this path, just later.)
+        let vtable = match object {
+            Some(object) => object.vtable(),
+            None => self.vtable(activation), // primitive receiver
+        };
+        let vt_ptr = vtable.as_ptr() as usize;
+
+        // Method-resolution inline cache: a monomorphic call site resolves the same
+        // (vtable, id) → non-arguments method every call. On a hit, skip the
+        // per-object bound-method probe AND the vtable lookup and dispatch straight
+        // to `exec` (call-dense AVM2 like Starling spends real time in this
+        // resolution). Only non-arguments methods are cached — see below.
+        if let Some(fm) = resolve_ic_get(vt_ptr, id) {
+            return exec(
+                fm.method,
+                fm.scope(),
+                *self,
+                fm.super_class_obj,
+                arguments,
+                activation,
+                None,
+            );
+        }
+
         // TODO: Bound methods should be cached on the Method in a
         // WeakKeyHashMap<Value, FunctionObject>, not on the Object
         if let Some(object) = object
@@ -1690,15 +1817,14 @@ impl<'gc> Value<'gc> {
             return bound_method.call(activation, *self, arguments);
         }
 
-        let vtable = match object {
-            Some(object) => object.vtable(),
-            None => self.vtable(activation), // primitive receiver
-        };
-
         let full_method = vtable.get_full_method(id).expect("Method should exist");
 
         // Execute immediately if this method doesn't require binding
         if !full_method.method.needs_arguments_object() {
+            // Cache the resolution so the next call on this class hits the fast
+            // path above. (Only non-arguments methods: they call straight through;
+            // arguments-object methods keep the per-object bound-method path.)
+            resolve_ic_put(vt_ptr, id, full_method);
             return exec(
                 full_method.method,
                 full_method.scope(),

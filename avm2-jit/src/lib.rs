@@ -28,6 +28,8 @@
 //! web execution path (browser bridge over shared memory) is not wired up yet,
 //! so on `wasm32` it also declines.
 
+#![feature(thread_local)]
+
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -95,6 +97,10 @@ struct GenSource {
     ops: Rc<[lower::JitOp]>,
     switches: Rc<[lower::SwitchTable]>,
     exceptions: Rc<[lower::ExcRange]>,
+    /// The AVM2 method name, emitted into the amalgam module's wasm name section
+    /// so profilers label each JIT-compiled method (otherwise every method shows
+    /// as `wasm-function[N]` and its samples mis-attribute to its caller).
+    name: Rc<str>,
 }
 
 impl GenSource {
@@ -106,6 +112,7 @@ impl GenSource {
             ops: Rc::from([] as [lower::JitOp; 0]),
             switches: Rc::from([] as [lower::SwitchTable; 0]),
             exceptions: Rc::from([] as [lower::ExcRange; 0]),
+            name: Rc::from(""),
         }
     }
 }
@@ -125,10 +132,27 @@ type CacheEntry = Option<Rc<Compiled>>;
 /// the reserved entry-slot pool on method-heavy content (OpenTTD).
 const GEN_BATCH: usize = 128;
 
+/// Inline-cache table size (power of two — the mask is `IC_SIZE - 1`). Direct-
+/// mapped method-ptr → `Compiled`, fronting the `cache` HashMap on the hot path.
+const IC_SIZE: usize = 4096;
+
 /// Diagnostic: dump every call-bearing method the JIT has run when the FlasCC
 /// allocator throws its `#1506` heap-corruption error. Set `true` to hunt the
 /// CallMethod corruptor (needs `JIT_CALLMETHOD = true`); off for shipping.
 const DUMP_ON_1506: bool = false;
+
+/// Diagnostic: log each method's name + op count the first time the JIT decides
+/// its fate (compiled vs declined). Grep the run for a specific method (e.g.
+/// `F_lua_newstate`) to learn whether the JIT translated it or left it to the
+/// interpreter. Off for shipping.
+const LOG_JIT_METHODS: bool = false;
+
+/// Diagnostic/bisection: decline to JIT any method whose name contains one of
+/// these substrings, leaving it to the interpreter while the JIT stays on for
+/// everything else. Used to localise a JIT miscompile: if declining method X
+/// makes a fault vanish, X's translation is at fault; if it persists, X merely
+/// inherited already-corrupt state from an upstream JIT'd method. Empty = ship.
+const JIT_DENY_SUBSTRINGS: &[&str] = &[];
 
 thread_local! {
     /// Ordered log of every **call-bearing** method this thread's JIT has executed
@@ -176,6 +200,15 @@ pub struct WasmJit {
     /// Compiled module bytes keyed by [`Method::as_ptr`]. `Some(None)` records a
     /// method we've already found unsupported so we don't retranslate it.
     cache: RefCell<FnvHashMap<usize, CacheEntry>>,
+    /// Monomorphic-ish **inline cache** fronting `cache`: a direct-mapped table
+    /// (method-ptr → its `Compiled`) so the hot per-call path skips the `HashMap`
+    /// hash+probe (`WasmJit` dispatch was the single biggest JIT-entry cost on
+    /// call-dense content). Only *successfully compiled* entries are cached (never
+    /// a decline — those are rare in the hot path and must stay retry-able for the
+    /// script-init deferral). Per-thread (each worker's `WasmJit` is thread-local),
+    /// so no cross-thread aliasing. Kept in sync trivially: a key's `Compiled` `Rc`
+    /// is set once and never changes identity.
+    ic: RefCell<Box<[Option<(usize, Rc<Compiled>)>]>>,
     /// When set, every JIT run is also executed through the real interpreter and
     /// the two results are asserted equal (differential self-check). Opt-in —
     /// only sound for the side-effect-free methods the JIT accepts.
@@ -217,6 +250,7 @@ impl Default for WasmJit {
     fn default() -> Self {
         Self {
             cache: RefCell::new(FnvHashMap::default()),
+            ic: RefCell::new(vec![None; IC_SIZE].into_boxed_slice()),
             verify: false,
             in_verify: Cell::new(false),
             #[cfg(target_arch = "wasm32")]
@@ -338,6 +372,18 @@ impl WasmJit {
         if let Some(entry) = self.cache.borrow().get(&key) {
             return entry.clone();
         }
+        // Bisection denylist: leave named methods to the interpreter (see
+        // `JIT_DENY_SUBSTRINGS`).
+        if !JIT_DENY_SUBSTRINGS.is_empty() {
+            let name = method.method_name();
+            if JIT_DENY_SUBSTRINGS.iter().any(|s| name.contains(s)) {
+                if LOG_JIT_METHODS {
+                    tracing::info!("JIT DENYLISTED {name}");
+                }
+                self.cache.borrow_mut().insert(key, None);
+                return None;
+            }
+        }
         // Low-memory guard (web): compiling allocates (wasm-encoder buffers,
         // caches, tables), and a failed allocation inside `try_run` ABORTS the
         // whole player (`handle_alloc_error` → `unreachable`, seen in the field
@@ -350,9 +396,29 @@ impl WasmJit {
             self.cache.borrow_mut().insert(key, None);
             return None;
         }
+        // Init-ordering guard: don't compile a method that references a script
+        // (`getscriptglobals`) which hasn't been initialized yet. Building the side
+        // tables resolves script globals eagerly (`script_globals_table` →
+        // `Script::globals`), which RUNS the script initializer — at method *entry*
+        // rather than at the `getscriptglobals` op, reordering observable class/
+        // script inits (the `lazyinit` / `loader_duplicate_class` tests). Let the
+        // interpreter run this method once (initializing scripts in op order); a
+        // later invocation compiles safely, when the eager resolution is a pure
+        // cache hit. Retry-able, so DON'T cache the decline.
+        if method
+            .get_verified_info()
+            .parsed_code
+            .iter()
+            .any(|op| matches!(op, Op::GetScriptGlobals { script } if !script.is_initialized()))
+        {
+            return None;
+        }
         let entry: CacheEntry = locals_typed_seed(activation, method)
             .and_then(|(int_seed, double_seed)| compile_method(method, &int_seed, &double_seed))
-            .map(|(bytes, manifest, mn_list, gen_src)| {
+            .map(|(bytes, manifest, mn_list, mut gen_src)| {
+                // Record the method name for the amalgam's wasm name section
+                // (this is the only place with the `Method` in scope).
+                gen_src.name = method.method_name().as_ref().into();
                 // Build the per-method side tables ONCE, here (the only place with
                 // both the compile result and an activation for script-globals
                 // resolution) — the hot path then just installs the cached slices.
@@ -396,11 +462,26 @@ impl WasmJit {
         // On the first (and only) miss for a method that declined, record why —
         // the first op the boxed path can't lower (`<compile>` if all ops are
         // supported but the lowering bailed). Skips body-less methods.
-        if entry.is_none() && method.body().is_some() {
+        let decline_reason = (entry.is_none() && method.body().is_some()).then(|| {
             let core_ops = &method.get_verified_info().parsed_code;
-            let reason = translate::first_unsupported_boxed(core_ops)
-                .unwrap_or_else(|| "<compile>".to_string());
-            self.record_decline(reason);
+            translate::first_unsupported_boxed(core_ops).unwrap_or_else(|| "<compile>".to_string())
+        });
+        if let Some(reason) = &decline_reason {
+            self.record_decline(reason.clone());
+        }
+        if LOG_JIT_METHODS {
+            let op_count = method.body().map(|b| b.code.len()).unwrap_or(0);
+            tracing::info!(
+                "JIT {} {} (locals={}, ops={}){}",
+                if entry.is_some() { "compiled" } else { "DECLINED" },
+                method.method_name(),
+                method.body().map(|b| b.num_locals).unwrap_or(0),
+                op_count,
+                decline_reason
+                    .as_deref()
+                    .map(|r| format!(" reason={r}"))
+                    .unwrap_or_default(),
+            );
         }
         self.cache.borrow_mut().insert(key, entry.clone());
         // Web: fold freshly compiled methods into a GENERATION module per batch
@@ -440,6 +521,7 @@ impl WasmJit {
                     ops: &c.gen_src.ops,
                     switches: &c.gen_src.switches,
                     exceptions: &c.gen_src.exceptions,
+                    name: &c.gen_src.name,
                 })
                 .collect();
             let Some((bytes, union)) = lower::compile_generation(&members) else {
@@ -558,6 +640,8 @@ fn compile_method<'gc>(
             ops: ops.into(),
             switches: switches.into(),
             exceptions: exceptions.into(),
+            // Filled in by the caller (which has the `Method` for `method_name`).
+            name: Rc::from(""),
         };
         Some((bytes, lower::manifest(ops), mn_list.into(), gen_src))
     };
@@ -816,6 +900,8 @@ fn multiname_table(method: Method<'_>) -> Vec<*const ()> {
             // so the sets align.
             Op::GetPropertyStatic { multiname }
             | Op::GetPropertyFast { multiname }
+            | Op::FindPropStrict { multiname }
+            | Op::FindProperty { multiname }
             | Op::CallProperty { multiname, .. }
             | Op::CallPropVoid { multiname, .. }
             | Op::ConstructProp { multiname, .. }
@@ -1005,7 +1091,28 @@ impl JitBackend for WasmJit {
         // classes) is built once at compile time and cached in `Compiled` — the hot
         // path below only installs the cached slices (incl. `num_locals`, so the
         // per-call `method.body()` deref chain is gone).
-        let compiled = self.compiled(activation, method)?;
+        //
+        // Inline cache: try the direct-mapped `ic` slot first, so a hot method skips
+        // the `cache` HashMap hash+probe entirely. On a miss (or the slot holds a
+        // different method), fall through to `compiled()` and refill the slot — but
+        // only with a real `Compiled` (`?` already returned for a decline), so a
+        // retry-able decline is never cached here.
+        let key = method.as_ptr() as usize;
+        let slot = (key >> 4) & (IC_SIZE - 1);
+        let compiled = {
+            let hit = match &self.ic.borrow()[slot] {
+                Some((k, c)) if *k == key => Some(c.clone()),
+                _ => None,
+            };
+            match hit {
+                Some(c) => c,
+                None => {
+                    let c = self.compiled(activation, method)?;
+                    self.ic.borrow_mut()[slot] = Some((key, c.clone()));
+                    c
+                }
+            }
+        };
         let (bytes, manifest) = (&compiled.bytes, &compiled.manifest);
         let num_locals = compiled.num_locals as usize;
 
@@ -1031,7 +1138,7 @@ impl JitBackend for WasmJit {
             unsafe { std::slice::from_raw_parts(activation.local_registers_ptr(), num_locals) }
         };
 
-        let key = method.as_ptr() as usize;
+        // (`key` was computed above for the inline-cache probe.)
 
         // Diagnostic: log each method's name + ops the first time it JIT-executes,
         // so if a JIT'd method hangs (infinite loop), the *last* `JIT-EXEC` line

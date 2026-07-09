@@ -302,7 +302,9 @@ impl ActivePlayer {
         builder = builder
             .with_navigator(navigator)
             .with_renderer(renderer)
-            .with_worker_host(ruffle_core::worker_host::ThreadWorkerHost)
+            // TEMP: disable worker/concurrency support to force CrossBridge onto
+            // its single-threaded path (was `ThreadWorkerHost`).
+            .with_worker_host(ruffle_core::worker_host::NullWorkerHost)
             // TEST: force a sane frame rate. FlasCC content declares ~0.12 FPS
             // (≈8.5s/frame) and drives itself via frames/timers, so the low rate
             // makes the whole thing glacial (and starves worker busy-waits).
@@ -354,6 +356,17 @@ impl ActivePlayer {
                 ruffle_avm2_jit::WasmJit::shared()
             };
             player.lock().expect("player lock").set_avm2_jit_backend(jit);
+        }
+
+        // Opt-in AVM opcode tracing from startup — a frame-1 fault (e.g. the
+        // CrossBridge Lua compile) throws before the Ctrl+Alt+D runtime toggle can
+        // be pressed. Needs `--features avm_debug` and a debug-level filter, e.g.
+        // `RUST_LOG=ruffle_core::avm2=debug`.
+        if std::env::var("RUFFLE_AVM_DEBUG").is_ok() {
+            player
+                .lock()
+                .expect("player lock")
+                .set_avm_debug_output(true);
         }
 
         window.set_title(&format!("Ruffle - {readable_name}"));

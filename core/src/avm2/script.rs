@@ -671,6 +671,18 @@ impl<'gc> Script<'gc> {
         self.0.globals.instance_class()
     }
 
+    /// Whether the script initializer has already run (its globals resolved).
+    ///
+    /// The AVM2 JIT consults this before compiling a method: eagerly resolving a
+    /// `getscriptglobals` operand runs the initializer via [`Self::globals`], so a
+    /// method referencing an *uninitialized* script must not be compiled yet — the
+    /// init would fire at method entry instead of at the op, reordering observable
+    /// class/script initialization.
+    #[inline]
+    pub fn is_initialized(self) -> bool {
+        self.0.initialized.get()
+    }
+
     /// Return the global scope for the script.
     ///
     /// If the script has not yet been initialized, this will initialize it on

@@ -571,10 +571,10 @@ impl NavigatorBackend for WebNavigatorBackend {
     }
 }
 
-struct WebResponseWrapper {
-    rewritten_url: Option<String>,
-    response: WebResponse,
-    body_stream: Option<Rc<RefCell<ReadableStream>>>,
+pub(crate) struct WebResponseWrapper {
+    pub(crate) rewritten_url: Option<String>,
+    pub(crate) response: WebResponse,
+    pub(crate) body_stream: Option<Rc<RefCell<ReadableStream>>>,
 }
 
 impl SuccessResponse for WebResponseWrapper {

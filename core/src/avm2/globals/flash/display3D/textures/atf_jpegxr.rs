@@ -18,8 +18,8 @@ pub fn do_compressed_upload<'gc>(
     byte_array_offset: usize,
     is_cube: bool,
 ) -> Result<(), Error<'gc>> {
-    let bytes = data.as_bytearray().unwrap();
-    let raw_atf = &ByteArrayStorage::bytes(&bytes)[byte_array_offset..];
+    let mut bytes = data.as_bytearray_mut().unwrap();
+    let raw_atf = &ByteArrayStorage::bytes(&mut bytes)[byte_array_offset..];
 
     let atf_texture = ATFTexture::from_bytes(raw_atf).expect("Failed to parse ATF texture");
 

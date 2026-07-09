@@ -86,7 +86,7 @@ pub(crate) fn value_to_shared(value: Value<'_>) -> Option<SharedValue> {
         ValueEnum::Number(n) => Some(SharedValue::Number(n)),
         ValueEnum::String(s) => Some(SharedValue::Str(s.to_string())),
         ValueEnum::Object(o) => {
-            if let Some(ba) = o.as_bytearray() {
+            if let Some(mut ba) = o.as_bytearray_mut() {
                 // A `shareable` ByteArray crosses by reference; otherwise it is
                 // copied by value. (No pinning needed: growth moves synchronize
                 // with every accessor — see `SharedByteBuffer`.)

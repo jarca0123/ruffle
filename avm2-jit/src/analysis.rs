@@ -231,6 +231,7 @@ fn simulate_block(block: &[JitOp], mut locals: Vec<bool>) -> Option<Vec<bool>> {
             | JitOp::GetProperty(_)
             | JitOp::GetPropertyFast(_)
             | JitOp::GetSlot(_)
+            | JitOp::FindProp(_, _)
             | JitOp::PushIntValue(_)
             | JitOp::PushConst(_)
             | JitOp::CallHelper3(_, _)

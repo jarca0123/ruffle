@@ -202,7 +202,7 @@ pub fn request_from_url_request<'gc>(
 
             let payload = if let Some(ba) = data.as_object().and_then(|o| o.as_bytearray_object()) {
                 // Note that this does *not* respect or modify the position.
-                ba.storage().bytes().to_vec()
+                ba.storage_mut().bytes().to_vec()
             } else {
                 data.coerce_to_string(activation)?
                     .to_utf8_lossy()
@@ -238,7 +238,7 @@ pub fn load_bytes<'gc>(
     let this = this.as_object().unwrap();
 
     let arg0 = args.get_object(activation, 0, "data")?;
-    let bytes = arg0.as_bytearray().unwrap().bytes().to_vec();
+    let bytes = arg0.as_bytearray_mut().unwrap().bytes().to_vec();
     let context = args.try_get_object(1);
 
     let loader_info = this

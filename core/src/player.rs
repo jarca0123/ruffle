@@ -733,6 +733,17 @@ impl Player {
         });
     }
 
+    /// Enable/disable AVM opcode debug tracing from startup (the `avm_debug`
+    /// feature's `Opcode: {op}` stream, normally toggled at runtime with
+    /// Ctrl+Alt+D). Needed to trace a fault that happens on frame 1, before any
+    /// key press. No-op unless built with `--features avm_debug`.
+    pub fn set_avm_debug_output(&mut self, visible: bool) {
+        self.enter_arena_mut(|_, gc_root, _| {
+            gc_root.avm1.set_show_debug_output(visible);
+            gc_root.avm2.set_show_debug_output(visible);
+        });
+    }
+
     pub fn run_context_menu_callback(&mut self, index: usize) {
         self.mutate_with_update_context(|context| {
             let menu = &context.current_context_menu;

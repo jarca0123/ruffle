@@ -173,7 +173,7 @@ impl Avm2ObjectWindow {
                     ui.end_row();
                 }
 
-                if let Some(ba) = object.as_bytearray() {
+                if let Some(mut ba) = object.as_bytearray_mut() {
                     ui.label("Byte Array");
 
                     if ba.len() > 0 {

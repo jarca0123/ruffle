@@ -300,6 +300,13 @@ impl<'gc> VTable<'gc> {
         self.get_full_method(disp_id).map(|m| m.method)
     }
 
+    /// The vtable's identity as a raw pointer — a stable key for the
+    /// method-resolution inline cache (gc_arena is non-moving; a vtable lives as
+    /// long as its class). See `Value::call_method_with_args`.
+    pub fn as_ptr(self) -> *const () {
+        Gc::as_ptr(self.0) as *const ()
+    }
+
     pub fn get_full_method(self, disp_id: usize) -> Option<&'gc ClassBoundMethod<'gc>> {
         let data = Gc::as_ref(self.0);
         // Methods owned by this class: a direct index — no walk, no cache.

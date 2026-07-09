@@ -397,6 +397,15 @@ impl<'gc> Domain<'gc> {
                 panic!("Domain memory bytearray must not be larger than i32::MAX!");
             }
 
+            // avmplus subscribes (enables the fast `li*`/`si*` path) at
+            // set-domainMemory time, not lazily. Promote the buffer to shared here
+            // so ALL consumers — the JIT inline dm path, the DataInput read API, and
+            // the Stage3D texture/vertex upload — observe one coherent buffer from
+            // the start. A lazy promotion on the first JIT dm-touch could otherwise
+            // land mid-frame, after the render already read the pre-promotion buffer
+            // (the Starling Flash-logo glitch).
+            domain_memory.storage_mut().make_shareable();
+
             domain_memory
         } else {
             let memory = self.0.default_domain_memory.get();

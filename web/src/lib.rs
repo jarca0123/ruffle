@@ -8,12 +8,29 @@ mod input;
 mod log_adapter;
 mod navigator;
 mod storage;
+#[cfg(target_arch = "wasm32")]
+mod tlsf_alloc;
 mod ui;
+
+// Replace the default wasm allocator (`dlmalloc`, which walks free lists and
+// thrashes under our mixed huge-bitmap/tiny-alloc workload) with an O(1) TLSF
+// allocator. See `tlsf_alloc` for the full rationale.
+#[cfg(target_arch = "wasm32")]
+#[global_allocator]
+static ALLOC: tlsf_alloc::TlsfAlloc = tlsf_alloc::TlsfAlloc::new();
 #[cfg(feature = "threads")]
 mod worker_bridge;
 mod worker_host;
 #[cfg(all(feature = "threads", feature = "gl"))]
+mod worker_audio;
+#[cfg(all(feature = "threads", feature = "gl"))]
+mod worker_navigator;
+#[cfg(all(feature = "threads", feature = "gl"))]
 mod worker_player;
+#[cfg(all(feature = "threads", feature = "gl"))]
+mod worker_storage;
+#[cfg(all(feature = "threads", feature = "gl"))]
+mod worker_ui;
 #[cfg(all(feature = "threads", feature = "gl"))]
 mod worker_shell;
 mod zip;

@@ -75,7 +75,7 @@ features = ["audio", "mp3", "aac", "nellymoser", "default_compatibility_rules", 
 [dependencies.web-sys]
 workspace = true
 features = [
-    "AddEventListenerOptions", "AudioBuffer", "AudioBufferSourceNode", "AudioContext", "AudioContextOptions",
+    "AddEventListenerOptions", "AudioBuffer", "AudioBufferSourceNode", "AudioContext", "AudioContextOptions", "AudioContextState",
     "AudioDestinationNode", "AudioNode", "AudioParam", "Blob", "BlobPropertyBag",
     "ChannelMergerNode", "ChannelSplitterNode", "ClipboardEvent", "DataTransfer", "Element",
     "EventTarget", "GainNode", "Headers", "HtmlCanvasElement", "HtmlDocument", "HtmlElement", "HtmlFormElement",
@@ -83,13 +83,20 @@ features = [
     "Request", "RequestInit", "Response", "Storage", "WheelEvent", "Window", "ReadableStream", "RequestCredentials",
     "Url", "WebGlContextEvent", "Clipboard", "FocusEvent", "FocusOptions", "ShadowRoot", "Gamepad", "GamepadButton", "OffscreenCanvas",
     "TextMetrics", "OffscreenCanvasRenderingContext2d",
-    "WorkerGlobalScope", "MessageChannel", "MessagePort", "MessageEvent",
+    "WorkerGlobalScope", "WorkerLocation", "WorkerNavigator", "MessageChannel", "MessagePort", "MessageEvent",
     "DedicatedWorkerGlobalScope"
 ]
 
 [target.'cfg(target_family = "wasm")'.dependencies.getrandom]
 version = "0.3"
 features = ["wasm_js"]
+
+# TLSF (two-level segregated fit) allocator, used as the wasm `#[global_allocator]`.
+# `default-features = false` keeps it `no_std` (we only use the core `Tlsf` engine
+# and back it onto `memory.grow` ourselves — see `src/tlsf_alloc.rs`).
+[target.'cfg(target_arch = "wasm32")'.dependencies.rlsf]
+version = "0.2"
+default-features = false
 
 [package.metadata.cargo-machete]
 ignored = [

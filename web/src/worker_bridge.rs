@@ -17,7 +17,7 @@
 //! data, so the block is `Send`/`Sync` and needs no GC awareness.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ruffle_core::worker_host::WorkerHost;
@@ -54,6 +54,30 @@ pub struct WorkerBridge {
     /// pointer is valid on the main thread and the spawned worker sees the same
     /// shared buffers/mutexes/conditions.
     spawn_requests: Mutex<VecDeque<usize>>,
+    /// SharedObject writes the worker made, for the main thread to persist to
+    /// `localStorage` (which a worker can't touch). Reads are served from the
+    /// startup snapshot in `WorkerInit`, so only writes cross the bridge.
+    storage_writes: Mutex<VecDeque<StorageWrite>>,
+    /// Current clipboard text. The main thread writes it from the DOM `paste`
+    /// event (the only place the text is available); the worker's UI backend
+    /// serves `clipboard_content()` from it. A worker can't read the clipboard.
+    clipboard: Mutex<String>,
+    /// Copy requests: text the worker wants placed on the system clipboard, for
+    /// the main thread to write via `navigator.clipboard` (worker can't).
+    clipboard_writes: Mutex<VecDeque<String>>,
+    /// The mouse cursor the worker wants shown, encoded per `worker_ui::CURSOR_*`.
+    /// The main thread owns the canvas element, so it applies the CSS `cursor`.
+    cursor: AtomicU8,
+    /// Pending fullscreen request from the worker: `0` none, `1` enter, `2` exit.
+    /// The main thread owns the canvas/document, so it performs the transition.
+    fullscreen_request: AtomicU8,
+}
+
+/// A pending SharedObject persist. `value` is the base64 string `localStorage`
+/// stores (see `LocalStorageBackend`); `None` deletes the key.
+pub struct StorageWrite {
+    pub name: String,
+    pub value: Option<String>,
 }
 
 impl WorkerBridge {
@@ -66,7 +90,84 @@ impl WorkerBridge {
             viewport_gen: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             spawn_requests: Mutex::new(VecDeque::new()),
+            storage_writes: Mutex::new(VecDeque::new()),
+            clipboard: Mutex::new(String::new()),
+            clipboard_writes: Mutex::new(VecDeque::new()),
+            cursor: AtomicU8::new(crate::worker_ui::CURSOR_ARROW),
+            fullscreen_request: AtomicU8::new(0),
         })
+    }
+
+    /// Sets the clipboard text (main thread, from the DOM `paste` event).
+    pub fn set_clipboard(&self, text: String) {
+        *self.clipboard.lock().expect("bridge clipboard poisoned") = text;
+    }
+
+    /// The current clipboard text (worker: `UiBackend::clipboard_content`).
+    pub fn clipboard(&self) -> String {
+        self.clipboard.lock().expect("bridge clipboard poisoned").clone()
+    }
+
+    /// Queues a system-clipboard write (worker: `UiBackend::set_clipboard_content`).
+    pub fn push_clipboard_write(&self, text: String) {
+        self.clipboard_writes
+            .lock()
+            .expect("bridge clipboard_writes poisoned")
+            .push_back(text);
+    }
+
+    /// Takes all pending clipboard writes (main thread).
+    pub fn drain_clipboard_writes(&self, out: &mut Vec<String>) {
+        out.extend(
+            self.clipboard_writes
+                .lock()
+                .expect("bridge clipboard_writes poisoned")
+                .drain(..),
+        );
+    }
+
+    /// Records the cursor the worker wants shown (worker thread).
+    pub fn set_cursor(&self, code: u8) {
+        self.cursor.store(code, Ordering::Relaxed);
+    }
+
+    /// The cursor code the worker last requested (main thread).
+    pub fn cursor(&self) -> u8 {
+        self.cursor.load(Ordering::Relaxed)
+    }
+
+    /// Requests a fullscreen transition (worker thread): `true` enter, `false` exit.
+    pub fn request_fullscreen(&self, enter: bool) {
+        self.fullscreen_request
+            .store(if enter { 1 } else { 2 }, Ordering::Relaxed);
+    }
+
+    /// Takes a pending fullscreen request (main thread), clearing it.
+    pub fn take_fullscreen_request(&self) -> Option<bool> {
+        match self.fullscreen_request.swap(0, Ordering::Relaxed) {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Queues a SharedObject persist (worker). `value` = base64 to write, `None`
+    /// to delete. Non-blocking: the worker holds the lock only for a `push_back`.
+    pub fn push_storage_write(&self, name: String, value: Option<String>) {
+        self.storage_writes
+            .lock()
+            .expect("bridge storage_writes poisoned")
+            .push_back(StorageWrite { name, value });
+    }
+
+    /// Takes all pending SharedObject writes (main thread).
+    pub fn drain_storage_writes(&self, out: &mut Vec<StorageWrite>) {
+        out.extend(
+            self.storage_writes
+                .lock()
+                .expect("bridge storage_writes poisoned")
+                .drain(..),
+        );
     }
 
     /// Queues a nested-worker spawn request (worker thread). `ptr` is a leaked

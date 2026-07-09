@@ -30,6 +30,8 @@ pub fn generate_random_bytes<'gc>(
     let mut rng = OsRng {};
 
     rng.try_fill_bytes(ba_write.bytes_mut()).unwrap();
+    // Propagate the in-place fill to the shared buffer (no-op unless shareable).
+    ba_write.flush_scratch();
 
     Ok(ba.into())
 }

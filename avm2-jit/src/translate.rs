@@ -76,7 +76,13 @@ pub fn translate(ops: &[Op]) -> Option<Vec<JitOp>> {
             // branch targets (op indices) stay aligned.
             Op::Pop | Op::PushScope => JitOp::Pop,
             Op::Dup => JitOp::Dup,
-            Op::Nop | Op::CoerceI | Op::Kill { .. } => JitOp::Nop,
+            // Debug metadata is a no-op (see the boxed path).
+            Op::Nop
+            | Op::CoerceI
+            | Op::Kill { .. }
+            | Op::Debug { .. }
+            | Op::DebugFile { .. }
+            | Op::DebugLine { .. } => JitOp::Nop,
             _ => return None,
         });
     }
@@ -111,6 +117,14 @@ const JIT_CONSTRUCT_SUPER: bool = true;
 /// Whether `Op::Call` (call a function *value* on the stack — no receiver/disp-id)
 /// JITs. Mirrors `op_call` (`Value::call`); shares the arg-spill + `perr` machinery.
 const JIT_CALL_VALUE: bool = true;
+
+/// Whether `findpropstrict`/`findproperty` JIT. This is the FlasCC C-call idiom
+/// (`findpropstrict F_fn; …; callpropvoid F_fn`) — the single biggest blocker for
+/// the hot CrossBridge/Lua methods, whose dispatch loops are saturated with it (and
+/// with `getlex`, which the verifier splits into `findpropstrict` + `getproperty`).
+/// Mirrors `op_find_prop_strict`/`op_find_property` via the `fp` helper; only
+/// non-lazy multinames compile (a lazy one consumes runtime name/ns off the stack).
+const JIT_FINDPROP: bool = true;
 
 /// Whether `getpropertyfast` (dynamic-name property read, `arr[i]`/dictionaries) JITs.
 /// Mirrors `op_get_property_fast` (index/dictionary fast path + a `fill_with_runtime_
@@ -166,11 +180,14 @@ const JIT_TYPE_LATE: bool = true;
 /// `Number`), falling back to the helper only for mixed/object operands.
 const INLINE_CMP: bool = true;
 
-/// Whether bitwise ops (`bitand`/`bitor`/`bitxor`/`lshift`/`rshift`) are **inlined**
-/// as an `i32` op with an int fast path (`BitOpInt`) rather than always crossing to
-/// the two-stack helper. Only int operands take the inline path (an int's low 32
-/// bits are already its `ToInt32`); `Number`/object operands fall back to the helper.
-/// `urshift` is excluded — its `uint` result can exceed `i32` range (different box).
+/// Whether bitwise ops (`bitand`/`bitor`/`bitxor`/`lshift`/`rshift`/`urshift`) are
+/// **inlined** as an `i32` op (`BitOpInt`) rather than always crossing to the
+/// two-stack helper. Two inline tiers: int operands (their low 32 bits are already
+/// `ToInt32`) and numeric `Number` operands with `|v| < 2^63` (pure-wasm wrapping
+/// `ToInt32` — the hot CrossBridge case, where these ops hit `Number`-boxed
+/// pointers/ints). Only strings/objects and out-of-range `Number`s reach the
+/// helper. `urshift` inlines too, boxing its `uint` result as `int` (`< 2^31`) or
+/// `Number` (`>= 2^31`) to match the helper.
 const INLINE_BITWISE: bool = true;
 
 /// Whether `coerce_i`/`coerce_u` are **inlined** with an int fast path (`CoerceInt`)
@@ -447,14 +464,16 @@ fn boxed_op(
         Op::LessEquals => JitOp::CallHelper2(CMP_LE),
         Op::GreaterThan => JitOp::CallHelper2(CMP_GT),
         Op::GreaterEquals => JitOp::CallHelper2(CMP_GE),
-        // Bitwise (operands coerced to i32/u32; `<<`/`>>` masked by 0x1F). Inlined
-        // as an `i32` op with an int fast path when enabled (`urshift` stays a helper
-        // — its `uint` result can exceed `i32` range, needing a different box).
+        // Bitwise (operands coerced to i32/u32; `<<`/`>>`/`>>>` masked by 0x1F).
+        // Inlined as an `i32` op with int and numeric-`Number` fast paths when
+        // enabled; `urshift` inlines too, boxing its `uint` result as `int` or
+        // `Number` (see `BitOpInt` lowering).
         Op::BitAnd if INLINE_BITWISE => JitOp::BitOpInt(BIT_AND),
         Op::BitOr if INLINE_BITWISE => JitOp::BitOpInt(BIT_OR),
         Op::BitXor if INLINE_BITWISE => JitOp::BitOpInt(BIT_XOR),
         Op::LShift if INLINE_BITWISE => JitOp::BitOpInt(LSHIFT),
         Op::RShift if INLINE_BITWISE => JitOp::BitOpInt(RSHIFT),
+        Op::URShift if INLINE_BITWISE => JitOp::BitOpInt(URSHIFT),
         Op::BitAnd => JitOp::CallHelper2(BIT_AND),
         Op::BitOr => JitOp::CallHelper2(BIT_OR),
         Op::BitXor => JitOp::CallHelper2(BIT_XOR),
@@ -473,6 +492,27 @@ fn boxed_op(
             JitOp::GetProperty(k)
         }
         Op::GetPropertySlow { .. } => return None,
+        // `findpropstrict`/`findproperty` — resolve a multiname through the scope
+        // chain (the FlasCC C-call idiom). `k` indexes the run's multiname table,
+        // in op order (matching `lib::multiname_table`). Only non-lazy multinames
+        // compile; a lazy one pops runtime name/ns off the stack, which the `fp`
+        // helper doesn't model. `strict` → throws `#1065` on a miss.
+        Op::FindPropStrict { multiname } if JIT_FINDPROP => {
+            if multiname.has_lazy_component() {
+                return None;
+            }
+            let k = *next_mn;
+            *next_mn += 1;
+            JitOp::FindProp(k, true)
+        }
+        Op::FindProperty { multiname } if JIT_FINDPROP => {
+            if multiname.has_lazy_component() {
+                return None;
+            }
+            let k = *next_mn;
+            *next_mn += 1;
+            JitOp::FindProp(k, false)
+        }
         // Dynamic-name read (`arr[i]`): the lazy multiname `k` (name off the stack) —
         // the `get_property_fast` helper does the fast index/dictionary path or fills
         // the multiname. Bumps the same multiname counter as the static reads.
@@ -743,7 +783,17 @@ fn boxed_op(
         Op::PopScope if needs_scope => JitOp::PopScopeReal,
         Op::PopScope => JitOp::Nop,
         Op::Pop | Op::PushScope => JitOp::Pop,
-        Op::Nop | Op::Kill { .. } => JitOp::Nop,
+        // Debug metadata (`debug`/`debugfile`/`debugline`) is semantically a no-op:
+        // it only feeds the AVM2 debugger's source/line mapping, which the JIT
+        // doesn't surface. Emitting a `Nop` (rather than declining) keeps the 1:1
+        // op mapping branch offsets rely on, and no per-run side table counts these
+        // ops, so indices stay in sync. This was the single largest decline reason
+        // (nearly every Sparkworkz/AS3 method opens with `debugfile`).
+        Op::Nop
+        | Op::Kill { .. }
+        | Op::Debug { .. }
+        | Op::DebugFile { .. }
+        | Op::DebugLine { .. } => JitOp::Nop,
         _ => return None,
     })
 }
@@ -816,7 +866,12 @@ pub fn translate_double(ops: &[Op]) -> Option<Vec<JitOp>> {
             Op::Negate => JitOp::NegateD,
             Op::ReturnValue { .. } => JitOp::ReturnDouble,
             Op::Pop | Op::PushScope => JitOp::Pop,
-            Op::Nop | Op::Kill { .. } => JitOp::Nop,
+            // Debug metadata is a no-op (see the boxed path).
+            Op::Nop
+            | Op::Kill { .. }
+            | Op::Debug { .. }
+            | Op::DebugFile { .. }
+            | Op::DebugLine { .. } => JitOp::Nop,
             _ => return None,
         });
     }
@@ -1001,6 +1056,7 @@ pub(crate) fn reference_run(ops: &[JitOp], regs: &[u64]) -> u64 {
             | JitOp::Throw
             | JitOp::NewCatch(_)
             | JitOp::Coerce(_)
+            | JitOp::FindProp(_, _)
             | JitOp::PopScopeReal => {
                 unreachable!("non-int ops not in the int reference interpreter")
             }

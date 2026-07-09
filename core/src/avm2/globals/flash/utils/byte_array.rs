@@ -230,7 +230,7 @@ pub fn to_string<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
 
-    if let Some(bytearray) = this.as_bytearray() {
+    if let Some(mut bytearray) = this.as_bytearray_mut() {
         return Ok(strip_bom(activation, bytearray.bytes()).into());
     }
 

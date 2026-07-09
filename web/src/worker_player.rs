@@ -21,10 +21,6 @@ use std::time::Duration;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
-use ruffle_core::backend::audio::NullAudioBackend;
-use ruffle_core::backend::navigator::NullNavigatorBackend;
-use ruffle_core::backend::storage::MemoryStorageBackend;
-use ruffle_core::backend::ui::NullUiBackend;
 use ruffle_core::limits::ExecutionLimit;
 use ruffle_core::loader::LoadBehavior;
 use ruffle_core::tag_utils::SwfMovie;
@@ -38,6 +34,12 @@ use web_sys::OffscreenCanvas;
 use web_time::Instant;
 
 use crate::worker_bridge::WorkerBridge;
+
+/// Install the AVM2 JIT on the worker player (primordial + spawned Flash workers).
+/// Flip to `false` to run the worker path on the pure interpreter — a bisection
+/// switch for JIT-vs-core bugs (e.g. deciding whether a `#1506` domainMemory OOB
+/// originates in JIT'd code or in CrossBridge startup itself).
+const WORKER_PLAYER_JIT: bool = true;
 
 /// One-shot init payload moved from the main thread into the worker via a leaked
 /// `Box` pointer (a wasm32 address into the shared `WebAssembly.Memory`). Every
@@ -54,6 +56,18 @@ pub struct WorkerInit {
     pub frame_rate: Option<f64>,
     /// Render quality.
     pub quality: StageQuality,
+    /// Startup snapshot of `localStorage` (`name -> base64`), read on the main
+    /// thread — the worker can't reach `localStorage`, so SharedObject reads are
+    /// served from this and writes are pushed back over the bridge to persist.
+    pub storage: std::collections::HashMap<String, String>,
+    /// Hosts (`scheme://host`) allowed credentialed (`credentials: include`)
+    /// fetches; mirrors the embed's `credentialAllowList`. Everything else is
+    /// `SameOrigin` (see `WebWorkerNavigatorBackend`).
+    pub credential_allow_list: Vec<String>,
+    /// The audio mixer, created on the main thread so its proxy can drive the
+    /// `AudioContext` there before the worker exists. The worker owns it (all the
+    /// AVM-facing sound calls); see `worker_audio`.
+    pub audio_mixer: ruffle_core::backend::audio::AudioMixer,
 }
 
 impl WorkerInit {
@@ -150,17 +164,36 @@ async fn run(offscreen: OffscreenCanvas, init: WorkerInit) -> Result<(), Box<dyn
     // (setTimeout, addEventListener, requestContext3D, …) multiply — a Starling
     // app spirals into exponential timer storms. Use it only on compute-heavy
     // (FlasCC-style) content.
-    ruffle_core::worker_runtime::set_worker_jit_factory(|| ruffle_avm2_jit::WasmJit::shared());
+    if WORKER_PLAYER_JIT {
+        ruffle_core::worker_runtime::set_worker_jit_factory(|| ruffle_avm2_jit::WasmJit::shared());
+    }
 
     let renderer = create_worker_renderer(&offscreen, init.quality).await?;
 
+    // Base for relative URLs / credentialed fetch (the movie's own URL).
+    let movie_url = init.movie.url().to_string();
+
     let player = PlayerBuilder::new()
         .with_boxed_renderer(renderer)
-        // DOM-bound backends are stubbed for the first milestone.
-        .with_audio(NullAudioBackend::new())
-        .with_navigator(NullNavigatorBackend::new())
-        .with_storage(Box::new(MemoryStorageBackend::new()))
-        .with_ui(NullUiBackend::new())
+        // Networking is worker-native (`WorkerGlobalScope.fetch`); credentialed
+        // fetches follow `credential_allow_list` (default `SameOrigin`, like the
+        // main-thread backend). Audio owns the mixer here; the `AudioContext`
+        // playback runs on the main thread off its proxy (see `worker_audio`).
+        // Only UI stays stubbed — it needs a DOM bridge, unlike the rest.
+        .with_audio(crate::worker_audio::WebWorkerAudioBackend::from_mixer(
+            init.audio_mixer,
+        ))
+        .with_navigator(crate::worker_navigator::WebWorkerNavigatorBackend::new(
+            Some(movie_url),
+            init.credential_allow_list,
+        ))
+        .with_storage(Box::new(crate::worker_storage::WebWorkerStorageBackend::new(
+            init.storage,
+            init.bridge.clone(),
+        )))
+        // UI is bridged to the main thread (clipboard/cursor/fullscreen need the
+        // DOM the worker lacks); see `worker_ui`.
+        .with_ui(crate::worker_ui::WebWorkerUiBackend::new(init.bridge.clone()))
         // Flash workers (FlasCC's compute thread) can't spawn nested from here;
         // route each spawn to the main thread via the bridge.
         .with_worker_host(crate::worker_bridge::BridgeWorkerHost::new(
@@ -189,10 +222,12 @@ async fn run(offscreen: OffscreenCanvas, init: WorkerInit) -> Result<(), Box<dyn
         .build();
 
     // Install the JIT, consistent with the main-thread build.
-    player
-        .lock()
-        .expect("worker player poisoned")
-        .set_avm2_jit_backend(ruffle_avm2_jit::WasmJit::shared());
+    if WORKER_PLAYER_JIT {
+        player
+            .lock()
+            .expect("worker player poisoned")
+            .set_avm2_jit_backend(ruffle_avm2_jit::WasmJit::shared());
+    }
 
     // Drive preload to completion up front.
     {

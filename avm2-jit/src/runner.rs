@@ -156,6 +156,14 @@ fn build_instance(bytes: &[u8], m: &crate::lower::Manifest) -> Option<PooledRun>
             .into(),
         );
     }
+    if m.has_findprop {
+        externs.push(
+            Func::wrap(&mut store, |k: i64, strict: i64| -> i64 {
+                crate::helpers::find_prop(k, strict)
+            })
+            .into(),
+        );
+    }
     for i in 0..m.num_helpers2 as usize {
         let helper = *crate::helpers::HELPERS2.get(i)?;
         externs.push(Func::wrap(&mut store, move |a: i64, b: i64| -> i64 { helper(a, b) }).into());
@@ -339,7 +347,19 @@ mod web {
         /// member's `MODULE_CACHE`/`INSTANCES` entries when the generation installs.
         static GEN_ENTRIES: RefCell<FnvHashMap<usize, (Rc<Generation>, u32)>> =
             RefCell::new(FnvHashMap::default());
+        /// Run-target **inline cache** fronting `GEN_ENTRIES` on the hot path:
+        /// direct-mapped bytes-key → `(dispatcher fn-ptr, member index)`. The
+        /// direct-call generation path needs only those two integers, so a hit
+        /// skips both the `GEN_ENTRIES` HashMap lookup AND the `Rc<Generation>`
+        /// clone. Only the fast (`run_index = Some`) path is cached; the fn-ptr
+        /// stays valid because `GEN_ENTRIES` keeps the generation alive and its
+        /// entries are never removed.
+        static RUN_IC: RefCell<Box<[Option<(usize, usize, u32)>]>> =
+            RefCell::new(vec![None; RUN_IC_SIZE].into_boxed_slice());
     }
+
+    /// Run-target inline-cache size (power of two).
+    const RUN_IC_SIZE: usize = 4096;
 
     /// Pops a free reserved table slot (lazily initializing the pool), or `None` when
     /// the pool ([`RESERVED_SLOT_COUNT`]) is exhausted → that method uses `call3`.
@@ -491,6 +511,9 @@ mod web {
         }
         if m.has_getprop_fast {
             bind_fn(&env, &table, "gpf", crate::helpers::get_property_fast as fn(i64, i64, i64) -> i64 as usize)?;
+        }
+        if m.has_findprop {
+            bind_fn(&env, &table, "fp", crate::helpers::find_prop as fn(i64, i64) -> i64 as usize)?;
         }
         for i in 0..m.num_helpers2 as usize {
             let helper = *crate::helpers::HELPERS2.get(i)?;
@@ -652,26 +675,47 @@ mod web {
             (0, 0)
         };
 
+        type RunFn6 = unsafe extern "C" fn(i32, i32, i32, i32, i32, i32) -> i64;
+        let call_dispatcher = |idx: usize, member: u32| -> u64 {
+            let run: RunFn6 = unsafe { core::mem::transmute::<usize, RunFn6>(idx) };
+            DEPTH.with(|d| d.set(depth + 1));
+            let r = unsafe {
+                run(
+                    member as i32,
+                    state_ptr as i32,
+                    dm_base as i32,
+                    dm_len as i32,
+                    regs_ptr as i32,
+                    regs_len as i32,
+                )
+            } as u64;
+            DEPTH.with(|d| d.set(depth));
+            r
+        };
+
+        // Run-target inline cache: hit → call the cached dispatcher directly,
+        // skipping the `GEN_ENTRIES` lookup + `Rc` clone (the biggest slice of the
+        // remaining per-call dispatch cost).
+        let ic_slot = (key >> 4) & (RUN_IC_SIZE - 1);
+        if let Some((idx, member)) =
+            RUN_IC.with(|ic| ic.borrow()[ic_slot].filter(|(k, ..)| *k == key).map(|(_, i, m)| (i, m)))
+        {
+            return Some(call_dispatcher(idx, member));
+        }
+
         // GENERATION path: the method lives in an amalgam module — call its
         // dispatcher with the member index prepended.
         if let Some((generation, member)) = GEN_ENTRIES.with(|g| g.borrow().get(&key).cloned()) {
-            DEPTH.with(|d| d.set(depth + 1));
             let result = match generation.run_index {
                 Some(idx) => {
-                    type RunFn6 = unsafe extern "C" fn(i32, i32, i32, i32, i32, i32) -> i64;
-                    let run: RunFn6 = unsafe { core::mem::transmute::<usize, RunFn6>(idx) };
-                    Some(unsafe {
-                        run(
-                            member as i32,
-                            state_ptr as i32,
-                            dm_base as i32,
-                            dm_len as i32,
-                            regs_ptr as i32,
-                            regs_len as i32,
-                        )
-                    } as u64)
+                    // Cache the direct-call target, then dispatch.
+                    RUN_IC.with(|ic| ic.borrow_mut()[ic_slot] = Some((key, idx, member)));
+                    Some(call_dispatcher(idx, member))
                 }
                 None => {
+                    // Not cached (the fn-ptr fast path is; this JS-apply fallback
+                    // is rare). Manage `DEPTH` around the re-entrant call itself.
+                    DEPTH.with(|d| d.set(depth + 1));
                     // (`js_sys::Array` has constructors only up to `of5`.)
                     let args = js_sys::Array::of5(
                         &JsValue::from(member),
@@ -681,16 +725,17 @@ mod web {
                         &JsValue::from(regs_ptr),
                     );
                     args.push(&JsValue::from(regs_len));
-                    generation
+                    let r = generation
                         .run
                         .apply(&JsValue::NULL, &args)
                         .ok()
                         .and_then(|r| r.dyn_into::<js_sys::BigInt>().ok())
                         .and_then(|b| i64::try_from(b).ok())
-                        .map(|v| v as u64)
+                        .map(|v| v as u64);
+                    DEPTH.with(|d| d.set(depth));
+                    r
                 }
             };
-            DEPTH.with(|d| d.set(depth));
             return result;
         }
 

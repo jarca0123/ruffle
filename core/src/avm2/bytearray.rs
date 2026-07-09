@@ -90,11 +90,15 @@ pub struct ByteArrayStorage {
     /// The encoding used when serializing/deserializing using readObject/writeObject
     object_encoding: ObjectEncoding,
 
-    /// When this ByteArray is `shareable`, its bytes are backed by an
+    /// When this ByteArray is `shareable`, its bytes live SOLELY in an
     /// arena-external buffer shared by reference across worker threads (see
-    /// [`SharedByteBuffer`]). `bytes` above then acts as a local write-through
-    /// mirror; domain-memory (`si*`/`li*`) traffic and the atomic operations go
-    /// straight to the shared buffer for cross-thread correctness.
+    /// [`SharedByteBuffer`]) — the single source of truth. `bytes` above is then
+    /// NOT a full mirror (that doubled memory for every shareable ByteArray, e.g.
+    /// the multi-MB FlasCC domainMemory RAM): it's a transient **read scratch**,
+    /// materialized on demand only by the slice-returning read API
+    /// ([`Self::materialize`]) so those borrows have stable backing (the shared
+    /// buffer may move on wasm growth). Value reads/writes (`li*`/`si*`, `get`/
+    /// `set`, atomics) go straight to the shared buffer, never through `bytes`.
     shared: Option<SharedByteBuffer>,
 }
 
@@ -121,12 +125,35 @@ impl ByteArrayStorage {
         }
     }
 
-    /// Mark this ByteArray as `shareable`, moving its current contents into a new
-    /// arena-external shared buffer. Idempotent.
+    /// Mark this ByteArray as `shareable`, MOVING its contents into a new
+    /// arena-external shared buffer. Idempotent. The local `bytes` is dropped
+    /// (freed): once shareable, the shared buffer is the sole store and `bytes`
+    /// is only a transient read scratch (see the field doc / [`Self::materialize`]).
+    /// This is the memory win — no more full duplicate per shareable ByteArray.
     pub fn make_shareable(&mut self) {
         if self.shared.is_none() {
-            self.shared = Some(SharedByteBuffer::from_vec(self.bytes.clone()));
+            self.shared = Some(SharedByteBuffer::from_vec(std::mem::take(&mut self.bytes)));
+            // Drop the (now-copied-into-shared) buffer; `bytes` becomes the scratch.
+            self.bytes = Vec::new();
         }
+    }
+
+    /// Materializes the whole shared buffer into the `bytes` read scratch and
+    /// returns it — the stable backing for a slice-returning read on a shareable
+    /// ByteArray (the shared buffer itself may move on growth). For a non-shareable
+    /// ByteArray `bytes` already IS the data, so this is a no-op. Only the
+    /// slice-returning read API needs it; value ops go straight to the shared buffer.
+    fn materialize(&mut self) -> &[u8] {
+        if let Some(s) = &self.shared {
+            let slen = s.len();
+            if self.bytes.len() != slen {
+                self.bytes.resize(slen, 0);
+            }
+            if slen > 0 {
+                s.read(0, &mut self.bytes[..slen]);
+            }
+        }
+        &self.bytes
     }
 
     /// Whether this ByteArray is backed by a shared buffer.
@@ -141,18 +168,11 @@ impl ByteArrayStorage {
     }
 
     /// Adopt an existing shared buffer (worker side of by-reference sharing):
-    /// seed the local mirror from it and route future shared traffic through it.
+    /// route all traffic through it. No mirror is seeded — the read scratch is
+    /// materialized on demand (see the field doc).
     pub fn attach_shared(&mut self, buffer: SharedByteBuffer) {
-        self.bytes = buffer.snapshot();
+        self.bytes = Vec::new();
         self.shared = Some(buffer);
-    }
-
-    /// Refresh the local mirror from the shared buffer, making writes performed
-    /// by other worker threads visible to the borrow-based read API.
-    pub fn resync_shared(&mut self) {
-        if let Some(shared) = &self.shared {
-            self.bytes = shared.snapshot();
-        }
     }
 
     // --- domain-memory fast path (`si*`/`li*`) ---
@@ -382,6 +402,22 @@ impl ByteArrayStorage {
     /// Write bytes at any offset in the ByteArray
     /// Will automatically grow the ByteArray to fit the new buffer
     pub fn write_at(&mut self, buf: &[u8], offset: usize) -> Result<(), ByteArrayError> {
+        // DIAGNOSTIC (RUFFLE_DUMP_LUA_SRC): dump a ByteArray write that carries the
+        // CrossBridge Lua sandbox source (`CModule.writeString` → `writeUTFBytes`),
+        // so the bytes actually landing in domainMemory can be diffed against the
+        // embedded `sandbox_env.lua` asset. The `len` gate short-circuits the common
+        // small write before the (rarer) signature scan / env read.
+        if buf.len() > 10_000
+            && buf.windows(11).any(|w| w == b"sandbox_env")
+            && std::env::var("RUFFLE_DUMP_LUA_SRC").is_ok()
+        {
+            let path = format!("/tmp/ram_lua_src_{offset}.bin");
+            let _ = std::fs::write(&path, buf);
+            tracing::error!(
+                "RUFFLE_DUMP_LUA_SRC: wrote {} source bytes at offset {offset} -> {path}",
+                buf.len()
+            );
+        }
         if offset.saturating_add(buf.len()) > u32::MAX as usize {
             return Err(ByteArrayError::IndexOutOfBounds);
         }
@@ -391,21 +427,22 @@ impl ByteArrayStorage {
         if self.len() < new_len {
             self.set_length(new_len);
         }
-        // The mirror can physically lag the (shared) logical length; grow it so
-        // the indexed write below cannot panic.
-        self.ensure_mirror_len();
-        if self.bytes.len() < new_len {
-            self.bytes.resize(new_len, 0);
-        }
-        self.bytes
-            .get_mut(offset..new_len)
-            .expect("ByteArray write out of bounds")
-            .copy_from_slice(buf);
-        // Write-through to the shared buffer so cross-thread readers (DataInput
-        // *and* domain-memory) observe this write. `set_length` above already
-        // grew the shared length when needed.
-        if let Some(s) = &self.shared {
-            s.write(offset, buf);
+        match &self.shared {
+            // Shareable: write straight to the shared buffer (the sole store);
+            // `set_length` above already grew it. The read scratch is materialized
+            // on demand and is NOT grown on write (the memory win).
+            Some(s) => {
+                s.write(offset, buf);
+            }
+            None => {
+                if self.bytes.len() < new_len {
+                    self.bytes.resize(new_len, 0);
+                }
+                self.bytes
+                    .get_mut(offset..new_len)
+                    .expect("ByteArray write out of bounds")
+                    .copy_from_slice(buf);
+            }
         }
         Ok(())
     }
@@ -413,17 +450,18 @@ impl ByteArrayStorage {
     /// Write bytes at any offset in the ByteArray
     /// Will return an error if the new buffer does not fit the ByteArray
     pub fn write_at_nongrowing(&mut self, buf: &[u8], offset: usize) -> Result<(), ByteArrayError> {
-        // Grow the mirror to the shared logical length so a write that fits the
-        // (shared) array doesn't spuriously fail against a stale-short mirror.
-        self.ensure_mirror_len();
+        // Shareable: the store is the shared buffer, already written by the only
+        // callers (`dm_write` / `atomic_compare_and_swap_int_at`); nothing to do
+        // to the scratch (it's materialized on read). Bounds were validated by the
+        // caller's `s.write`.
+        if self.shared.is_some() {
+            return Ok(());
+        }
         self.bytes
             .get_mut(offset..)
             .and_then(|bytes| bytes.get_mut(..buf.len()))
             .ok_or(ByteArrayError::IndexOutOfBounds)?
             .copy_from_slice(buf);
-        // Note: shared write-through is intentionally *not* done here. The only
-        // callers (`dm_write`, `atomic_compare_and_swap_int_at`) already push to
-        // the shared buffer themselves; doing it here too would double-write.
         Ok(())
     }
 
@@ -451,35 +489,30 @@ impl ByteArrayStorage {
         if self.len() < new_len {
             self.set_length(new_len);
         }
-        // Sync the mirror from the shared buffer so the memmove source/dest are
-        // correct and in-bounds.
-        self.ensure_mirror_len();
-        if self.bytes.len() < new_len {
-            self.bytes.resize(new_len, 0);
-        }
-
-        // `ensure_mirror_len` only refreshes the region *beyond* the old mirror
-        // length; the source range may already be within the mirror yet stale
-        // (another worker thread wrote it to the shared buffer without this
-        // arena's mirror seeing it — e.g. FlasCC `getdirentries` filling a dirent
-        // that C `memcpy` then moves via `ByteArray.writeBytes(this, ...)`).
-        // Refresh the *source* range from shared before the memmove, or it copies
-        // stale zeros.
-        if let Some(s) = &self.shared {
-            if amnt > 0 {
-                s.read(start, &mut self.bytes[start..end]);
+        match &self.shared {
+            // Shareable: memmove within the shared buffer via a small transient
+            // buffer (the store is shared; no scratch growth). Reading the source
+            // range from shared also picks up another thread's writes.
+            Some(s) => {
+                if amnt > 0 {
+                    let mut tmp = vec![0u8; amnt];
+                    s.read(start, &mut tmp);
+                    s.write(offset, &tmp);
+                }
             }
-        }
-
-        self.bytes.copy_within(start..end, offset);
-        if let Some(s) = &self.shared {
-            s.write(offset, &self.bytes[offset..offset + amnt]);
+            None => {
+                if self.bytes.len() < new_len {
+                    self.bytes.resize(new_len, 0);
+                }
+                self.bytes.copy_within(start..end, offset);
+            }
         }
         Ok(())
     }
 
     /// Compress the ByteArray into a temporary buffer.
     pub fn compress(&mut self, algorithm: CompressionAlgorithm) -> Vec<u8> {
+        self.materialize(); // refresh the read scratch (no-op when not shareable)
         let mut buffer = Vec::new();
         let error: Option<Box<dyn std::error::Error>> = match algorithm {
             CompressionAlgorithm::Zlib => {
@@ -509,6 +542,7 @@ impl ByteArrayStorage {
 
     /// Decompress the ByteArray into a temporary buffer.
     pub fn decompress(&mut self, algorithm: CompressionAlgorithm) -> Option<Vec<u8>> {
+        self.materialize(); // refresh the read scratch (no-op when not shareable)
         let mut buffer = Vec::new();
         let error: Option<Box<dyn std::error::Error>> = match algorithm {
             CompressionAlgorithm::Zlib => {
@@ -575,24 +609,19 @@ impl ByteArrayStorage {
     #[inline]
     pub fn set_length(&mut self, new_len: usize) {
         if let Some(s) = &self.shared {
-            // The shared buffer is process RAM shared by reference across worker
-            // threads. Another thread may have grown it (FlasCC `sbrk` via
-            // `atomicCompareAndSwapLength`) without this arena's mirror seeing it,
-            // so `new_len` — derived from the stale-short mirror length — can be
-            // *below* the true shared length. Never shrink the shared buffer here:
-            // that would truncate another thread's live data (e.g. its stack / a
-            // queued thunk request). Only grow; keep the mirror at the shared len.
-            let shared_len = s.len();
-            if new_len < shared_len {
-                tracing::warn!(
-                    "set_length t{:?}: refusing to shrink shared buffer {shared_len} -> {new_len}",
-                    std::thread::current().id()
-                );
-            }
-            let target = new_len.max(shared_len);
-            s.set_len(target);
-            self.bytes.resize(target, 0);
-            self.position.set(self.position().min(target));
+            // Honor the requested length, shrink included. The old code refused to
+            // shrink a shared buffer, to guard against a `new_len` *derived from a
+            // stale-short local mirror* (another worker had grown the shared buffer
+            // via FlasCC `sbrk`, so this arena's mirror lagged). The mirror is gone
+            // now — `len()` returns the true shared length directly — so every
+            // `new_len` here is authoritative: the internal grow paths pass a value
+            // `>= len()`, and an explicit `ByteArray.length = X` is the app's own
+            // resize (which must be able to shrink; otherwise the reported length
+            // stays stuck high — the mops "float min" range bug). Cross-thread `sbrk`
+            // growth still goes through `atomic_compare_and_swap_length`, not here.
+            s.set_len(new_len);
+            // Don't grow the scratch — it's materialized on read.
+            self.position.set(self.position().min(new_len));
         } else {
             self.bytes.resize(new_len, 0);
             self.position.set(self.position().min(new_len));
@@ -664,9 +693,8 @@ impl ByteArrayStorage {
     pub fn atomic_compare_and_swap_length(&mut self, expected: usize, new: usize) -> usize {
         if let Some(shared) = self.shared.clone() {
             let old = shared.cas_len(expected, new);
-            // Mirror the resulting length locally.
-            self.bytes.resize(shared.len(), 0);
-            self.position.set(self.position().min(self.bytes.len()));
+            // Don't grow the scratch — materialized on read.
+            self.position.set(self.position().min(shared.len()));
             return old;
         }
         let old = self.len();
@@ -686,11 +714,13 @@ impl ByteArrayStorage {
         if self.len() < (item + 1) {
             self.set_length(item + 1);
         }
-        self.ensure_mirror_len();
-
-        *self.bytes.get_mut(item).unwrap() = value;
-        if let Some(s) = &self.shared {
-            s.write(item, &[value]);
+        match &self.shared {
+            Some(s) => {
+                s.write(item, &[value]);
+            }
+            None => {
+                *self.bytes.get_mut(item).unwrap() = value;
+            }
         }
     }
 
@@ -698,35 +728,73 @@ impl ByteArrayStorage {
     /// method sets the bytearray's `position` to 0.
     pub fn swap_storage_with(&mut self, new_data: &mut Vec<u8>) {
         self.position.set(0);
+        // Materialize the current content into the scratch, then swap: the caller
+        // receives the old content and we adopt theirs. For a shareable ByteArray
+        // the new content is installed into the shared buffer (the store).
+        self.materialize();
         std::mem::swap(&mut self.bytes, new_data);
+        if let Some(s) = self.shared.clone() {
+            s.set_len(self.bytes.len());
+            s.write(0, &self.bytes);
+            self.bytes = Vec::new(); // back to the on-demand scratch model
+        }
     }
 
     /// Write a single byte at any offset in the bytearray, panicking if out of bounds.
     pub fn set_nongrowing(&mut self, item: usize, value: u8) {
-        self.ensure_mirror_len();
-        self.bytes[item] = value;
-        if let Some(s) = &self.shared {
-            s.write(item, &[value]);
-        }
-    }
-
-    pub fn delete(&mut self, item: usize) {
-        if let Some(i) = self.bytes.get_mut(item) {
-            *i = 0;
-            if let Some(s) = &self.shared {
-                s.write(item, &[0]);
+        match &self.shared {
+            Some(s) => {
+                s.write(item, &[value]);
+            }
+            None => {
+                self.bytes[item] = value;
             }
         }
     }
 
-    #[inline]
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+    pub fn delete(&mut self, item: usize) {
+        match &self.shared {
+            Some(s) => {
+                if item < s.len() {
+                    s.write(item, &[0]);
+                }
+            }
+            None => {
+                if let Some(i) = self.bytes.get_mut(item) {
+                    *i = 0;
+                }
+            }
+        }
     }
 
+    /// The whole buffer as a slice. Takes `&mut self` because a shareable
+    /// ByteArray must first materialize the shared buffer into the read scratch
+    /// (there is no persistent mirror). For a non-shareable ByteArray this is the
+    /// plain backing.
+    #[inline]
+    pub fn bytes(&mut self) -> &[u8] {
+        self.materialize()
+    }
+
+    /// The whole buffer as a mutable slice, materialized from shared first. A
+    /// mutation through this slice is written back to the shared buffer with
+    /// [`Self::flush_scratch`] — call it after mutating (or use a write method).
+    /// Only valid for wholesale in-place edits; prefer `write_at` for offset writes.
     #[inline]
     pub fn bytes_mut(&mut self) -> &mut [u8] {
+        self.materialize();
         &mut self.bytes
+    }
+
+    /// Writes the read scratch back to the shared buffer (after a `bytes_mut`
+    /// mutation). No-op for a non-shareable ByteArray.
+    #[inline]
+    pub fn flush_scratch(&mut self) {
+        if let Some(s) = &self.shared {
+            if !self.bytes.is_empty() {
+                s.write(0, &self.bytes);
+            }
+        }
     }
 
     #[inline]
@@ -739,21 +807,6 @@ impl ByteArrayStorage {
         match &self.shared {
             Some(s) => s.len(),
             None => self.bytes.len(),
-        }
-    }
-
-    /// Grow the local mirror to cover the shared buffer's current length,
-    /// seeding the new region from the shared buffer. No-op unless another thread
-    /// grew the shared buffer past this arena's mirror.
-    #[inline]
-    fn ensure_mirror_len(&mut self) {
-        if let Some(s) = &self.shared {
-            let slen = s.len();
-            let old = self.bytes.len();
-            if old < slen {
-                self.bytes.resize(slen, 0);
-                s.read(old, &mut self.bytes[old..slen]);
-            }
         }
     }
 

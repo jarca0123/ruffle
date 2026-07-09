@@ -107,7 +107,7 @@ pub fn serialize_value<'gc>(
             } else if let Some(xml) = o.as_xml_object() {
                 // `is_string` is `true` for the AS3 XML class
                 AmfValue::XML(xml.node().xml_to_xml_string(activation).to_string(), true)
-            } else if let Some(bytearray) = o.as_bytearray() {
+            } else if let Some(mut bytearray) = o.as_bytearray_mut() {
                 AmfValue::ByteArray(bytearray.bytes().to_vec())
             } else if let Some(dictionary) = o.as_dictionary_object() {
                 // FIXME change this once weak keys are implemented

@@ -121,6 +121,12 @@ export async function startWorkerPlayer(
             });
             computeWorkers.push(compute);
         }
+        // Persist any SharedObject writes the worker made (it can't touch
+        // `localStorage`); reads are served from the startup snapshot.
+        handle.service_storage();
+        // Apply the worker's UI requests to the DOM: cursor, fullscreen, and copy
+        // to the system clipboard (the worker owns none of these).
+        handle.service_ui();
         requestAnimationFrame(pumpSpawns);
     };
     requestAnimationFrame(pumpSpawns);
