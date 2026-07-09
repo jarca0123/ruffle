@@ -32,6 +32,11 @@ pub struct VerifiedMethodInfo<'gc> {
     /// may hoist it out of a loop (a pure read is safe to run speculatively).
     /// Sorted (recording follows block order, remapped by `remove_nops`).
     pub null_safe_getslots: Vec<u32>,
+
+    /// Op indices of `GetSlot`s whose resolved value class is `Number`. The AVM2
+    /// JIT marks their result `Number` so phase-2 type-specialization keeps it
+    /// unboxed as `f64` (e.g. Starling matrix fields). Sorted; nop-remapped.
+    pub number_slots: Vec<u32>,
 }
 
 #[derive(Collect)]
@@ -514,6 +519,7 @@ pub fn verify_method<'gc>(
     }
 
     let mut null_safe_getslots: Vec<u32> = Vec::new();
+    let mut number_slots: Vec<u32> = Vec::new();
     crate::avm2::optimizer::optimize(
         activation,
         method,
@@ -522,12 +528,14 @@ pub fn verify_method<'gc>(
         resolved_param_config,
         jump_targets,
         &mut null_safe_getslots,
+        &mut number_slots,
     )?;
 
     Ok(VerifiedMethodInfo {
         parsed_code: verified_code,
         exceptions: new_exceptions,
         null_safe_getslots,
+        number_slots,
     })
 }
 

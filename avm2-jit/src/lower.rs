@@ -85,6 +85,13 @@ pub(crate) const VALUE_TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 /// A `Boolean` `Value`'s base bits (`BOX_MARK | TAG_BOOL << 48`); the `0`/`1`
 /// payload is OR-ed in. Must match `core::avm2::value` (`TAG_BOOL = 2`).
 pub(crate) const VALUE_BOOL_MARK: u64 = 0xFFFA_0000_0000_0000;
+/// Bit position of the 3-bit box tag (`bits >> TAG_SHIFT & 0x7`). Must match
+/// `core::avm2::value::TAG_SHIFT`.
+const TAG_SHIFT: u64 = 48;
+/// Tag of a **heap-boxed double**: a colliding negative-quiet-NaN `Number` whose
+/// exact bits can't live inline, so `Value::number_lossless` stashes them in a
+/// `Gc<f64>` and stores the pointer. Must match `core::avm2::value::TAG_BOXED_DOUBLE`.
+const TAG_BOXED_DOUBLE: u64 = 6;
 /// An `Object` `Value`'s top 16 bits (`(BOX_MARK | TAG_OBJECT << 48) >> 48`,
 /// `TAG_OBJECT = 5`): a word is object-boxed iff `bits >> 48 == 0xFFFD`. The
 /// low 48 bits are then the raw `Gc` data pointer (see `Value::pack`).
@@ -252,7 +259,7 @@ pub(crate) fn helper_dominated(ops: &[JitOp]) -> bool {
         match op {
             // Expensive JS-boundary crossings the JIT can't inline (a helper `call`).
             JitOp::GetProperty(_)
-            | JitOp::GetSlot(_)
+            | JitOp::GetSlot(_, _)
             | JitOp::CallMethod(..)
             | JitOp::CallHelper(_)
             | JitOp::CallHelper2(_)
@@ -291,12 +298,12 @@ pub(crate) fn has_getprop(ops: &[JitOp]) -> bool {
 
 /// Whether this method uses the arity-3 getpropertyfast import (`("env","gpf")`).
 pub(crate) fn has_getprop_fast(ops: &[JitOp]) -> bool {
-    ops.iter().any(|op| matches!(op, JitOp::GetPropertyFast(_)))
+    ops.iter().any(|op| matches!(op, JitOp::GetPropertyFast(_, _)))
 }
 
 /// Whether this method uses the arity-2 getslot import (`("env","gs")`).
 pub(crate) fn has_getslot(ops: &[JitOp]) -> bool {
-    ops.iter().any(|op| matches!(op, JitOp::GetSlot(_)))
+    ops.iter().any(|op| matches!(op, JitOp::GetSlot(_, _)))
 }
 
 /// Whether this method uses the arity-2 findprop import (`("env","fp")`).
@@ -449,8 +456,8 @@ fn is_throwing_prop(op: JitOp) -> bool {
     matches!(
         op,
         JitOp::GetProperty(_)
-            | JitOp::GetPropertyFast(_)
-            | JitOp::GetSlot(_)
+            | JitOp::GetPropertyFast(_, _)
+            | JitOp::GetSlot(_, _)
             | JitOp::FindProp(..)
             | JitOp::CallHelper3(0..=SETSLOT_KIND_MAX, _)
     )
@@ -481,7 +488,7 @@ fn is_self_bailing_call(op: JitOp) -> bool {
             | JitOp::ConstructSuper(_)
             | JitOp::CallValue(_)
             | JitOp::VCall(..)
-            | JitOp::GetSlot(_)
+            | JitOp::GetSlot(_, _)
     )
 }
 
@@ -1063,7 +1070,9 @@ pub enum JitOp {
     /// `getpropertyfast`: a dynamic-name property read. Stack `[.., receiver, name]`;
     /// calls the arity-3 `gpf` (`get_property_fast`) helper with `(receiver, name, k)`
     /// (`k` = the lazy multiname template), pushing the result. Net -1.
-    GetPropertyFast(u32),
+    /// `getpropertyfast` (dynamic index). `bool` = `returns_number` (a
+    /// `Vector.<Number>` element) — phase-2 unbox may keep the result f64.
+    GetPropertyFast(u32, bool),
     /// `findpropstrict`/`findproperty` (`bool` = strict): resolve the method's
     /// `k`-th multiname through the scope chain and push the scope object that has
     /// it (via the arity-2 `fp` import; `(k, strict) -> object`). Net +1 — takes no
@@ -1074,7 +1083,9 @@ pub enum JitOp {
     /// Pop the receiver `Value` and push `receiver.get_slot(slot_id)`'s raw
     /// `Value` (via the arity-2 `gs` import). The verifier's resolved form of a
     /// typed property read — a direct slot fetch, no multiname lookup.
-    GetSlot(u32),
+    /// `getslot`: pop receiver, push slot value. The `bool` is `returns_number`
+    /// (optimizer proved the slot class is `Number`) — phase-2 unbox may keep it f64.
+    GetSlot(u32, bool),
     /// Push a boxed `int` `Value` constant (`VALUE_INT_MARK | v`). The boxed
     /// counterpart of `PushInt` (raw `Value` on the stack, not a raw i32).
     PushIntValue(i32),
@@ -1251,6 +1262,166 @@ fn slot(i: u32) -> MemArg {
         align: VALUE_ALIGN,
         memory_index: 0,
     }
+}
+
+/// Whether check-elision (type-specialization phase 1) runs: on a proven-numeric
+/// `ArithInt`, drop the runtime `is_numeric` guard + `valueOf` helper fallback.
+/// Sound whenever the [`crate::typed`] repr analysis is correct (guarded by the
+/// arity safety net) — the differential verify suite is the final gate.
+const JIT_CHECK_ELISION: bool = true;
+
+/// Check-elided [`JitOp::ArithInt`] (`multiply`/`subtract`/`add`, index 11/12/18):
+/// the type analysis proved BOTH operands numeric (`int` box or `Number`), so the
+/// runtime `is_numeric` guard and the string/object `valueOf` helper fallback are
+/// dropped. Byte-for-byte identical to the general `ArithInt` lowering EXCEPT the
+/// tier-1 `else` goes straight to the f64 numeric path. Same boxing (int-if-fits
+/// else Number), so `is int` semantics are preserved. Caller checks `depth >= 2`
+/// and does `depth -= 1`.
+/// Unbox `local` to `f64`, choosing the heap-box-safe path
+/// ([`emit_numval_boxsafe`]) iff `boxsafe` (the operand is a possibly-heap-boxed
+/// `NumberBoxed`), else the cheaper branchless [`emit_numval`].
+fn emit_numval_sel(body: &mut Function, local: u32, boxsafe: bool) {
+    if boxsafe {
+        emit_numval_boxsafe(body, local);
+    } else {
+        emit_numval(body, local);
+    }
+}
+
+fn emit_arith_int_elided(body: &mut Function, index: u32, a_boxsafe: bool, b_boxsafe: bool) {
+    body.instruction(&Instruction::LocalSet(SCRATCH64)); // B
+    body.instruction(&Instruction::LocalSet(SCRATCH64_2)); // A
+    // Tier 1: both int-boxed → i64 op, boxed int-if-fits-else-Number.
+    emit_is_int(body, SCRATCH64_2);
+    emit_is_int(body, SCRATCH64);
+    body.instruction(&Instruction::I32And);
+    body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    body.instruction(&Instruction::LocalGet(SCRATCH64_2));
+    body.instruction(&Instruction::I32WrapI64);
+    body.instruction(&Instruction::I64ExtendI32S);
+    body.instruction(&Instruction::LocalGet(SCRATCH64));
+    body.instruction(&Instruction::I32WrapI64);
+    body.instruction(&Instruction::I64ExtendI32S);
+    body.instruction(&match index {
+        11 => Instruction::I64Mul,
+        18 => Instruction::I64Add,
+        _ => Instruction::I64Sub,
+    });
+    body.instruction(&Instruction::LocalSet(SCRATCH64_2));
+    body.instruction(&Instruction::LocalGet(SCRATCH64_2));
+    body.instruction(&Instruction::LocalGet(SCRATCH64_2));
+    body.instruction(&Instruction::I64Extend32S);
+    body.instruction(&Instruction::I64Eq);
+    body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    body.instruction(&Instruction::LocalGet(SCRATCH64_2));
+    body.instruction(&Instruction::I32WrapI64);
+    emit_box_int(body);
+    body.instruction(&Instruction::Else);
+    body.instruction(&Instruction::LocalGet(SCRATCH64_2));
+    body.instruction(&Instruction::F64ConvertI64S);
+    body.instruction(&Instruction::I64ReinterpretF64);
+    body.instruction(&Instruction::End);
+    // ELIDED else: operands proven numeric → the f64 path directly (no is_numeric
+    // guard, no helper fallback). A `NumberBoxed` operand (`a_boxsafe`/`b_boxsafe`)
+    // is unboxed heap-box-safely; the result is a canonical `Number`.
+    body.instruction(&Instruction::Else);
+    emit_numval_sel(body, SCRATCH64_2, a_boxsafe);
+    emit_numval_sel(body, SCRATCH64, b_boxsafe);
+    body.instruction(&match index {
+        11 => Instruction::F64Mul,
+        18 => Instruction::F64Add,
+        _ => Instruction::F64Sub,
+    });
+    emit_box_double(body);
+    body.instruction(&Instruction::End);
+}
+
+/// Phase-2 physical unboxing: keep proven-`Number` values as raw `f64` on the
+/// wasm operand stack across a run, boxing only at boundaries. OFF by default —
+/// enable only after the differential verify suite confirms it (a bug here is the
+/// silent-corruption class this whole approach guards against).
+const JIT_UNBOX: bool = true;
+
+/// Boxes the top `k` operand-stack slots that are physically `f64` (per `phys`)
+/// back to boxed `Value` (`i64`), so a subsequent op that expects boxed operands
+/// (anything but the numeric-arith fast path) sees `i64`. Uses the spill pool as
+/// scratch — pop the top `k` (boxing `f64` ones with `emit_box_double`, which is
+/// the sound re-box for a `Number`), then re-push in order. `None` (decline the
+/// method) if `k` exceeds the spill pool AND an `f64` is present — too deep to box.
+fn box_top(body: &mut Function, phys: &mut [bool], depth: i32, k: u32) -> Option<()> {
+    let d = depth.max(0) as usize;
+    let k = (k as usize).min(d);
+    if k == 0 || !(0..k).any(|j| phys[d - 1 - j]) {
+        return Some(());
+    }
+    if k > SPILL_POOL as usize {
+        return None;
+    }
+    for j in 0..k {
+        if phys[d - 1 - j] {
+            emit_box_double(body); // f64 top -> i64
+        }
+        body.instruction(&Instruction::LocalSet(SPILL_BASE + (k - 1 - j) as u32));
+    }
+    for t in 0..k {
+        body.instruction(&Instruction::LocalGet(SPILL_BASE + t as u32));
+    }
+    for j in 0..k {
+        phys[d - 1 - j] = false;
+    }
+    Some(())
+}
+
+/// Physical-unboxing `ArithInt` (`multiply`/`subtract`/`add`) on proven-`Number`
+/// operands: consume each operand as `f64` — directly if it is already physically
+/// `f64` (`phys_*`), else `emit_numval` it — do the `f64` op, and LEAVE the result
+/// unboxed on the stack (the caller marks it `phys = true`). No boxing: the value
+/// stays `f64` until a boundary boxes it. Clobbers `SCRATCH64`/`SCRATCH_F64`.
+fn emit_arith_number_phys(
+    body: &mut Function,
+    index: u32,
+    phys_a: bool,
+    phys_b: bool,
+    a_boxsafe: bool,
+    b_boxsafe: bool,
+) {
+    // Stash B (top) into SCRATCH_F64 as f64.
+    if phys_b {
+        body.instruction(&Instruction::LocalSet(SCRATCH_F64));
+    } else {
+        body.instruction(&Instruction::LocalSet(SCRATCH64));
+        emit_numval_sel(body, SCRATCH64, b_boxsafe);
+        body.instruction(&Instruction::LocalSet(SCRATCH_F64));
+    }
+    // A is now on top; ensure f64.
+    if !phys_a {
+        body.instruction(&Instruction::LocalSet(SCRATCH64));
+        emit_numval_sel(body, SCRATCH64, a_boxsafe);
+    }
+    body.instruction(&Instruction::LocalGet(SCRATCH_F64));
+    body.instruction(&match index {
+        11 => Instruction::F64Mul,
+        18 => Instruction::F64Add,
+        _ => Instruction::F64Sub,
+    });
+}
+
+/// Phase-2 pure-`Number` `ArithInt` (`multiply`/`subtract`/`add`, 11/12/18): BOTH
+/// operands are proven `Number` (an `f64` box, never int-tagged), so even the
+/// `is_int` tier is dead — emit the f64 path directly. The result is a `Number`
+/// (these ops always yield one), so `emit_box_double` is the correct re-box.
+/// Caller checks `depth >= 2` and does `depth -= 1`.
+fn emit_arith_number(body: &mut Function, index: u32) {
+    body.instruction(&Instruction::LocalSet(SCRATCH64)); // B
+    body.instruction(&Instruction::LocalSet(SCRATCH64_2)); // A
+    emit_numval(body, SCRATCH64_2);
+    emit_numval(body, SCRATCH64);
+    body.instruction(&match index {
+        11 => Instruction::F64Mul,
+        18 => Instruction::F64Add,
+        _ => Instruction::F64Sub,
+    });
+    emit_box_double(body);
 }
 
 /// Emits a non-branch op onto `body`, updating the compile-time operand-stack
@@ -1902,7 +2073,7 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             body.instruction(&Instruction::Call(lay.fp_index));
             *depth += 1;
         }
-        JitOp::GetPropertyFast(k) => {
+        JitOp::GetPropertyFast(k, _) => {
             if *depth < 2 {
                 return None;
             }
@@ -1912,7 +2083,7 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             body.instruction(&Instruction::Call(lay.gpf_index));
             *depth -= 1;
         }
-        JitOp::GetSlot(slot_id) => {
+        JitOp::GetSlot(slot_id, _) => {
             if *depth < 1 {
                 return None;
             }
@@ -2583,6 +2754,57 @@ fn emit_numval(body: &mut Function, local: u32) {
     body.instruction(&Instruction::Select);
 }
 
+/// Like [`emit_numval`] but also correct for a **heap-boxed double**
+/// (`TAG_BOXED_DOUBLE`): a colliding negative-quiet-NaN `Number` that
+/// `Value::number_lossless` stashed in a `Gc<f64>`. Its inline bits are a pointer,
+/// so `emit_numval`'s reinterpret/int-convert would read garbage; here the
+/// boxed-double case instead `f64.load`s the pointee (memory 1 = Ruffle's heap on
+/// web, where the `Gc` lives; the exposed pointer is a low-32-bit offset on wasm32).
+///
+/// Never traps: the `f64.load` fires ONLY when `tag == TAG_BOXED_DOUBLE`, the sole
+/// tag whose payload is a live `f64` pointer (produced only by `number_lossless`).
+/// Every other input — inline `f64`, `int`, or a swallowed-OOB `Undefined` (the
+/// inline dm path returns `undefined` on OOB, see [`is_dm_op`]) — takes a pure
+/// arithmetic branch (`Undefined`→`0.0`). Non-numerics reinterpret to garbage,
+/// pure and memory-safe, exactly like [`emit_numval`]'s contract.
+pub(crate) fn emit_numval_boxsafe(body: &mut Function, local: u32) {
+    // is_f64 = (bits & BOX_MARK) != BOX_MARK
+    body.instruction(&Instruction::LocalGet(local));
+    body.instruction(&Instruction::I64Const(BOX_MARK as i64));
+    body.instruction(&Instruction::I64And);
+    body.instruction(&Instruction::I64Const(BOX_MARK as i64));
+    body.instruction(&Instruction::I64Ne);
+    body.instruction(&Instruction::If(BlockType::Result(ValType::F64)));
+    // inline `Number`: the bits ARE the f64.
+    body.instruction(&Instruction::LocalGet(local));
+    body.instruction(&Instruction::F64ReinterpretI64);
+    body.instruction(&Instruction::Else);
+    // boxed? tag == TAG_BOXED_DOUBLE (tag = (bits >> TAG_SHIFT) & 0x7)
+    body.instruction(&Instruction::LocalGet(local));
+    body.instruction(&Instruction::I64Const(TAG_SHIFT as i64));
+    body.instruction(&Instruction::I64ShrU);
+    body.instruction(&Instruction::I64Const(0x7));
+    body.instruction(&Instruction::I64And);
+    body.instruction(&Instruction::I64Const(TAG_BOXED_DOUBLE as i64));
+    body.instruction(&Instruction::I64Eq);
+    body.instruction(&Instruction::If(BlockType::Result(ValType::F64)));
+    // heap-boxed double: deref the `Gc<f64>` (pointer = low 32 bits on wasm32).
+    body.instruction(&Instruction::LocalGet(local));
+    body.instruction(&Instruction::I32WrapI64);
+    body.instruction(&Instruction::F64Load(MemArg {
+        offset: 0,
+        align: VALUE_ALIGN,
+        memory_index: 1,
+    }));
+    body.instruction(&Instruction::Else);
+    // int box (or swallowed-OOB `Undefined` → 0.0): convert the low 32 bits.
+    body.instruction(&Instruction::LocalGet(local));
+    body.instruction(&Instruction::I32WrapI64);
+    body.instruction(&Instruction::F64ConvertI32S);
+    body.instruction(&Instruction::End);
+    body.instruction(&Instruction::End);
+}
+
 /// Lowers `ops` to a WASM module exporting `run(state_ptr: i32) -> i64` (the
 /// returned `Value`'s bits), importing the shared memory as `("env", "memory")`.
 /// Returns `None` for anything unsupported.
@@ -2692,13 +2914,13 @@ pub struct ExcRange {
 }
 
 pub fn compile(ops: &[JitOp]) -> Option<Vec<u8>> {
-    compile_full(ops, &[], &[])
+    compile_full(ops, &[], &[], &[])
 }
 
 /// Switch-aware [`compile`]: `switches` supplies the targets for each
 /// [`JitOp::LookupSwitch`] op (see [`SwitchTable`]).
 pub fn compile_with_switches(ops: &[JitOp], switches: &[SwitchTable]) -> Option<Vec<u8>> {
-    compile_full(ops, switches, &[])
+    compile_full(ops, switches, &[], &[])
 }
 
 /// Full [`compile`]: also takes the method's exception handlers. A throw inside a
@@ -2709,6 +2931,7 @@ pub fn compile_full(
     ops: &[JitOp],
     switches: &[SwitchTable],
     exceptions: &[ExcRange],
+    numeric_seed: &[bool],
 ) -> Option<Vec<u8>> {
     if ops.is_empty() {
         return None;
@@ -2718,7 +2941,7 @@ pub fn compile_full(
     // With handlers, throwable ops dispatch (in the compile loop) rather than emit
     // their own inline `perr` return — so suppress the call arms' inline bail.
     lay.inline_perr = exceptions.is_empty();
-    let body = emit_body(ops, switches, exceptions, &lay)?;
+    let body = emit_body(ops, switches, exceptions, &lay, numeric_seed)?;
 
     // Assemble module.
     let mut module = Module::new();
@@ -2746,6 +2969,8 @@ pub struct GenMember<'a> {
     pub exceptions: &'a [ExcRange],
     /// AVM2 method name, emitted into the module's wasm name section for profilers.
     pub name: &'a str,
+    /// Per-local "is numeric on entry" (param types) — seeds check-elision.
+    pub numeric_seed: &'a [bool],
 }
 
 /// Compiles MANY methods into ONE module (an "amalgam" generation): every member
@@ -2779,7 +3004,13 @@ pub fn compile_generation(members: &[GenMember<'_>]) -> Option<(Vec<u8>, Manifes
         let mut member_lay = lay.clone();
         // Per-member: with handlers, throwable ops dispatch instead of inline-bailing.
         member_lay.inline_perr = mem.exceptions.is_empty();
-        code.function(&emit_body(mem.ops, mem.switches, mem.exceptions, &member_lay)?);
+        code.function(&emit_body(
+            mem.ops,
+            mem.switches,
+            mem.exceptions,
+            &member_lay,
+            mem.numeric_seed,
+        )?);
     }
     // The dispatcher: push the five `run` args, then the method index, and
     // `call_indirect` through the internal member table (type 0 = the method
@@ -2999,6 +3230,10 @@ fn emit_body(
     switches: &[SwitchTable],
     exceptions: &[ExcRange],
     lay: &Layout,
+    // Per-local "is numeric on entry" (from the method's param types). Seeds the
+    // repr analysis so a `:Number`/`:int`/`:uint` parameter is `Numeric` at block
+    // 0. Empty → all `Boxed` (numeric-ness then only flows from in-method producers).
+    numeric_seed: &[bool],
 ) -> Option<Function> {
     let has_handlers = !exceptions.is_empty();
     // `ReturnValueCoerced` inside a handler range isn't wired for exception
@@ -3076,6 +3311,31 @@ fn emit_body(
     let mut entry_depth = vec![-1i32; num_bbs];
     entry_depth[0] = 0;
 
+    // Type-specialization value-representation inference (see `crate::typed`).
+    // Per-block-entry local reprs, seeded all-`Boxed` (numeric-ness flows from
+    // in-method producers — `pushdouble`, `pushint`, numeric arith, and locals
+    // assigned those). Only computed when the block partition matches `typed`'s
+    // (no switches, no catch targets — else the `bb` indices wouldn't align), and
+    // under debug for the arity safety net regardless. `None` → no elision.
+    let reprs_ok = catch_targets.is_empty() && switches.is_empty();
+    let ce_entry: Option<Vec<Vec<crate::typed::Repr>>> =
+        if (JIT_CHECK_ELISION && reprs_ok) || (cfg!(debug_assertions) && reprs_ok) {
+            // Entry local reprs: a numeric-typed parameter is `Numeric`, all else
+            // `Boxed`. Sized to the frame so any local index resolves.
+            let entry_locals: Vec<crate::typed::Repr> = (0..crate::MAX_FRAME_SLOTS as usize)
+                .map(|i| {
+                    if numeric_seed.get(i).copied().unwrap_or(false) {
+                        crate::typed::Repr::Numeric
+                    } else {
+                        crate::typed::Repr::Boxed
+                    }
+                })
+                .collect();
+            crate::typed::infer_local_reprs(ops, &entry_locals)
+        } else {
+            None
+        };
+
     // loop { block(K-1) { ... block(0) { br_table } } }
     body.instruction(&Instruction::Loop(BlockType::Empty));
     for _ in 0..num_bbs {
@@ -3109,8 +3369,66 @@ fn emit_body(
             depth += 1;
         }
 
+        // Physical repr of each live operand-stack slot for phase-2 unboxing:
+        // `true` = the slot physically holds a raw `f64` (not a boxed `Value`).
+        // Entry slots are reloaded/materialized as boxed `i64`, so all `false`.
+        // Inert unless `JIT_UNBOX` (nothing is ever marked `f64`).
+        let mut phys: Vec<bool> = vec![false; depth.max(0) as usize];
+
+        // Safety net for the type-specialization stack model: when this block is
+        // entered with an empty operand stack (the common case), cross-check that
+        // `typed::stack_arity`'s predicted depth matches `emit_body`'s authoritative
+        // `depth` at every op. An arity mistake trips the JIT test suite in debug
+        // builds — it can never reach the codegen that would rely on it. No effect
+        // on release builds or lowering.
+        // The per-op operand-stack reprs for this block (empty-entry blocks only,
+        // so `simulate_block`'s empty-start stack aligns). Drives both the arity
+        // safety net (debug) and check-elision (release).
+        let block_pre: Option<Vec<Vec<crate::typed::Repr>>> = if depth == 0 {
+            ce_entry.as_ref().and_then(|e| {
+                crate::typed::simulate_block(&ops[start..end], e[bb].clone()).map(|(_, pre)| pre)
+            })
+        } else {
+            None
+        };
+
         for (pos, &op) in ops[start..end].iter().enumerate() {
             let op_idx = start + pos;
+            #[cfg(debug_assertions)]
+            if let Some(pre) = &block_pre {
+                if depth as usize != pre[pos].len() {
+                    panic!(
+                        "stack_arity depth mismatch at op {pos} ({op:?}) in block {bb}: \
+                         real={} predicted={}\n  block ops: {:?}",
+                        depth,
+                        pre[pos].len(),
+                        &ops[start..end],
+                    );
+                }
+            }
+
+            // Phase-2 physical unboxing. `is_f64_arith`: this op is a proven-both-
+            // `Number` arith that will CONSUME f64-aware operands and LEAVE its
+            // result unboxed. Every other op expects boxed operands, so box any
+            // live `f64` it would consume first — all of them before a terminator/
+            // branch (which spills the operand stack as `i64`), else just its pop.
+            let is_f64_arith = JIT_UNBOX
+                && matches!(op, JitOp::ArithInt(_))
+                && block_pre.as_ref().is_some_and(|p| {
+                    let s = &p[pos];
+                    s.len() >= 2
+                        && s[s.len() - 1].is_f64_unboxable()
+                        && s[s.len() - 2].is_f64_unboxable()
+                });
+            if JIT_UNBOX && !is_f64_arith {
+                let k = if op.is_terminator() {
+                    depth
+                } else {
+                    crate::typed::stack_arity(&op).0 as i32
+                };
+                box_top(&mut body, &mut phys, depth, k as u32)?;
+            }
+
             match op {
                 JitOp::ReturnValue => {
                     if depth < 1 {
@@ -3301,7 +3619,68 @@ fn emit_body(
                     body.instruction(&Instruction::Br(loop_depth));
                     depth = 0;
                 }
+                // Check-elision: a `multiply`/`subtract`/`add` whose BOTH operands
+                // the repr analysis proved numeric — drop the `is_numeric` guard +
+                // helper fallback. Falls through to the general `emit_linear`
+                // lowering when unproven.
+                JitOp::ArithInt(index)
+                    if (JIT_CHECK_ELISION || JIT_UNBOX)
+                        && block_pre.as_ref().is_some_and(|p| {
+                            let s = &p[pos];
+                            s.len() >= 2
+                                && s[s.len() - 1].is_numeric()
+                                && s[s.len() - 2].is_numeric()
+                        }) =>
+                {
+                    if depth < 2 {
+                        return None;
+                    }
+                    let s = &block_pre.as_ref().expect("guard checked Some")[pos];
+                    let a_repr = s[s.len() - 2];
+                    let b_repr = s[s.len() - 1];
+                    let both_number =
+                        a_repr == crate::typed::Repr::Number && b_repr == crate::typed::Repr::Number;
+                    // A possibly-heap-boxed operand needs the box-safe unbox. (A
+                    // physically-`f64` operand — always a canonical arith result,
+                    // repr `Number` — never sets this, so `phys` and `boxsafe` can't
+                    // both be true.)
+                    let a_boxsafe = a_repr.needs_boxsafe_unbox();
+                    let b_boxsafe = b_repr.needs_boxsafe_unbox();
+                    if is_f64_arith {
+                        // Phase 2: consume operands per their PHYSICAL repr, leave
+                        // the result unboxed as f64 (marked below).
+                        let d = depth as usize;
+                        emit_arith_number_phys(
+                            &mut body,
+                            index,
+                            phys[d - 2],
+                            phys[d - 1],
+                            a_boxsafe,
+                            b_boxsafe,
+                        );
+                    } else if both_number {
+                        // Both `Number` → pure f64 path (skip `is_int` too), boxed.
+                        emit_arith_number(&mut body, index);
+                    } else {
+                        // Numeric (maybe int / heap-boxed) → drop `is_numeric` guard
+                        // + helper; box-safe unbox any `NumberBoxed` operand.
+                        emit_arith_int_elided(&mut body, index, a_boxsafe, b_boxsafe);
+                    }
+                    depth -= 1;
+                }
                 other => emit_linear(&mut body, other, &mut depth, &lay)?,
+            }
+
+            // Phase-2: keep `phys` aligned with the authoritative `depth` after the
+            // op. Popped slots drop off the top; new pushes are boxed (`false`); an
+            // `f64`-arith's result is the exception — mark its top slot `f64`.
+            if JIT_UNBOX {
+                phys.resize(depth.max(0) as usize, false);
+                if is_f64_arith {
+                    if let Some(t) = phys.last_mut() {
+                        *t = true;
+                    }
+                }
             }
             // A call/dm op can throw out of band (`PENDING_ERROR`). Handle it right
             // after the op so a thrown error doesn't run on with a swallowed result.
@@ -3342,6 +3721,10 @@ fn emit_body(
         if end == ops.len() || !ops[end - 1].is_terminator() {
             if depth > 0 && (!spill_ok || depth as u32 > SPILL_POOL) {
                 return None;
+            }
+            // Box any live `f64` before the fall-through spill (which stores i64).
+            if JIT_UNBOX {
+                box_top(&mut body, &mut phys, depth, depth as u32)?;
             }
             if bb + 1 < num_bbs {
                 emit_spill(&mut body, depth);
@@ -3385,10 +3768,10 @@ mod tests {
         let m3 = [JitOp::VCall(vc::NEW_FUNCTION, 0, 0, true), JitOp::ReturnValueBoxed];
         let m4 = [JitOp::GetLocalValue(1), JitOp::CoerceInt(false), JitOp::ReturnValueBoxed];
         let members = [
-            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "" },
-            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "" },
-            GenMember { ops: &m3, switches: &[], exceptions: &[], name: "" },
-            GenMember { ops: &m4, switches: &[], exceptions: &[], name: "" },
+            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
+            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
+            GenMember { ops: &m3, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
+            GenMember { ops: &m4, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
         ];
         let (bytes, _union) = compile_generation(&members).expect("generation compiles");
         let engine = Engine::default();
@@ -3402,7 +3785,7 @@ mod tests {
             JitOp::GetLocalValue(0),
             JitOp::GetProperty(0),
             JitOp::GetProperty(1),
-            JitOp::GetSlot(2),
+            JitOp::GetSlot(2, false),
             JitOp::GetProperty(3),
             JitOp::ReturnValueBoxed,
         ];
@@ -3414,7 +3797,7 @@ mod tests {
             JitOp::GetLocalValue(0),
             JitOp::GetProperty(0),
             JitOp::GetProperty(1),
-            JitOp::GetSlot(2),
+            JitOp::GetSlot(2, false),
             JitOp::GetProperty(3),
             JitOp::CmpNum(1),
             JitOp::ArithInt(11),
@@ -3424,7 +3807,7 @@ mod tests {
 
         // Few crossings (< 4) never decline, even with zero inline compute — a small
         // method like `getlocal; getslot; returnvalue` still compiles.
-        let small = [JitOp::GetLocalValue(0), JitOp::GetSlot(0), JitOp::ReturnValueBoxed];
+        let small = [JitOp::GetLocalValue(0), JitOp::GetSlot(0, false), JitOp::ReturnValueBoxed];
         assert!(!helper_dominated(&small));
 
         // A FlasCC-shaped domainMemory hot path (dm ops are inline wins) compiles even
@@ -3434,7 +3817,7 @@ mod tests {
             JitOp::DmLoad(4),
             JitOp::DmStore(4),
             JitOp::DmLoad(1),
-            JitOp::GetSlot(0),
+            JitOp::GetSlot(0, false),
             JitOp::AddIBoxed,
             JitOp::ReturnValueBoxed,
         ];
@@ -4116,6 +4499,137 @@ mod tests {
         assert_eq!(mem, 1.5f32.to_le_bytes());
     }
 
+    // The heap-box-safe unbox primitive: `emit_numval_boxsafe` must yield the
+    // correct `f64` for every numeric input shape, INCLUDING a `TAG_BOXED_DOUBLE`
+    // (a colliding NaN `number_lossless` stashed in a `Gc<f64>`), which it derefs
+    // via `f64.load` on memory 1. The stubbed helpers in the other dm tests can't
+    // produce a real boxed double, so exercise the primitive directly here.
+    #[test]
+    fn numval_boxsafe_covers_all_cases() {
+        use wasm_encoder::{
+            CodeSection, ExportSection, FunctionSection, MemorySection, Module as EncModule,
+            TypeSection,
+        };
+        // A standalone module `t(i64) -> f64` = emit_numval_boxsafe(param0), with a
+        // second memory (index 1) it can `f64.load` a boxed double from.
+        let mut types = TypeSection::new();
+        types.ty().function([ValType::I64], [ValType::F64]);
+        let mut funcs = FunctionSection::new();
+        funcs.function(0);
+        let mut mems = MemorySection::new();
+        let mt = MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        };
+        mems.memory(mt); // memory 0 (unused, keeps indices honest)
+        mems.memory(mt); // memory 1 (the heap the boxed double lives in)
+        let mut exports = ExportSection::new();
+        exports.export("t", ExportKind::Func, 0);
+        exports.export("mem1", ExportKind::Memory, 1);
+        let mut code = CodeSection::new();
+        let mut f = Function::new([]); // param0 is the only local
+        emit_numval_boxsafe(&mut f, 0);
+        f.instruction(&Instruction::End);
+        code.function(&f);
+        let mut module = EncModule::new();
+        module.section(&types);
+        module.section(&funcs);
+        module.section(&mems);
+        module.section(&exports);
+        module.section(&code);
+        let bytes = module.finish();
+
+        let mut config = wasmi::Config::default();
+        config.wasm_multi_memory(true);
+        let engine = Engine::new(&config);
+        let module = Module::new(&engine, &bytes).expect("valid multi-memory wasm");
+        let mut store = Store::new(&engine, ());
+        let instance = Instance::new(&mut store, &module, &[]).expect("instantiates");
+        let mem1 = instance.get_memory(&store, "mem1").expect("mem1 export");
+        mem1.grow(&mut store, 1).ok();
+        let run = instance
+            .get_typed_func::<i64, f64>(&store, "t")
+            .expect("t export");
+
+        // (a) inline `Number`: the bits ARE the f64.
+        assert_eq!(run.call(&mut store, 3.14f64.to_bits() as i64).unwrap(), 3.14);
+        // (b) int box (positive and negative low 32 bits).
+        assert_eq!(run.call(&mut store, (VALUE_INT_MARK | 42) as i64).unwrap(), 42.0);
+        assert_eq!(
+            run.call(&mut store, (VALUE_INT_MARK | (-7i32 as u32 as u64)) as i64).unwrap(),
+            -7.0
+        );
+        // (c) heap-boxed double: a colliding negative-quiet-NaN whose EXACT bits are
+        // stashed at memory1[128]; the Value carries `TAG_BOXED_DOUBLE` + that
+        // pointer. `emit_numval_boxsafe` must `f64.load` the exact bits back.
+        let colliding = 0xFFF8_0000_0000_0001u64; // bits & BOX_MARK == BOX_MARK
+        assert_eq!(colliding & BOX_MARK, BOX_MARK);
+        mem1.write(&mut store, 128, &colliding.to_le_bytes()).unwrap();
+        let boxed = BOX_MARK | (TAG_BOXED_DOUBLE << TAG_SHIFT) | 128u64;
+        assert_eq!(
+            run.call(&mut store, boxed as i64).unwrap().to_bits(),
+            colliding,
+            "boxed double must deref to its exact bits"
+        );
+        // (d) swallowed-OOB `Undefined` → a pure `0.0` (no trap, no memory access).
+        assert_eq!(run.call(&mut store, UNDEFINED_BITS as i64).unwrap(), 0.0);
+    }
+
+    // End-to-end phase-2 over a `NumberBoxed` (`DmLoadF` result): the copyTo-shaped
+    // `lf64(addr) * lf64(addr)` must physically unbox both loads (heap-box-safely)
+    // and compute the product. Exercises the whole pipeline (infer → is_f64_arith →
+    // emit_arith_number_phys w/ box-safe unbox → box_top before return).
+    #[test]
+    fn dm_loadf_feeds_physical_arith() {
+        use wasmi::{
+            Config, Engine, Func, Instance, Memory, MemoryType as WMemoryType, Module, Store,
+        };
+        let int_val = |v: i32| VALUE_INT_MARK | (v as u32 as u64);
+        let ops = [
+            JitOp::GetLocalValue(1), // addr
+            JitOp::DmLoadF(8),       // x (NumberBoxed)
+            JitOp::GetLocalValue(1), // addr
+            JitOp::DmLoadF(8),       // x (NumberBoxed)
+            JitOp::ArithInt(11),     // multiply -> x*x (physical f64)
+            JitOp::ReturnValueBoxed,
+        ];
+        let m = manifest(&ops);
+        assert!(m.has_dm);
+        let bytes = compile(&ops).expect("compiles");
+        let mut config = Config::default();
+        config.wasm_multi_memory(true);
+        let engine = Engine::new(&config);
+        let module = Module::new(&engine, &bytes).expect("valid multi-memory wasm");
+        let mut store = Store::new(&engine, ());
+        let frame = Memory::new(&mut store, WMemoryType::new(1, None).unwrap()).unwrap();
+        let dm = Memory::new(&mut store, WMemoryType::new(1, None).unwrap()).unwrap();
+        frame.write(&mut store, 8, &int_val(0).to_le_bytes()).unwrap(); // local1 = addr 0
+        dm.write(&mut store, 32, &64u32.to_le_bytes()).unwrap(); // base=64
+        dm.write(&mut store, 36, &64u32.to_le_bytes()).unwrap(); // cap=64
+        dm.write(&mut store, 64, &3.0f64.to_le_bytes()).unwrap(); // value at base+0
+        let mut externs: Vec<wasmi::Extern> = Vec::new();
+        for _ in 0..m.num_helpers {
+            externs.push(Func::wrap(&mut store, |a: i64| -> i64 { a }).into());
+        }
+        // The arity-2 `t{i}` arith-helper fallbacks (unused: the fast path elides
+        // them, but the module still imports them).
+        for _ in 0..m.num_helpers2 {
+            externs.push(Func::wrap(&mut store, |a: i64, _: i64| -> i64 { a }).into());
+        }
+        externs.push(frame.into());
+        externs.push(dm.into());
+        let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
+        let run = instance
+            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .expect("run export");
+        let got = run.call(&mut store, (0, 32, 0, 0, 0)).expect("runs") as u64;
+        // 3.0 * 3.0 = 9.0, boxed as a canonical `Number` (its bits ARE the f64).
+        assert_eq!(got, 9.0f64.to_bits());
+    }
+
     // `coerceb`: `ToBoolean(v)` (via `to_boolean` = h5) boxed as a `Boolean` Value.
     #[test]
     fn lowers_coerce_bool() {
@@ -4319,7 +4833,7 @@ mod tests {
         let ops = [
             JitOp::GetLocalValue(1), // receiver
             JitOp::GetLocalValue(2), // name
-            JitOp::GetPropertyFast(5),
+            JitOp::GetPropertyFast(5, false),
             JitOp::ReturnValueBoxed,
         ];
         let m = manifest(&ops);
@@ -4398,7 +4912,7 @@ mod tests {
         // Handlers present ⇒ imports h0..=h22 (dispatch/new_catch/pop_caught).
         assert_eq!(manifest(&ops).num_helpers, POP_CAUGHT + 1);
 
-        let bytes = compile_full(&ops, &[], &exceptions).expect("compiles");
+        let bytes = compile_full(&ops, &[], &exceptions, &[]).expect("compiles");
         let engine = Engine::default();
         let module = Module::new(&engine, &bytes).expect("valid wasm");
         let mut store = Store::new(&engine, ());
@@ -4441,7 +4955,7 @@ mod tests {
         let exceptions = [ExcRange { from: 1, to: 2, target: 3 }];
         assert_eq!(manifest(&ops).num_helpers, POP_CAUGHT + 1); // h0..=h22
 
-        let bytes = compile_full(&ops, &[], &exceptions).expect("compiles");
+        let bytes = compile_full(&ops, &[], &exceptions, &[]).expect("compiles");
         let go = |err: i32| -> u64 {
             let engine = Engine::default();
             let module = Module::new(&engine, &bytes).expect("valid wasm");
@@ -4981,10 +5495,10 @@ mod tests {
         tests_slot_layout::force(Some((8, 12)));
         let ops = [
             JitOp::GetLocalValue(1),
-            JitOp::GetSlot(3), // int receiver → gs fallback (result dropped)
+            JitOp::GetSlot(3, false), // int receiver → gs fallback (result dropped)
             JitOp::Pop,
             JitOp::GetLocalValue(0),
-            JitOp::GetSlot(2), // object receiver → inline fast path
+            JitOp::GetSlot(2, false), // object receiver → inline fast path
             JitOp::ReturnValueBoxed,
         ];
         let m = manifest(&ops);
@@ -5047,8 +5561,8 @@ mod tests {
         ];
         let m1 = [JitOp::GetLocalValue(1), JitOp::CallHelper(0), JitOp::ReturnValueBoxed];
         let members = [
-            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "" },
-            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "" },
+            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
+            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
         ];
         let (bytes, union) = compile_generation(&members).expect("generation compiles");
         assert_eq!(union.num_helpers, 1); // the union carries m1's h0
@@ -5094,7 +5608,7 @@ mod tests {
         ];
         let m1 = [
             JitOp::GetLocalValue(0),
-            JitOp::GetSlot(1), // gs (+ perr)
+            JitOp::GetSlot(1, false), // gs (+ perr)
             JitOp::GetLocalValue(1),
             JitOp::ArithNum(13), // t0..t13
             JitOp::Coerce(0),    // coerce
@@ -5108,9 +5622,9 @@ mod tests {
             JitOp::ReturnValueBoxed,
         ];
         let members = [
-            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "" },
-            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "" },
-            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "" },
+            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
+            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
+            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
         ];
         let (bytes, union) = compile_generation(&members).expect("generation compiles");
         assert!(union.has_vcall && union.has_getslot && union.has_call && union.has_coerce);

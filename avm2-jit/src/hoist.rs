@@ -58,16 +58,16 @@ pub(crate) fn hoist_pass(
         }
         let written = written_locals(region);
         // Unique invariant (receiver, slot) pairs whose GetSlot is null-safe.
-        let mut pairs: Vec<(JitOp, u32)> = Vec::new();
+        let mut pairs: Vec<(JitOp, u32, bool)> = Vec::new();
         for (off, w) in region.windows(2).enumerate() {
-            let (recv, slot) = match (w[0], w[1]) {
-                (JitOp::GetLocalValue(r), JitOp::GetSlot(id))
+            let (recv, slot, num) = match (w[0], w[1]) {
+                (JitOp::GetLocalValue(r), JitOp::GetSlot(id, num))
                     if !written.contains(&r) =>
                 {
-                    (JitOp::GetLocalValue(r), id)
+                    (JitOp::GetLocalValue(r), id, num)
                 }
-                (JitOp::GetScriptGlobals(k), JitOp::GetSlot(id)) => {
-                    (JitOp::GetScriptGlobals(k), id)
+                (JitOp::GetScriptGlobals(k), JitOp::GetSlot(id, num)) => {
+                    (JitOp::GetScriptGlobals(k), id, num)
                 }
                 _ => continue,
             };
@@ -75,8 +75,8 @@ pub(crate) fn hoist_pass(
             if !null_safe.contains(&getslot_idx) {
                 continue;
             }
-            if !pairs.contains(&(recv, slot)) {
-                pairs.push((recv, slot));
+            if !pairs.contains(&(recv, slot, num)) {
+                pairs.push((recv, slot, num));
             }
         }
         let budget = (MAX_HOISTS_PER_METHOD - used)
@@ -90,8 +90,8 @@ pub(crate) fn hoist_pass(
         let scratch_of = |i: usize| first_scratch + used + i as u32;
         for idx in body..backedge {
             let pair = match (ops[idx], ops[idx + 1]) {
-                (r @ JitOp::GetLocalValue(_), JitOp::GetSlot(id))
-                | (r @ JitOp::GetScriptGlobals(_), JitOp::GetSlot(id)) => (r, id),
+                (r @ JitOp::GetLocalValue(_), JitOp::GetSlot(id, num))
+                | (r @ JitOp::GetScriptGlobals(_), JitOp::GetSlot(id, num)) => (r, id, num),
                 _ => continue,
             };
             if let Some(i) = pairs.iter().position(|p| *p == pair) {
@@ -103,9 +103,9 @@ pub(crate) fn hoist_pass(
         // Preheader: `recv; GetSlot; SetLocalValue(scratch)` per pair, before E.
         let insert_len = pairs.len() * 3;
         let mut preheader = Vec::with_capacity(insert_len);
-        for (i, (recv, slot)) in pairs.iter().enumerate() {
+        for (i, (recv, slot, num)) in pairs.iter().enumerate() {
             preheader.push(*recv);
-            preheader.push(JitOp::GetSlot(*slot));
+            preheader.push(JitOp::GetSlot(*slot, *num));
             preheader.push(JitOp::SetLocalValue(scratch_of(i)));
         }
         ops.splice(entry..entry, preheader);
@@ -189,7 +189,7 @@ fn region_is_invariant_safe(region: &[JitOp]) -> bool {
                 | JitOp::PushConst(_)
                 | JitOp::PushString(_)
                 | JitOp::GetScriptGlobals(_)
-                | JitOp::GetSlot(_)
+                | JitOp::GetSlot(_, _)
                 | JitOp::DupValue
                 | JitOp::SwapValue
                 | JitOp::Pop
@@ -261,7 +261,7 @@ mod tests {
         let mut ops = vec![
             JitOp::Jump(6),                // 0: E -> C
             JitOp::GetLocalValue(1),       // 1: B (receiver)
-            JitOp::GetSlot(2),             // 2:   null-safe
+            JitOp::GetSlot(2, false),             // 2:   null-safe
             JitOp::SetLocalValue(4),       // 3
             JitOp::IncDecLocalIValue(3, true), // 4: i++
             JitOp::Nop,                    // 5
@@ -274,7 +274,7 @@ mod tests {
         // Preheader before old E: recv; GetSlot; SetLocal(10).
         assert_eq!(
             &ops[0..3],
-            &[JitOp::GetLocalValue(1), JitOp::GetSlot(2), JitOp::SetLocalValue(10)]
+            &[JitOp::GetLocalValue(1), JitOp::GetSlot(2, false), JitOp::SetLocalValue(10)]
         );
         assert_eq!(ops[3], JitOp::Jump(9)); // C shifted by 3
         assert_eq!(ops[4], JitOp::GetLocalValue(10)); // in-loop pair rewritten
@@ -288,7 +288,7 @@ mod tests {
         let mut ops = vec![
             JitOp::Jump(5),
             JitOp::GetLocalValue(1),
-            JitOp::GetSlot(2),
+            JitOp::GetSlot(2, false),
             JitOp::SetLocalValue(1), // clobbers the receiver
             JitOp::Nop,
             JitOp::GetLocalValue(3),
@@ -306,7 +306,7 @@ mod tests {
         let mut ops = vec![
             JitOp::Jump(5),
             JitOp::GetLocalValue(1),
-            JitOp::GetSlot(2),
+            JitOp::GetSlot(2, false),
             JitOp::Pop,
             JitOp::Nop,
             JitOp::GetLocalValue(3),

@@ -270,7 +270,12 @@ const DM_STORE: u32 = 3;
 ///
 /// Every value it puts on the stack is a genuine `Value`, so returning any of
 /// them is sound (see the `ReturnValue` arm).
-pub fn translate_boxed(ops: &[Op]) -> Option<(Vec<JitOp>, Vec<SwitchTable>)> {
+pub fn translate_boxed(
+    ops: &[Op],
+    // Op indices whose `getslot` returns a `Number` (from the optimizer) — marks
+    // those `GetSlot`s for phase-2 unboxing. Sorted; empty is fine.
+    number_slots: &[u32],
+) -> Option<(Vec<JitOp>, Vec<SwitchTable>)> {
     let mut out: Vec<JitOp> = Vec::with_capacity(ops.len());
     let mut switches: Vec<SwitchTable> = Vec::new();
     // Running index into the method's multiname table (one entry per getproperty
@@ -304,7 +309,8 @@ pub fn translate_boxed(ops: &[Op]) -> Option<(Vec<JitOp>, Vec<SwitchTable>)> {
     let mut next_coerce: u32 = 0;
     let mut next_native: u32 = 0;
     let mut next_ns: u32 = 0;
-    for op in ops {
+    for (i, op) in ops.iter().enumerate() {
+        let returns_number = number_slots.binary_search(&(i as u32)).is_ok();
         out.push(boxed_op(
             op,
             &mut next_mn,
@@ -316,6 +322,7 @@ pub fn translate_boxed(ops: &[Op]) -> Option<(Vec<JitOp>, Vec<SwitchTable>)> {
             needs_scope,
             scope_this,
             &mut switches,
+            returns_number,
         )?);
     }
     Some((out, switches))
@@ -361,6 +368,8 @@ fn boxed_op(
     needs_scope: bool,
     scope_this: bool,
     switches: &mut Vec<SwitchTable>,
+    // Whether THIS op is a `getslot` the optimizer proved returns a `Number`.
+    returns_number: bool,
 ) -> Option<JitOp> {
     Some(match *op {
         // See [`scope_is_this`]: the only scope entry is the prologue-pushed
@@ -519,11 +528,11 @@ fn boxed_op(
         Op::GetPropertyFast { .. } if JIT_GETPROP_FAST => {
             let k = *next_mn;
             *next_mn += 1;
-            JitOp::GetPropertyFast(k)
+            JitOp::GetPropertyFast(k, returns_number)
         }
         // The verifier's resolved form of a typed property read: a direct slot
         // fetch (no multiname). One of the hottest AVM2 ops.
-        Op::GetSlot { index } => JitOp::GetSlot(index as u32),
+        Op::GetSlot { index } => JitOp::GetSlot(index as u32, returns_number),
         // Boxed constant push (verifier normalizes pushbyte/pushshort → PushInt).
         Op::PushInt { value } => JitOp::PushIntValue(value),
         // Other primitive constant pushes — bake the `Value` bits at translate time
@@ -824,6 +833,7 @@ pub fn first_unsupported_boxed(ops: &[Op]) -> Option<String> {
                 true,
                 false,
                 &mut switches,
+                false,
             )
             .is_none()
         })
@@ -1015,8 +1025,8 @@ pub(crate) fn reference_run(ops: &[JitOp], regs: &[u64]) -> u64 {
             | JitOp::IncrementIBoxed
             | JitOp::DecrementIBoxed
             | JitOp::GetProperty(_)
-            | JitOp::GetPropertyFast(_)
-            | JitOp::GetSlot(_)
+            | JitOp::GetPropertyFast(_, _)
+            | JitOp::GetSlot(_, _)
             | JitOp::PushIntValue(_)
             | JitOp::PushConst(_)
             | JitOp::CallHelper3(_, _)
@@ -1135,7 +1145,7 @@ mod tests {
             Op::TypeOf,
             Op::ReturnValue { return_type: None },
         ];
-        let (out, switches) = translate_boxed(&ops).expect("boxed supported");
+        let (out, switches) = translate_boxed(&ops, &[]).expect("boxed supported");
         assert!(switches.is_empty());
         assert_eq!(out[4], JitOp::VCall(vc::NEW_ARRAY, 0, 2, true));
         assert_eq!(out[5], JitOp::VCall(vc::TYPE_OF, 0, 0, true));
@@ -1145,7 +1155,7 @@ mod tests {
             Op::Construct { num_args: 1 },
             Op::ReturnValue { return_type: None },
         ];
-        let (out, _) = translate_boxed(&ops).expect("boxed supported");
+        let (out, _) = translate_boxed(&ops, &[]).expect("boxed supported");
         assert_eq!(out[0], JitOp::VCall(vc::NEW_OBJECT, 0, 6, true));
         assert_eq!(out[1], JitOp::VCall(vc::CONSTRUCT, 0, 1, true));
     }
@@ -1303,7 +1313,7 @@ mod diff_tests {
             Op::GetLocal { index: 2 },             // 19
             Op::ReturnValue { return_type: None }, // 20
         ];
-        let (ops, switches) = translate_boxed(&core_ops).expect("boxed supported");
+        let (ops, switches) = translate_boxed(&core_ops, &[]).expect("boxed supported");
         assert!(switches.is_empty());
         let bytes = compile(&ops).expect("compiles");
         for n in [0, 1, 2, 16, 100] {
@@ -1346,7 +1356,7 @@ mod diff_tests {
             Op::GetLocal { index: 2 },             // 20
             Op::ReturnValue { return_type: None }, // 21
         ];
-        let (ops, switches) = translate_boxed(&core_ops).expect("boxed supported");
+        let (ops, switches) = translate_boxed(&core_ops, &[]).expect("boxed supported");
         assert!(switches.is_empty());
         let bytes = compile(&ops).expect("compiles");
         for n in [0, 1, 2, 16, 100] {

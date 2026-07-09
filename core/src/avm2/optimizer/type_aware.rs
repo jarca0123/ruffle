@@ -686,6 +686,10 @@ pub fn type_aware_optimize<'gc>(
     resolved_parameters: &[ResolvedParamConfig<'gc>],
     jump_targets: &mut FnvHashSet<usize>,
     null_safe_getslots: &mut Vec<u32>,
+    // Op indices of `getslot`s whose resolved value class is `Number` — the JIT
+    // marks their result `Number` so phase-2 type-specialization can keep it
+    // unboxed as `f64` (e.g. Starling matrix fields). Sorted; nop-remapped.
+    number_slots: &mut Vec<u32>,
 ) -> Result<(), Error<'gc>> {
     let (block_list, op_index_to_block_index_table) = assemble_blocks(code_slice, jump_targets);
 
@@ -783,6 +787,7 @@ pub fn type_aware_optimize<'gc>(
             &mut in_worklist,
             false,
             null_safe_getslots,
+            number_slots,
         )?;
     }
 
@@ -804,6 +809,7 @@ pub fn type_aware_optimize<'gc>(
                 &mut in_worklist,
                 true,
                 null_safe_getslots,
+                number_slots,
             )?;
         }
     }
@@ -876,6 +882,8 @@ fn abstract_interpret_ops<'gc>(
     // may hoist it out of a loop (see `avm2-jit`'s hoist pass). Filled only
     // during the optimize pass (final op positions).
     null_safe_getslots: &mut Vec<u32>,
+    // Op indices of `Number`-typed `GetSlot`s (phase-2 unbox input). See caller.
+    number_slots: &mut Vec<u32>,
 ) -> Result<(), Error<'gc>> {
     let mut locals = initial_state.locals;
     let mut stack = initial_state.stack;
@@ -1568,6 +1576,10 @@ fn abstract_interpret_ops<'gc>(
 
                 vtable.set_slot_class(activation.gc(), slot_id, value_class);
 
+                if do_optimize && resolved_value_class == Some(types.number) {
+                    number_slots.push((start_index + i) as u32);
+                }
+
                 if let Some(class) = resolved_value_class {
                     stack.push_class(activation, class)?;
                 } else {
@@ -1621,6 +1633,12 @@ fn abstract_interpret_ops<'gc>(
                     {
                         null_safe_getslots.push((start_index + i) as u32);
                     }
+                    if do_optimize
+                        && matches!(new_op, Op::GetSlot { .. })
+                        && return_type == Some(types.number)
+                    {
+                        number_slots.push((start_index + i) as u32);
+                    }
                     optimize_op_to!(new_op);
 
                     if let Some(return_type) = return_type {
@@ -1668,6 +1686,11 @@ fn abstract_interpret_ops<'gc>(
                         {
                             stack_push_done = true;
                             stack.push_class(activation, param)?;
+                            // A `Vector.<Number>` element read is a `Number` — mark
+                            // it for phase-2 unboxing (e.g. Starling vertex math).
+                            if do_optimize && param.is_builtin_number() {
+                                number_slots.push((start_index + i) as u32);
+                            }
                         } else if activation.caller_movie_or_root().version() >= 14 {
                             // The general case, meanwhile, *is* correctly
                             // version-gated.

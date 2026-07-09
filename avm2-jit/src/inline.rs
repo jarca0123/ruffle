@@ -222,7 +222,7 @@ fn remap_op(op: JitOp, local_base: u32, mn_base: u32, target_base: usize) -> Jit
         JitOp::SetLocalDouble(i) => JitOp::SetLocalDouble(i + local_base),
         JitOp::StoreLocalDouble(i) => JitOp::StoreLocalDouble(i + local_base),
         JitOp::GetProperty(k) => JitOp::GetProperty(k + mn_base),
-        JitOp::GetPropertyFast(k) => JitOp::GetPropertyFast(k + mn_base),
+        JitOp::GetPropertyFast(k, num) => JitOp::GetPropertyFast(k + mn_base, num),
         JitOp::Jump(t) => JitOp::Jump(target_base + t),
         JitOp::IfTrue(t) => JitOp::IfTrue(target_base + t),
         JitOp::IfFalse(t) => JitOp::IfFalse(target_base + t),

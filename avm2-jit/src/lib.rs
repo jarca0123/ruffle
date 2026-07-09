@@ -47,6 +47,7 @@ pub(crate) mod helpers;
 pub mod lower;
 pub mod runner;
 pub mod translate;
+pub(crate) mod typed;
 
 /// A compiled method: the module bytes, its import manifest, and every per-method
 /// side table the helpers index at run time — ALL built once at compile time and
@@ -101,6 +102,9 @@ struct GenSource {
     /// so profilers label each JIT-compiled method (otherwise every method shows
     /// as `wasm-function[N]` and its samples mis-attribute to its caller).
     name: Rc<str>,
+    /// Per-local "is numeric on entry" (param types) — seeds check-elision when
+    /// this method is re-emitted into a generation amalgam.
+    numeric_seed: Rc<[bool]>,
 }
 
 impl GenSource {
@@ -113,6 +117,7 @@ impl GenSource {
             switches: Rc::from([] as [lower::SwitchTable; 0]),
             exceptions: Rc::from([] as [lower::ExcRange; 0]),
             name: Rc::from(""),
+            numeric_seed: Rc::from([] as [bool; 0]),
         }
     }
 }
@@ -414,7 +419,9 @@ impl WasmJit {
             return None;
         }
         let entry: CacheEntry = locals_typed_seed(activation, method)
-            .and_then(|(int_seed, double_seed)| compile_method(method, &int_seed, &double_seed))
+            .and_then(|(int_seed, double_seed, numeric_seed)| {
+                compile_method(method, &int_seed, &double_seed, &numeric_seed)
+            })
             .map(|(bytes, manifest, mn_list, mut gen_src)| {
                 // Record the method name for the amalgam's wasm name section
                 // (this is the only place with the `Method` in scope).
@@ -522,6 +529,7 @@ impl WasmJit {
                     switches: &c.gen_src.switches,
                     exceptions: &c.gen_src.exceptions,
                     name: &c.gen_src.name,
+                    numeric_seed: &c.gen_src.numeric_seed,
                 })
                 .collect();
             let Some((bytes, union)) = lower::compile_generation(&members) else {
@@ -591,15 +599,20 @@ fn warn_heap_exhausted_once() {
 fn locals_typed_seed<'gc>(
     activation: &mut Activation<'_, 'gc>,
     method: Method<'gc>,
-) -> Option<(Vec<bool>, Vec<bool>)> {
+) -> Option<(Vec<bool>, Vec<bool>, Vec<bool>)> {
     let num_locals = method.body()?.num_locals as usize;
     method.resolve_info(activation).ok()?;
     let params = method.resolved_param_config();
     let class_defs = activation.avm2().class_defs();
-    let (int_class, number_class) = (class_defs.int, class_defs.number);
+    let (int_class, number_class, uint_class) =
+        (class_defs.int, class_defs.number, class_defs.uint);
 
     let mut int_seed = vec![false; num_locals];
     let mut double_seed = vec![false; num_locals];
+    // For check-elision: `int`, `uint`, AND `Number` params are all provably numeric
+    // (safe to skip the `is_numeric` guard). This is broader than the int/double
+    // path seeds — `uint` is numeric even though it can't use the signed-`i32` path.
+    let mut numeric_seed = vec![false; num_locals];
     for (i, param) in params.iter().enumerate() {
         let slot = i + 1; // local 0 is `this`
         if slot < num_locals {
@@ -608,13 +621,20 @@ fn locals_typed_seed<'gc>(
                 // signed (`I32LtS`) and re-boxes as `Integer`, but a `uint > i32::MAX`
                 // is a positive `Number` in AS3 — signed compare / int-box would
                 // diverge. `uint` methods fall to the boxed path (CoerceU/abstract_lt).
-                Some(c) if c == int_class => int_seed[slot] = true,
-                Some(c) if c == number_class => double_seed[slot] = true,
+                Some(c) if c == int_class => {
+                    int_seed[slot] = true;
+                    numeric_seed[slot] = true;
+                }
+                Some(c) if c == number_class => {
+                    double_seed[slot] = true;
+                    numeric_seed[slot] = true;
+                }
+                Some(c) if c == uint_class => numeric_seed[slot] = true,
                 _ => {}
             }
         }
     }
-    Some((int_seed, double_seed))
+    Some((int_seed, double_seed, numeric_seed))
 }
 
 /// Translates, type-checks, and compiles a method. `None` if any op is
@@ -623,6 +643,7 @@ fn compile_method<'gc>(
     method: Method<'gc>,
     int_seed: &[bool],
     double_seed: &[bool],
+    numeric_seed: &[bool],
 ) -> Option<(Rc<[u8]>, lower::Manifest, Rc<[*const ()]>, GenSource)> {
     method.body()?;
     let core_ops = &method.get_verified_info().parsed_code;
@@ -634,14 +655,16 @@ fn compile_method<'gc>(
                   exceptions: &[lower::ExcRange],
                   mn_list: Vec<*const ()>|
      -> Option<(Rc<[u8]>, lower::Manifest, Rc<[*const ()]>, GenSource)> {
-        let bytes =
-            Rc::from(lower::compile_full(ops, switches, exceptions)?.into_boxed_slice());
+        let bytes = Rc::from(
+            lower::compile_full(ops, switches, exceptions, numeric_seed)?.into_boxed_slice(),
+        );
         let gen_src = GenSource {
             ops: ops.into(),
             switches: switches.into(),
             exceptions: exceptions.into(),
             // Filled in by the caller (which has the `Method` for `method_name`).
             name: Rc::from(""),
+            numeric_seed: numeric_seed.into(),
         };
         Some((bytes, lower::manifest(ops), mn_list.into(), gen_src))
     };
@@ -665,7 +688,8 @@ fn compile_method<'gc>(
     let exceptions = exc_ranges(method);
 
     // Boxed (GC-aware) path — raw `Value`s + imported helper `call`s.
-    let (mut ops, switches) = translate::translate_boxed(core_ops)?;
+    let (mut ops, switches) =
+        translate::translate_boxed(core_ops, &method.get_verified_info().number_slots)?;
     // The caller's multiname pointers; the inline pass appends each inlined callee's
     // (and remaps that callee's `k`s), keeping this list in sync with the final ops.
     let mut mn_list = multiname_table(method);
@@ -684,7 +708,7 @@ fn compile_method<'gc>(
         let null_safe: Vec<u32> = null_safe
             .iter()
             .copied()
-            .filter(|&i| matches!(ops.get(i as usize), Some(lower::JitOp::GetSlot(_))))
+            .filter(|&i| matches!(ops.get(i as usize), Some(lower::JitOp::GetSlot(_, _))))
             .collect();
         hoisted_locals = hoist::hoist_pass(&mut ops, &null_safe, num_locals, MAX_FRAME_SLOTS);
     }
@@ -821,7 +845,7 @@ fn resolve_inlinable<'gc>(
     let callee_locals = callee_method.body()?.num_locals;
     // Only already-verified bytecode callees (never force verification here).
     let info = callee_method.try_verified_info()?;
-    let (callee, callee_switches) = translate::translate_boxed(&info.parsed_code)?;
+    let (callee, callee_switches) = translate::translate_boxed(&info.parsed_code, &info.number_slots)?;
     // A callee with a `lookupswitch` carries a side-table of absolute op targets
     // that splicing would have to remap — don't inline it (its call stays a helper).
     if !callee_switches.is_empty() {

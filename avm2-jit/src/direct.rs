@@ -66,7 +66,7 @@ fn effect(op: &JitOp) -> Option<(usize, usize)> {
         | JitOp::CoerceString
         | JitOp::Coerce(_)
         | JitOp::GetProperty(_)
-        | JitOp::GetSlot(_) => (1, 1),
+        | JitOp::GetSlot(_, _) => (1, 1),
         JitOp::CallHelper2(_)
         | JitOp::CmpNum(_)
         | JitOp::BitOpInt(_)
@@ -75,7 +75,7 @@ fn effect(op: &JitOp) -> Option<(usize, usize)> {
         | JitOp::AddIBoxed
         | JitOp::SubtractIBoxed
         | JitOp::MultiplyIBoxed
-        | JitOp::GetPropertyFast(_) => (2, 1),
+        | JitOp::GetPropertyFast(_, _) => (2, 1),
         JitOp::CallHelper3(_, _) => (2, 0),
         // Calls: `argc` spilled args + the receiver; the result is pushed for the
         // value form, dropped for the void form. Re-entrancy is fine — the callee
@@ -241,13 +241,13 @@ pub(crate) fn run(ops: &[JitOp], regs: &[u64]) -> Option<u64> {
                 push!(helpers::get_property(recv, k as i64));
                 perr_bail!();
             }
-            JitOp::GetPropertyFast(k) => {
+            JitOp::GetPropertyFast(k, _) => {
                 let name = pop!();
                 let recv = pop!();
                 push!(helpers::get_property_fast(recv, name, k as i64));
                 perr_bail!();
             }
-            JitOp::GetSlot(slot_id) => {
+            JitOp::GetSlot(slot_id, _) => {
                 let recv = pop!();
                 push!(helpers::get_slot(recv, slot_id as i64));
                 perr_bail!();
