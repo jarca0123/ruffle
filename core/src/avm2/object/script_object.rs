@@ -161,6 +161,21 @@ pub fn jit_slots_layout() -> Option<(u32, u32)> {
     }
 }
 
+/// AVM2-JIT layout ABI for the property **inline cache** class guard: the byte
+/// offset, within an object's `ScriptObjectData` prefix (`#[repr(C)]`, shared by
+/// every `Object` variant), of the `vtable` pointer word.
+///
+/// The vtable is a `Gc` pointer that is *identical for every instance of a class*
+/// and is what all non-dynamic property dispatch resolves through, so its raw
+/// pointer value is a sound monomorphic-IC key: two receivers with the same
+/// vtable word resolve a given multiname to the same slot. `Lock<VTable>` is
+/// `#[repr(transparent)]` over a single `Gc` word, so the word at this offset is
+/// the raw pointer (32-bit on wasm32, matching the inline `getslot` fast path's
+/// `i32`-truncated object pointers).
+pub fn jit_vtable_offset() -> u32 {
+    std::mem::offset_of!(ScriptObjectData<'static, Erased>, vtable) as u32
+}
+
 impl<'gc, K> ScriptObjectData<'gc, K> {
     #[inline(always)]
     pub fn kind(&self) -> ObjectKind {

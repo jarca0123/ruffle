@@ -46,26 +46,37 @@ const DM_BASE: u32 = 1;
 const DM_LEN: u32 = 2;
 const REGS_PTR: u32 = 3;
 const REGS_LEN: u32 = 4;
-const SCRATCH: u32 = 5;
+/// 6th `run` param: memory-1 byte offset of this method's property-IC cache
+/// buffer (a JIT-owned `Box<[IcCell]>`; see [`emit_getprop_ic`]). 0 when the
+/// method has no IC site (`Manifest::has_ic == false`) — then no emitted code
+/// reads it.
+const IC_BASE: u32 = 5;
+const SCRATCH: u32 = 6;
 /// Second i32 scratch (inline `si*` holds the address and the value at once).
-const SCRATCH2: u32 = 6;
-const BLOCK: u32 = 7;
+const SCRATCH2: u32 = 7;
+const BLOCK: u32 = 8;
 /// i64 scratch for boxed-`Value` stores.
-const SCRATCH64: u32 = 8;
+const SCRATCH64: u32 = 9;
 /// Second i64 scratch (used by `swap`, which must hold both operands).
-const SCRATCH64_2: u32 = 9;
+const SCRATCH64_2: u32 = 10;
 /// f64 scratch for double boxing.
-const SCRATCH_F64: u32 = 10;
+const SCRATCH_F64: u32 = 11;
 /// Base index of the operand-stack spill pool: `SPILL_POOL` i64 locals used to
 /// carry live boxed operands across a basic-block boundary (the `br_table`
 /// dispatch can't keep the wasm operand stack live across blocks). A branch spills
 /// its live values here; the target block reloads them. Only the boxed path uses
 /// them (its stack values are i64); the int/double paths declare them but never
 /// spill (int values are i32; the double path is branch-free).
-const SPILL_BASE: u32 = 11;
+const SPILL_BASE: u32 = 12;
 /// Max operand-stack height carryable across a branch. Ternary/short-circuit carry
 /// 1; deeper cross-branch expressions are rare — a method exceeding this declines.
 const SPILL_POOL: u32 = 8;
+
+/// Bytes per JIT frame nesting level in memory 0 (`state_ptr = depth * FRAME_STRIDE`).
+/// The in-wasm JIT→JIT direct call ([`emit_call_direct`]) places the callee frame at
+/// `state_ptr + FRAME_STRIDE`, so this MUST equal the runner's frame stride
+/// (`runner::web::STRIDE`, which is defined as this).
+pub(crate) const FRAME_STRIDE: u32 = 4096;
 
 /// The canonical NaN bit pattern Ruffle stores for a NaN `Number` (must match
 /// `core::avm2::value`'s `CANON_NAN`).
@@ -116,19 +127,51 @@ fn slot_layout() -> Option<(u32, u32)> {
     }
 }
 
-/// Test hook: forces a fake [`slot_layout`] so the (wasm32-gated) inline
-/// `getslot` codegen can be exercised natively under wasmi with a mock memory 1.
+/// Byte offset of the object's `vtable` pointer within its `ScriptObjectData`
+/// prefix — the property-IC class guard's key (see [`emit_getprop_ic`]). Same
+/// web-only gating as [`slot_layout`] (`None` natively → the IC is never
+/// emitted); forced in tests alongside the slot layout.
+fn vtable_offset() -> Option<u32> {
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    if let Some(off) = tests_slot_layout::get_vtable() {
+        return Some(off);
+    }
+    if cfg!(target_arch = "wasm32") {
+        static VOFF: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        Some(*VOFF.get_or_init(ruffle_core::avm2::jit_vtable_offset))
+    } else {
+        None
+    }
+}
+
+/// Whether the property inline cache can be emitted: both the slot layout and the
+/// vtable-offset probes must be available (web, or forced in a test). When false
+/// (native production), `translate` keeps the generic `GetProperty` helper path.
+pub(crate) fn ic_available() -> bool {
+    slot_layout().is_some() && vtable_offset().is_some()
+}
+
+/// Test hook: forces a fake [`slot_layout`] / [`vtable_offset`] so the
+/// (wasm32-gated) inline `getslot` + property-IC codegen can be exercised
+/// natively under wasmi with a mock memory 1.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) mod tests_slot_layout {
     use std::cell::Cell;
     thread_local! {
         static FORCED: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
+        static FORCED_VTABLE: Cell<Option<u32>> = const { Cell::new(None) };
     }
     pub fn get() -> Option<(u32, u32)> {
         FORCED.with(|c| c.get())
     }
     pub fn force(layout: Option<(u32, u32)>) {
         FORCED.with(|c| c.set(layout));
+    }
+    pub fn get_vtable() -> Option<u32> {
+        FORCED_VTABLE.with(|c| c.get())
+    }
+    pub fn force_vtable(off: Option<u32>) {
+        FORCED_VTABLE.with(|c| c.set(off));
     }
 }
 
@@ -340,6 +383,12 @@ fn has_call(ops: &[JitOp]) -> bool {
     ops.iter().any(|op| matches!(op, JitOp::CallMethod(..)))
 }
 
+/// Whether this method makes any JIT→JIT direct call (`callmethod` behind the
+/// call-cache) — needs the `cmi` (call+refill) import + the shared `pca`/`perr`.
+fn has_call_direct(ops: &[JitOp]) -> bool {
+    ops.iter().any(|op| matches!(op, JitOp::CallMethodDirect(..)))
+}
+
 /// Whether this method makes any `callproperty`/`callpropvoid` (needs the `cp`
 /// call_property import + the shared `pca`/`perr` call imports).
 fn has_callprop(ops: &[JitOp]) -> bool {
@@ -373,7 +422,11 @@ fn has_coerce(ops: &[JitOp]) -> bool {
 }
 
 fn has_any_call(ops: &[JitOp]) -> bool {
-    has_call(ops) || has_callprop(ops) || has_construct_super(ops) || has_call_value(ops)
+    has_call(ops)
+        || has_call_direct(ops)
+        || has_callprop(ops)
+        || has_construct_super(ops)
+        || has_call_value(ops)
 }
 
 /// Whether this method inlines domainMemory (`li*`/`si*`) — needs memory 1
@@ -484,6 +537,7 @@ fn is_self_bailing_call(op: JitOp) -> bool {
     matches!(
         op,
         JitOp::CallMethod(..)
+            | JitOp::CallMethodDirect(..)
             | JitOp::CallProperty(..)
             | JitOp::ConstructSuper(_)
             | JitOp::CallValue(_)
@@ -620,6 +674,9 @@ pub struct Manifest {
     pub has_getprop: bool,
     /// Whether the arity-2 `gs` (getslot) import is used.
     pub has_getslot: bool,
+    /// Whether the property inline-cache miss import `gpi` is used (a
+    /// [`JitOp::GetPropertyIc`] is present).
+    pub has_ic: bool,
     /// Whether the arity-3 `gpf` (getpropertyfast) import is used.
     pub has_getprop_fast: bool,
     /// Whether the arity-2 `fp` (findprop, `findpropstrict`/`findproperty`) import
@@ -631,6 +688,9 @@ pub struct Manifest {
     pub set3_mask: u32,
     /// Whether the `cm` (call_method) import is used (`= has_call`).
     pub has_call: bool,
+    /// Whether the `cmi` (call_method + call-cache refill) import is used
+    /// (`= has_call_direct`) — the JIT→JIT direct-call miss path.
+    pub has_call_direct: bool,
     /// Whether the `cp` (call_property) import is used (`= has_callprop`).
     pub has_callprop: bool,
     /// Whether the `csup` (construct_super) import is used (`= has_construct_super`).
@@ -695,11 +755,13 @@ impl Manifest {
             num_helpers,
             has_getprop,
             has_getslot,
+            has_ic,
             has_getprop_fast,
             has_findprop,
             num_helpers2,
             set3_mask,
             has_call,
+            has_call_direct,
             has_callprop,
             has_construct_super,
             has_call_value,
@@ -718,11 +780,13 @@ impl Manifest {
         self.num_helpers = self.num_helpers.max(num_helpers);
         self.has_getprop |= has_getprop;
         self.has_getslot |= has_getslot;
+        self.has_ic |= has_ic;
         self.has_getprop_fast |= has_getprop_fast;
         self.has_findprop |= has_findprop;
         self.num_helpers2 = self.num_helpers2.max(num_helpers2);
         self.set3_mask |= set3_mask;
         self.has_call |= has_call;
+        self.has_call_direct |= has_call_direct;
         self.has_callprop |= has_callprop;
         self.has_construct_super |= has_construct_super;
         self.has_call_value |= has_call_value;
@@ -741,6 +805,7 @@ impl Manifest {
 
     pub fn needs_perr(&self) -> bool {
         self.has_call
+            || self.has_call_direct
             || self.has_callprop
             || self.has_construct_super
             || self.has_call_value
@@ -756,6 +821,60 @@ impl Manifest {
             || self.has_getslot
             || self.has_findprop
             || self.set3_mask & ((1 << (SETSLOT_KIND_MAX + 1)) - 1) != 0
+    }
+
+    /// Whether a JITed method with this manifest is a **direct-call target** for the
+    /// in-wasm JIT→JIT `call_indirect` path (§8 / step 4): the caller places the
+    /// callee's frame at `state_ptr + STRIDE` and calls its `run` wasm→wasm, without
+    /// building an interpreter `Activation` and without touching the Rust-side
+    /// `DEPTH` frame counter.
+    ///
+    /// That is sound ONLY if the callee makes **no Rust re-entry that allocates a
+    /// nested frame or needs the callee's own `Activation`** — otherwise a re-entrant
+    /// helper would read the stale caller `DEPTH` (frame collision) or the wrong
+    /// activation. This v1 is deliberately maximal-conservative: a leaf that imports
+    /// **no helper at all** (`perr` aside — a pure `PENDING_ERROR` flag read) — pure
+    /// register arithmetic + branches + locals. It EXCLUDES `dm`/`getslot` leaves:
+    /// even their inline fast paths keep an `activation()`-reading fallback
+    /// (`dm_load8` coerces the address — `valueOf` re-entry — and reads
+    /// `domain_memory`; `get_slot` reads the activation), so they are both a re-entry
+    /// risk and activation-dependent. Widening to those (the memory-touching numeric
+    /// win that actually matters — §10 `luaV_execute`, Starling `copyTo`) needs those
+    /// hot helpers refactored **Activation-free** (domain/gc passed explicitly) —
+    /// exactly the §8 LESSON's core rewrite. Kept narrow-but-sound until then.
+    /// `getslots_all_null_safe`: every `GetSlot` in the callee is verifier-proven
+    /// not-null (`VerifiedMethodInfo::null_safe_getslots`). A `GetSlot` already
+    /// implies an OBJECT receiver (the verifier only emits it after resolving the
+    /// property to a slot on a known class), so the inline fast path — which reads
+    /// the slot directly, `activation()`-free (see `helpers::get_slot`) — always
+    /// runs; null-safety additionally rules out the slow throw path. So a leaf whose
+    /// only "helper" is `getslot` is directable exactly when all its getslots are
+    /// null-safe. (`gs` is still IMPORTED for the defensive non-object fallback, but
+    /// that arm is dead here — hence `has_getslot` is allowed under the flag.)
+    pub(crate) fn directable(&self, getslots_all_null_safe: bool) -> bool {
+        self.num_helpers == 0
+            && self.num_helpers2 == 0
+            && self.set3_mask == 0
+            && !self.has_getprop
+            && (!self.has_getslot || getslots_all_null_safe)
+            && !self.has_ic
+            && !self.has_getprop_fast
+            && !self.has_findprop
+            && !self.has_call
+            && !self.has_callprop
+            && !self.has_construct_super
+            && !self.has_call_value
+            && !self.has_vcall
+            && !self.has_coerce
+            && !self.has_coerce_s
+            && !self.has_coerce_int
+            && !self.h2_throws
+            && !self.has_hasnext2
+            && !self.has_script_globals
+            && !self.has_push_strings
+            && !self.has_coerced_return
+            && !self.has_dm
+            && !self.dm_throws
     }
 }
 
@@ -776,11 +895,13 @@ pub(crate) fn manifest(ops: &[JitOp]) -> Manifest {
         num_helpers: helper_count(ops),
         has_getprop: has_getprop(ops),
         has_getslot: has_getslot(ops),
+        has_ic: ops.iter().any(|op| matches!(op, JitOp::GetPropertyIc(..))),
         has_getprop_fast: has_getprop_fast(ops),
         has_findprop: has_findprop(ops),
         num_helpers2: helper2_count(ops),
         set3_mask,
         has_call: has_call(ops),
+        has_call_direct: has_call_direct(ops),
         has_callprop: has_callprop(ops),
         has_construct_super: has_construct_super(ops),
         has_call_value: has_call_value(ops),
@@ -805,6 +926,8 @@ pub(crate) fn manifest(ops: &[JitOp]) -> Manifest {
 struct Layout {
     gp_index: u32,
     gs_index: u32,
+    /// `gpi` (property inline-cache miss) import (valid only when `has_ic`).
+    gpi_index: u32,
     /// `get_property_fast` import (arity-3; valid only when `has_getprop_fast`).
     gpf_index: u32,
     /// `find_prop` import (arity-2 `(k, strict) -> object`; valid only when
@@ -815,6 +938,9 @@ struct Layout {
     set3_index: [u32; HELPER3_KINDS],
     /// `call_method` import (valid only when `has_call`).
     call_index: u32,
+    /// `cmi` (call_method + call-cache refill) import (valid only when
+    /// `has_call_direct`) — follows `cm`.
+    cmi_index: u32,
     /// `call_property` import (valid only when `has_callprop`).
     callprop_index: u32,
     /// `construct_super` import (valid only when `has_construct_super`).
@@ -851,6 +977,8 @@ fn layout_of(m: &Manifest) -> Layout {
     next += m.has_getprop as u32;
     let gs_index = next;
     next += m.has_getslot as u32;
+    let gpi_index = next;
+    next += m.has_ic as u32;
     let gpf_index = next;
     next += m.has_getprop_fast as u32;
     // `fp` (find_prop) follows the property-read imports.
@@ -867,9 +995,11 @@ fn layout_of(m: &Manifest) -> Layout {
     // `csup` (construct_super), then the shared `pca` (arg spill) and `perr` (error bail).
     // `vcall` spills its extra operands through the same `pca`, so it gates it too.
     let any_call =
-        m.has_call || m.has_callprop || m.has_construct_super || m.has_call_value || m.has_vcall;
+        m.has_call || m.has_call_direct || m.has_callprop || m.has_construct_super || m.has_call_value || m.has_vcall;
     let call_index = next;
     next += m.has_call as u32;
+    let cmi_index = next;
+    next += m.has_call_direct as u32;
     let callprop_index = next;
     next += m.has_callprop as u32;
     let csup_index = next;
@@ -889,11 +1019,13 @@ fn layout_of(m: &Manifest) -> Layout {
     Layout {
         gp_index,
         gs_index,
+        gpi_index,
         gpf_index,
         fp_index,
         t_base,
         set3_index,
         call_index,
+        cmi_index,
         callprop_index,
         csup_index,
         callv_index,
@@ -1067,6 +1199,13 @@ pub enum JitOp {
     /// Pop the receiver `Value`, read the method's `k`-th multiname, and push
     /// `receiver.get_property(mn)`'s raw `Value` (via the arity-2 `gp` import).
     GetProperty(u32),
+    /// `getproperty` behind a monomorphic **inline cache** (`u32` = multiname
+    /// `k`, `u32` = per-method IC site index): an inline vtable-class guard loads
+    /// the cached slot directly on a hit, else calls the `gpi` helper which
+    /// resolves and refills the cell (see [`emit_getprop_ic`]). Same net stack
+    /// effect as [`JitOp::GetProperty`] — pop receiver, push value. Only emitted
+    /// when the inline object layout is available (`slot_layout().is_some()`).
+    GetPropertyIc(u32, u32),
     /// `getpropertyfast`: a dynamic-name property read. Stack `[.., receiver, name]`;
     /// calls the arity-3 `gpf` (`get_property_fast`) helper with `(receiver, name, k)`
     /// (`k` = the lazy multiname template), pushing the result. Net -1.
@@ -1167,6 +1306,13 @@ pub enum JitOp {
     /// pending-error check after the call so a thrown error bails the whole method
     /// (see `crate::helpers::call_method`). Fields: `(disp_id, argc, push)`.
     CallMethod(u32, u32, bool),
+    /// `callmethod` behind a monomorphic JIT→JIT **direct-call cache** (`u32` = disp
+    /// id, `u32` = argc, `bool` = push, `u32` = per-method call-cache site): an inline
+    /// vtable guard `call_indirect`s a directable callee's compiled `run` on a hit,
+    /// else the `cmi` helper does the call and refills the cell (see
+    /// [`emit_call_direct`]). Same net stack effect as [`JitOp::CallMethod`]. Only
+    /// emitted when the inline object layout is available (`ic_available()`).
+    CallMethodDirect(u32, u32, bool, u32),
     /// `callproperty`/`callpropvoid`: a multiname method call. Like [`JitOp::CallMethod`]
     /// but resolves the `k`-th multiname (the run's multiname table) instead of a
     /// disp-id — spills `argc` args (`push_call_arg`), calls the `call_property`
@@ -1424,9 +1570,275 @@ fn emit_arith_number(body: &mut Function, index: u32) {
     emit_box_double(body);
 }
 
+/// Size (bytes) of one property-IC cache cell in memory 1: `{ class_word: u32
+/// @+0, slot_id: u32 @+4 }`. `class_word == 0` is the "never-observed /
+/// uncacheable" sentinel — a real object's vtable pointer is never null, so a
+/// zeroed cell always misses the guard and routes to the `gpi` helper, which
+/// (re)fills it.
+pub(crate) const IC_CELL_SIZE: u32 = 8;
+
+/// Emits the monomorphic property **inline cache** for a `getproperty` site
+/// (§7): pops the receiver `Value` bits (top of stack), pushes the property
+/// `Value` bits — net stack effect 0, identical to the generic `gp` path.
+///
+/// The class guard is the receiver object's **vtable pointer** (stable per
+/// class; every non-dynamic property dispatch resolves through it), compared
+/// against the per-site cache cell at `cell_addr` in memory 1:
+/// - **object receiver AND `obj.vtable == cell.class`** → the cached slot is
+///   this class's fixed layout, so load `slots_ptr + cell.slot_id*8` directly
+///   (no range check — the class identity guarantees the slot is in range);
+/// - **otherwise** (non-object, or a class miss) → call the `gpi` helper
+///   `(receiver_bits, k, cell_addr) -> value_bits`, which resolves the multiname
+///   via the interpreter and, as a Rust-side effect, refills the cell at
+///   `cell_addr` (a proven fixed slot → `{vtable, slot_id}`; anything else → the
+///   uncacheable sentinel).
+///
+/// The per-site cache cell lives at `ic_base + site*IC_CELL_SIZE` in memory 1,
+/// where `ic_base` is a WASM local (the `run` param carrying this method's
+/// JIT-owned cache buffer offset); `site*IC_CELL_SIZE + field` folds into the
+/// load's compile-time `MemArg` offset. `scratch_i32`/`scratch_i64` are
+/// caller-provided WASM-local indices (the frame pool's `SCRATCH`/`SCRATCH64` in
+/// real codegen; the unit test passes its own) so the guard can be validated in
+/// isolation. All object/cell traffic is on memory 1 (Ruffle's own heap on web,
+/// a mock under wasmi natively), exactly like the inline `getslot` fast path.
+#[allow(clippy::too_many_arguments)]
+fn emit_getprop_ic(
+    body: &mut Function,
+    slots_ptr_off: u32,
+    vtable_off: u32,
+    ic_base_local: u32,
+    k: u64,
+    site: u32,
+    gpi_index: u32,
+    scratch_i32: u32,
+    scratch_i64: u32,
+) {
+    use Instruction::*;
+    let mem1 = |offset: u32, align: u32| MemArg { offset: offset as u64, align, memory_index: 1 };
+    let cell = site * IC_CELL_SIZE;
+    // The miss path: `gpi(receiver_bits, k, cell_addr) -> value_bits`, where
+    // `cell_addr = ic_base + site*IC_CELL_SIZE` is this site's cell address in
+    // memory 1. Passing the absolute cell address (not the site index) lets
+    // `gp_ic` refill the cell with a plain store, needing no side channel for the
+    // base. Emitted twice (non-object receiver; class-guard miss) so neither arm
+    // keeps the receiver on the wasm stack across the branch.
+    let emit_miss = |body: &mut Function| {
+        body.instruction(&LocalGet(scratch_i64)); // receiver bits
+        body.instruction(&I64Const(k as i64));
+        body.instruction(&LocalGet(ic_base_local));
+        body.instruction(&I32Const(cell as i32));
+        body.instruction(&I32Add); // cell_addr = ic_base + site*IC_CELL_SIZE
+        body.instruction(&Call(gpi_index));
+    };
+
+    body.instruction(&LocalSet(scratch_i64)); // scratch_i64 = receiver Value bits
+    // Object-tagged? `(bits >> 48) == 0xFFFD` (see `VALUE_OBJECT_TAG16`).
+    body.instruction(&LocalGet(scratch_i64));
+    body.instruction(&I64Const(48));
+    body.instruction(&I64ShrU);
+    body.instruction(&I64Const(VALUE_OBJECT_TAG16));
+    body.instruction(&I64Eq);
+    body.instruction(&If(BlockType::Result(ValType::I64)));
+    // Object: pointer = the payload's low 32 bits (wasm32 pointers).
+    body.instruction(&LocalGet(scratch_i64));
+    body.instruction(&I32WrapI64);
+    body.instruction(&LocalSet(scratch_i32)); // scratch_i32 = obj ptr (memory 1)
+    // Guard: `obj.vtable == cell.class`?
+    body.instruction(&LocalGet(scratch_i32));
+    body.instruction(&I32Load(mem1(vtable_off, 2))); // obj.vtable
+    body.instruction(&LocalGet(ic_base_local));
+    body.instruction(&I32Load(mem1(cell, 2))); // cell.class
+    body.instruction(&I32Eq);
+    body.instruction(&If(BlockType::Result(ValType::I64)));
+    // HIT: slots[cell.slot_id] bits = load(memory1, slots_ptr + slot_id*8).
+    body.instruction(&LocalGet(scratch_i32));
+    body.instruction(&I32Load(mem1(slots_ptr_off, 2))); // slots_ptr
+    body.instruction(&LocalGet(ic_base_local));
+    body.instruction(&I32Load(mem1(cell + 4, 2))); // cell.slot_id
+    body.instruction(&I32Const(8));
+    body.instruction(&I32Mul);
+    body.instruction(&I32Add);
+    body.instruction(&I64Load(mem1(0, 3)));
+    body.instruction(&Else);
+    emit_miss(body); // class-guard miss
+    body.instruction(&End);
+    body.instruction(&Else);
+    emit_miss(body); // non-object receiver
+    body.instruction(&End);
+}
+
+/// Size (bytes) of one JIT→JIT call-target inline-cache cell in memory 1:
+/// `{ cached_vtable: u32 @+0, callee_run_index: u32 @+4, callee_ic_base: u32 @+8 }`
+/// (padded to 16 for alignment). `cached_vtable == 0` (fresh) or
+/// `callee_run_index == CALL_SENTINEL` → the guard misses to the helper.
+pub(crate) const CALL_CELL_SIZE: u32 = 16;
+
+/// `callee_run_index` value meaning "observed but NOT a direct-call target" (the
+/// callee isn't a compiled directable leaf) — the guard's vtable may match but this
+/// forces the helper path, without re-resolving directability every call.
+pub(crate) const CALL_SENTINEL: u32 = 0xFFFF_FFFF;
+
+/// `member_idx` cell value (`@+12`) meaning the target is a STANDALONE method (its
+/// own 6-param `run` in the shared table). Any other value = the amalgam-member index
+/// of a GENERATION target, reached via that amalgam's 7-param dispatcher.
+pub(crate) const CALL_NO_MEMBER: u32 = 0xFFFF_FFFF;
+
+/// Emits the in-wasm JIT→JIT **direct call** for a `CallMethod(disp_id, argc, push)`
+/// to a directable leaf (§8 / step 4): a monomorphic call-target cache guards the
+/// receiver's vtable; on a hit the args are written straight into the callee's frame
+/// at `state_ptr + STRIDE` and its compiled `run` is invoked **wasm→wasm** via
+/// `call_indirect` (no interpreter `Activation`, no JS crossing); on a miss the
+/// generic `cm` (`call_method`) helper runs (which also refills the cell — a
+/// directable callee → `{vtable, run_index, ic_base}`, else the `CALL_SENTINEL`).
+///
+/// Stack in: `[.., receiver, arg0, .., arg{argc-1}]` (top = last arg); stack out:
+/// the result `Value` iff `push`. `scratch_sp`/`scratch_ptr` (i32) and
+/// `scratch_bits` (i64) are caller-provided frame-pool locals. The callee frame is
+/// memory 0 (`state_ptr` space); the vtable + cache cell are memory 1.
+#[allow(clippy::too_many_arguments)]
+fn emit_call_direct(
+    body: &mut Function,
+    argc: u32,
+    disp_id: u32,
+    vtable_off: u32,
+    cell_base_local: u32,
+    cell_offset: u32,
+    state_ptr_local: u32,
+    dm_base_local: u32,
+    dm_len_local: u32,
+    run_type_index: u32,
+    dispatch_type_index: u32,
+    miss_index: u32,
+    pca_index: u32,
+    scratch_sp: u32,
+    scratch_ptr: u32,
+    scratch_bits: u32,
+    stride: u32,
+    push: bool,
+) {
+    use Instruction::*;
+    // Byte offset of this site's cell within the shared cache buffer (`cell_base` =
+    // `ic_base`; the call region follows the property-IC cells).
+    let cell = cell_offset;
+    let mem1 = |o: u32, a: u32| MemArg { offset: o as u64, align: a, memory_index: 1 };
+    let frame = |o: u32, a: u32| MemArg { offset: o as u64, align: a, memory_index: 0 };
+
+    // callee_sp = caller state_ptr + STRIDE (the next disjoint frame slice).
+    body.instruction(&LocalGet(state_ptr_local));
+    body.instruction(&I32Const(stride as i32));
+    body.instruction(&I32Add);
+    body.instruction(&LocalSet(scratch_sp));
+
+    // Write receiver + args into the callee frame, popping the wasm stack top-first:
+    // arg{argc-1} → slot `argc`, …, receiver → slot 0. After the loop `scratch_bits`
+    // holds the receiver bits (the last op written).
+    for i in (0..=argc).rev() {
+        body.instruction(&LocalSet(scratch_bits));
+        body.instruction(&LocalGet(scratch_sp));
+        body.instruction(&LocalGet(scratch_bits));
+        body.instruction(&I64Store(frame(i * 8, 3)));
+    }
+
+    // Miss: reconstruct the generic call. Spill args top-first (arg{argc-1}…arg0) via
+    // `pca`, reading them back out of the callee frame, then `cm(receiver, disp, argc)`.
+    let emit_miss = |body: &mut Function| {
+        for i in (1..=argc).rev() {
+            body.instruction(&LocalGet(scratch_sp));
+            body.instruction(&I64Load(frame(i * 8, 3)));
+            body.instruction(&Call(pca_index));
+        }
+        body.instruction(&LocalGet(scratch_bits)); // receiver bits
+        body.instruction(&I64Const(disp_id as i64));
+        body.instruction(&I64Const(argc as i64));
+        body.instruction(&LocalGet(cell_base_local));
+        body.instruction(&I32Const(cell as i32));
+        body.instruction(&I32Add); // cell_addr for the refill
+        body.instruction(&Call(miss_index));
+    };
+
+    // Guard: object receiver? (nested so the vtable load never runs on a non-object)
+    body.instruction(&LocalGet(scratch_bits));
+    body.instruction(&I64Const(48));
+    body.instruction(&I64ShrU);
+    body.instruction(&I64Const(VALUE_OBJECT_TAG16));
+    body.instruction(&I64Eq);
+    body.instruction(&If(BlockType::Result(ValType::I64)));
+    body.instruction(&LocalGet(scratch_bits));
+    body.instruction(&I32WrapI64);
+    body.instruction(&LocalSet(scratch_ptr)); // obj ptr (memory 1)
+    // obj.vtable == cell.vtable ?
+    body.instruction(&LocalGet(scratch_ptr));
+    body.instruction(&I32Load(mem1(vtable_off, 2)));
+    body.instruction(&LocalGet(cell_base_local));
+    body.instruction(&I32Load(mem1(cell, 2)));
+    body.instruction(&I32Eq);
+    // AND cell.run_index != CALL_SENTINEL (callee is a directable target)
+    body.instruction(&LocalGet(cell_base_local));
+    body.instruction(&I32Load(mem1(cell + 4, 2)));
+    body.instruction(&I32Const(CALL_SENTINEL as i32));
+    body.instruction(&I32Ne);
+    body.instruction(&I32And);
+    body.instruction(&If(BlockType::Result(ValType::I64)));
+    // HIT: invoke the callee's compiled `run`. `regs_ptr`/`regs_len` = 0 → its prologue
+    // copies nothing; its args are the frame slots we just wrote. `member_idx` (@+12)
+    // selects the entry shape: `CALL_NO_MEMBER` → a STANDALONE method's own 6-param
+    // `run`; else a GENERATION member reached via its amalgam's 7-param dispatcher
+    // (member index prepended). Both slots live in the shared table.
+    body.instruction(&LocalGet(cell_base_local));
+    body.instruction(&I32Load(mem1(cell + 12, 2)));
+    body.instruction(&I32Const(CALL_NO_MEMBER as i32));
+    body.instruction(&I32Eq);
+    body.instruction(&If(BlockType::Result(ValType::I64)));
+    // Standalone: run(callee_sp, dm_base, dm_len, 0, 0, ic_base).
+    body.instruction(&LocalGet(scratch_sp));
+    body.instruction(&LocalGet(dm_base_local));
+    body.instruction(&LocalGet(dm_len_local));
+    body.instruction(&I32Const(0));
+    body.instruction(&I32Const(0));
+    body.instruction(&LocalGet(cell_base_local));
+    body.instruction(&I32Load(mem1(cell + 8, 2))); // callee ic_base
+    body.instruction(&LocalGet(cell_base_local));
+    body.instruction(&I32Load(mem1(cell + 4, 2))); // run slot
+    body.instruction(&CallIndirect { type_index: run_type_index, table_index: 0 });
+    body.instruction(&Else);
+    // Generation member: dispatch(member_idx, callee_sp, dm_base, dm_len, 0, 0, ic_base).
+    body.instruction(&LocalGet(cell_base_local));
+    body.instruction(&I32Load(mem1(cell + 12, 2))); // member_idx
+    body.instruction(&LocalGet(scratch_sp));
+    body.instruction(&LocalGet(dm_base_local));
+    body.instruction(&LocalGet(dm_len_local));
+    body.instruction(&I32Const(0));
+    body.instruction(&I32Const(0));
+    body.instruction(&LocalGet(cell_base_local));
+    body.instruction(&I32Load(mem1(cell + 8, 2))); // callee ic_base
+    body.instruction(&LocalGet(cell_base_local));
+    body.instruction(&I32Load(mem1(cell + 4, 2))); // dispatcher slot
+    body.instruction(&CallIndirect { type_index: dispatch_type_index, table_index: 0 });
+    body.instruction(&End);
+    body.instruction(&Else);
+    emit_miss(body); // vtable/sentinel miss
+    body.instruction(&End);
+    body.instruction(&Else);
+    emit_miss(body); // non-object receiver
+    body.instruction(&End);
+
+    if !push {
+        body.instruction(&Drop);
+    }
+}
+
 /// Emits a non-branch op onto `body`, updating the compile-time operand-stack
 /// `depth`. Returns `None` if the op isn't a linear op or underflows.
-fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) -> Option<()> {
+fn emit_linear(
+    body: &mut Function,
+    op: JitOp,
+    depth: &mut i32,
+    lay: &Layout,
+    // Byte offset of the property-IC region's end = start of the call-cache region in
+    // the shared per-method buffer (`= num_ic_sites * IC_CELL_SIZE`). Only read by
+    // `CallMethodDirect`.
+    call_region_offset: u32,
+) -> Option<()> {
     match op {
         JitOp::GetLocal(i) => {
             body.instruction(&Instruction::LocalGet(STATE_PTR));
@@ -2062,6 +2474,28 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             body.instruction(&Instruction::I64Const(k as i64));
             body.instruction(&Instruction::Call(lay.gp_index));
         }
+        JitOp::GetPropertyIc(k, site) => {
+            if *depth < 1 {
+                return None;
+            }
+            // Inline monomorphic cache: guard the receiver's vtable, load the
+            // cached slot on a hit, else `gpi(receiver, k, site)`. Net depth 0.
+            // The layout is present whenever translate emits this op; `?` is a
+            // belt-and-braces bail (an emitter bug, not a semantic path).
+            let (ptr_off, _len_off) = slot_layout()?;
+            let vtable_off = vtable_offset()?;
+            emit_getprop_ic(
+                body,
+                ptr_off,
+                vtable_off,
+                IC_BASE,
+                k as u64,
+                site,
+                lay.gpi_index,
+                SCRATCH,
+                SCRATCH64,
+            );
+        }
         JitOp::FindProp(k, strict) => {
             // No operand: push (k, strict) and call the arity-2 `fp` helper, which
             // resolves the multiname through the scope chain and pushes the scope
@@ -2447,6 +2881,46 @@ fn emit_linear(body: &mut Function, op: JitOp, depth: &mut i32, lay: &Layout) ->
             // Error check: if the call threw, bail out of the whole method now.
             // `try_run` sees the pending error and propagates it; the returned
             // `undefined` here is ignored. `Return` is stack-polymorphic.
+            if lay.inline_perr {
+                emit_perr_bail(body, lay.perr_index);
+            }
+            *depth -= argc as i32 + 1;
+            if push {
+                *depth += 1;
+            }
+        }
+        JitOp::CallMethodDirect(disp_id, argc, push, site) => {
+            // Stack: [.., receiver, arg0, .., arg{argc-1}]. `emit_call_direct` consumes
+            // them (writes them into the callee frame), guards the receiver's vtable,
+            // and either `call_indirect`s the callee's `run` (hit) or `cmi(receiver,
+            // disp, argc, cell_addr)` (miss, which also refills the cell). The hit path
+            // can't throw (a directable callee is a pure/null-safe leaf); the miss can,
+            // so a `perr` bail follows (a no-op on the non-throwing hit).
+            if *depth < argc as i32 + 1 {
+                return None;
+            }
+            let vtable_off = vtable_offset()?;
+            let cell_offset = call_region_offset + site * CALL_CELL_SIZE;
+            emit_call_direct(
+                body,
+                argc,
+                disp_id,
+                vtable_off,
+                IC_BASE,
+                cell_offset,
+                STATE_PTR,
+                DM_BASE,
+                DM_LEN,
+                /*run_type_index*/ 0,
+                /*dispatch_type_index*/ 6,
+                lay.cmi_index,
+                lay.pca_index,
+                SCRATCH,
+                SCRATCH2,
+                SCRATCH64,
+                FRAME_STRIDE,
+                push,
+            );
             if lay.inline_perr {
                 emit_perr_bail(body, lay.perr_index);
             }
@@ -3012,15 +3486,18 @@ pub fn compile_generation(members: &[GenMember<'_>]) -> Option<(Vec<u8>, Manifes
             mem.numeric_seed,
         )?);
     }
-    // The dispatcher: push the five `run` args, then the method index, and
-    // `call_indirect` through the internal member table (type 0 = the method
-    // signature, so the type check always passes).
+    // The dispatcher: push the six `run` args (incl. `ic_base`), then the method
+    // index, and `call_indirect` through the internal member table (type 0 = the
+    // method signature, so the type check always passes). The member table is table 0,
+    // UNLESS a member makes a direct call — then the shared `__indirect_function_table`
+    // is imported as table 0 and the member table shifts to table 1.
+    let member_table = member_table_index(&u);
     let mut disp = Function::new([]);
-    for arg in 1..=5u32 {
+    for arg in 1..=6u32 {
         disp.instruction(&Instruction::LocalGet(arg));
     }
     disp.instruction(&Instruction::LocalGet(0)); // method_idx selects the table entry
-    disp.instruction(&Instruction::CallIndirect { type_index: 0, table_index: 0 });
+    disp.instruction(&Instruction::CallIndirect { type_index: 0, table_index: member_table });
     disp.instruction(&Instruction::End);
     code.function(&disp);
 
@@ -3052,7 +3529,8 @@ pub fn compile_generation(members: &[GenMember<'_>]) -> Option<(Vec<u8>, Manifes
     let mut elements = ElementSection::new();
     let member_funcs: Vec<u32> = (lay.run_index..lay.run_index + n).collect();
     elements.active(
-        None, // MVP encoding: table 0, funcref
+        // The member table (table 0, or table 1 when the shared table is imported).
+        Some(member_table),
         &ConstExpr::i32_const(0),
         Elements::Functions(member_funcs.into()),
     );
@@ -3086,9 +3564,9 @@ pub fn compile_generation(members: &[GenMember<'_>]) -> Option<(Vec<u8>, Manifes
 fn emit_types() -> TypeSection {
     let mut types = TypeSection::new();
     types.ty().function(
-        [ValType::I32, ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+        [ValType::I32, ValType::I32, ValType::I32, ValType::I32, ValType::I32, ValType::I32],
         [ValType::I64],
-    ); // type 0: run(state_ptr, dm_base, dm_len, regs_ptr, regs_len)->Value
+    ); // type 0: run(state_ptr, dm_base, dm_len, regs_ptr, regs_len, ic_base)->Value
     types.ty().function([ValType::I64], [ValType::I64]); // type 1: helper(Value)->Value
     types.ty().function([ValType::I64, ValType::I64], [ValType::I64]); // type 2: gp/gs(recv,k)->Value
     types
@@ -3104,13 +3582,21 @@ fn emit_types() -> TypeSection {
             ValType::I32,
             ValType::I32,
             ValType::I32,
+            ValType::I32,
         ],
         [ValType::I64],
-    ); // type 6: dispatch(method_idx, state_ptr, dm_base, dm_len, regs_ptr, regs_len)->Value
+    ); // type 6: dispatch(method_idx, state_ptr, dm_base, dm_len, regs_ptr, regs_len, ic_base)->Value
     types.ty().function(
         [ValType::I64, ValType::I64, ValType::I64, ValType::I64],
         [ValType::I64],
     ); // type 7: vc(a, imm, spill, kind)->result (the generic variadic helper)
+    types
+        .ty()
+        .function([ValType::I64, ValType::I64, ValType::I32], [ValType::I64]); // type 8: gpi(receiver, k, cell_addr)->Value (property inline cache miss)
+    types.ty().function(
+        [ValType::I64, ValType::I64, ValType::I64, ValType::I32],
+        [ValType::I64],
+    ); // type 9: cmi(receiver, disp, argc, cell_addr)->Value (direct-call miss + refill)
     types
 }
 
@@ -3128,6 +3614,11 @@ fn emit_imports(m: &Manifest) -> ImportSection {
     }
     if m.has_getslot {
         imports.import("env", "gs", EntityType::Function(2));
+    }
+    // `gpi` (property inline-cache miss) is `(receiver, k, site) -> value` = type 8,
+    // following the other property-read imports.
+    if m.has_ic {
+        imports.import("env", "gpi", EntityType::Function(8));
     }
     // `gpf` (get_property_fast) is arity-3 `(receiver, name, k) -> result` = type 3.
     if m.has_getprop_fast {
@@ -3153,6 +3644,11 @@ fn emit_imports(m: &Manifest) -> ImportSection {
     if m.has_call {
         imports.import("env", "cm", EntityType::Function(3));
     }
+    // `cmi` (direct-call miss + refill) is `(receiver, disp, argc, cell_addr) -> value`
+    // = type 9, following `cm`.
+    if m.has_call_direct {
+        imports.import("env", "cmi", EntityType::Function(9));
+    }
     if m.has_callprop {
         imports.import("env", "cp", EntityType::Function(3));
     }
@@ -3165,7 +3661,7 @@ fn emit_imports(m: &Manifest) -> ImportSection {
         imports.import("env", "callv", EntityType::Function(3));
     }
     let any_call =
-        m.has_call || m.has_callprop || m.has_construct_super || m.has_call_value || m.has_vcall;
+        m.has_call || m.has_call_direct || m.has_callprop || m.has_construct_super || m.has_call_value || m.has_vcall;
     if any_call {
         imports.import("env", "pca", EntityType::Function(4));
     }
@@ -3216,7 +3712,32 @@ fn emit_imports(m: &Manifest) -> ImportSection {
             }),
         );
     }
+    // Shared `__indirect_function_table` — the JIT→JIT direct call `call_indirect`s a
+    // callee's `run` (or its amalgam dispatcher) slot in it (see `emit_call_direct`).
+    // Imported ⇒ table 0; any LOCAL table (a generation's member table) then shifts to
+    // table 1. `minimum: 0` — the host table (`wasm_bindgen::function_table`, holding
+    // the reserved run slots) is always larger.
+    if m.has_call_direct {
+        imports.import(
+            "env",
+            "__indirect_function_table",
+            EntityType::Table(TableType {
+                element_type: RefType::FUNCREF,
+                table64: false,
+                minimum: 0,
+                maximum: None,
+                shared: false,
+            }),
+        );
+    }
     imports
+}
+
+/// The table index of a generation module's LOCAL member table: `1` when the shared
+/// `__indirect_function_table` is imported (some member makes a direct call, so it is
+/// table 0), else `0`.
+fn member_table_index(union: &Manifest) -> u32 {
+    union.has_call_direct as u32
 }
 
 
@@ -3236,6 +3757,14 @@ fn emit_body(
     numeric_seed: &[bool],
 ) -> Option<Function> {
     let has_handlers = !exceptions.is_empty();
+    // Shared cache buffer layout: `[property-IC cells | call-cache cells]`. The call
+    // region starts after the IC cells, so its byte offset is `num_ic_sites *
+    // IC_CELL_SIZE` (sites are dense post-`renumber_ic_sites`).
+    let call_region_offset = ops
+        .iter()
+        .filter(|o| matches!(o, JitOp::GetPropertyIc(..)))
+        .count() as u32
+        * IC_CELL_SIZE;
     // `ReturnValueCoerced` inside a handler range isn't wired for exception
     // dispatch: its lowering emits a bare `Return` right after `coerce_return`, so
     // a failed return-type coercion (`#1034`, stashed in `PENDING_ERROR`) would
@@ -3668,7 +4197,7 @@ fn emit_body(
                     }
                     depth -= 1;
                 }
-                other => emit_linear(&mut body, other, &mut depth, &lay)?,
+                other => emit_linear(&mut body, other, &mut depth, &lay, call_region_offset)?,
             }
 
             // Phase-2: keep `phys` aligned with the authoritative `depth` after the
@@ -3864,9 +4393,9 @@ mod tests {
         memory.write(&mut store, 0, &buf).unwrap();
         let instance = Instance::new(&mut store, &module, &[memory.into()]).expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
-        run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs") as u64
+        run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs") as u64
     }
 
     #[test]
@@ -3914,9 +4443,9 @@ mod tests {
         let instance =
             Instance::new(&mut store, &module, &[h0.into(), memory.into()]).expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
-        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs") as u64, 1007);
+        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs") as u64, 1007);
     }
 
     // Boxed loop with a `CallHelper2` compare condition — the exact shape the new
@@ -3969,10 +4498,10 @@ mod tests {
         )
         .expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
         // i: 0 → loops while i<5 → 5.
-        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs") as u64, 5);
+        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs") as u64, 5);
     }
 
     // `lookupswitch`: a computed multi-way branch lowered to a nested-block
@@ -4016,12 +4545,12 @@ mod tests {
 
         let instance = Instance::new(&mut store, &module, &imports).expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
 
         for (selector, expected) in [(0u64, 100u32), (1, 200), (5, 999), (99, 999)] {
             memory.write(&mut store, 0, &selector.to_le_bytes()).unwrap();
-            let got = run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs") as u32;
+            let got = run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs") as u32;
             assert_eq!(got, expected, "selector {selector} → {expected}");
         }
     }
@@ -4071,10 +4600,10 @@ mod tests {
                 Instance::new(&mut store, &module, &[t0.into(), t1.into(), memory.into()])
                     .expect("instantiates");
             let run = instance
-                .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+                .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
                 .expect("run export");
             assert_eq!(
-                run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs") as u64,
+                run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs") as u64,
                 want,
                 "a={a:#018x} b={b:#018x}"
             );
@@ -4124,9 +4653,9 @@ mod tests {
             )
             .expect("instantiates");
             let run = instance
-                .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+                .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
                 .expect("run export");
-            assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).unwrap() as u64, want, "a={a:#018x} b={b:#018x}");
+            assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).unwrap() as u64, want, "a={a:#018x} b={b:#018x}");
         }
     }
 
@@ -4181,9 +4710,9 @@ mod tests {
             externs.push(memory.into());
             let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
             let run = instance
-                .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+                .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
                 .expect("run export");
-            assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).unwrap() as u64, want, "a={a:#018x} b={b:#018x}");
+            assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).unwrap() as u64, want, "a={a:#018x} b={b:#018x}");
         }
     }
 
@@ -4235,9 +4764,9 @@ mod tests {
             externs.push(memory.into());
             let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
             let run = instance
-                .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+                .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
                 .expect("run export");
-            assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).unwrap() as u64, want, "a={a:#018x} b={b:#018x}");
+            assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).unwrap() as u64, want, "a={a:#018x} b={b:#018x}");
         }
     }
 
@@ -4309,10 +4838,10 @@ mod tests {
                 externs.push(memory.into());
                 let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
                 let run = instance
-                    .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+                    .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
                     .expect("run export");
                 assert_eq!(
-                    run.call(&mut store, (0, 0, 0, 0, 0)).unwrap() as u64,
+                    run.call(&mut store, (0, 0, 0, 0, 0, 0)).unwrap() as u64,
                     want,
                     "signed={signed} a={a:#018x}"
                 );
@@ -4397,12 +4926,12 @@ mod tests {
         externs.push(dm.into());
         let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
         // run(state_ptr=0, dm_base=DESC@32): fast path — store+load at
         // memory1[base=64 + addr=8], no fallback calls.
         assert_eq!(
-            run.call(&mut store, (0, 32, 0, 0, 0)).expect("runs") as u64,
+            run.call(&mut store, (0, 32, 0, 0, 0, 0)).expect("runs") as u64,
             box_int(0x12345678)
         );
         assert_eq!(dm.data(&store)[72..76], 0x12345678u32.to_le_bytes());
@@ -4413,7 +4942,7 @@ mod tests {
         // addr and its sentinel is the result.
         dm.write(&mut store, 36, &8u32.to_le_bytes()).unwrap();
         assert_eq!(
-            run.call(&mut store, (0, 32, 0, 0, 0)).expect("runs"),
+            run.call(&mut store, (0, 32, 0, 0, 0, 0)).expect("runs"),
             LOAD_SENTINEL
         );
         assert_eq!(
@@ -4424,7 +4953,7 @@ mod tests {
 
         // desc == 0 (domainMemory unavailable) → fallback too.
         assert_eq!(
-            run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs"),
+            run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs"),
             LOAD_SENTINEL
         );
         assert_eq!(store.data().0.len(), 2);
@@ -4480,9 +5009,9 @@ mod tests {
             let instance =
                 Instance::new(&mut store, &module, &externs).expect("instantiates");
             let run = instance
-                .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+                .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
                 .expect("run export");
-            let got = run.call(&mut store, (0, 32, 0, 0, 0)).expect("runs") as u64;
+            let got = run.call(&mut store, (0, 32, 0, 0, 0, 0)).expect("runs") as u64;
             let at = 64 + addr as usize; // base=64 + addr
             let mem = dm.data(&store)[at..at + width as usize].to_vec();
             (got, mem)
@@ -4623,9 +5152,9 @@ mod tests {
         externs.push(dm.into());
         let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
-        let got = run.call(&mut store, (0, 32, 0, 0, 0)).expect("runs") as u64;
+        let got = run.call(&mut store, (0, 32, 0, 0, 0, 0)).expect("runs") as u64;
         // 3.0 * 3.0 = 9.0, boxed as a canonical `Number` (its bits ARE the f64).
         assert_eq!(got, 9.0f64.to_bits());
     }
@@ -4653,11 +5182,11 @@ mod tests {
         externs.push(memory.into());
         let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
         for (v, expect) in [(0u64, VALUE_BOOL_MARK), (7, VALUE_BOOL_MARK | 1)] {
             memory.write(&mut store, 0, &v.to_le_bytes()).unwrap();
-            assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).unwrap() as u64, expect, "coerceb {v}");
+            assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).unwrap() as u64, expect, "coerceb {v}");
         }
     }
 
@@ -4698,9 +5227,9 @@ mod tests {
             )
             .expect("instantiates");
             let run = instance
-                .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+                .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
                 .expect("run export");
-            run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs") as u64
+            run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs") as u64
         };
 
         assert_eq!(go(0), 84); // no error → the coerced value flows through
@@ -4759,9 +5288,9 @@ mod tests {
             )
             .expect("instantiates");
             let run = instance
-                .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+                .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
                 .expect("run export");
-            run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs") as u64
+            run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs") as u64
         };
 
         assert_eq!(go(0), 310); // no error → the call result flows through
@@ -4816,9 +5345,9 @@ mod tests {
             )
             .expect("instantiates");
             let run = instance
-                .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+                .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
                 .expect("run export");
-            run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs") as u64
+            run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs") as u64
         };
 
         assert_eq!(go(0), 308); // no error → the call result flows through
@@ -4856,9 +5385,9 @@ mod tests {
         let instance = Instance::new(&mut store, &module, &[gpf.into(), perr.into(), memory.into()])
             .expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
-        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).unwrap() as u64, 100 * 1000 + 7 * 10 + 5);
+        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).unwrap() as u64, 100 * 1000 + 7 * 10 + 5);
     }
 
     // `getscriptglobals`: pushes the `k`-th script's global (pre-resolved bits) by
@@ -4887,9 +5416,9 @@ mod tests {
         externs.push(memory.into());
         let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
-        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).unwrap() as u64, 3 + 0xF00);
+        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).unwrap() as u64, 3 + 0xF00);
     }
 
     // Exception dispatch: `throw` inside a handler range routes through `dispatch_exc`
@@ -4930,9 +5459,9 @@ mod tests {
         externs.push(memory.into());
         let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
-        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).unwrap() as u64, caught_marker);
+        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).unwrap() as u64, caught_marker);
     }
 
     // Call-in-try dispatch: a `callmethod` inside a handler range. On no throw
@@ -4983,9 +5512,9 @@ mod tests {
             externs.push(memory.into());
             let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
             let run = instance
-                .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+                .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
                 .expect("run export");
-            run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs") as u64
+            run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs") as u64
         };
         assert_eq!(go(0), call_result, "no throw: call result flows to the normal return");
         assert_eq!(go(1), caught_marker, "throw: dispatched to the catch block");
@@ -5025,11 +5554,11 @@ mod tests {
         externs.push(memory.into());
         let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
         for (cond, expected) in [(1u64, a), (0, b), (7, a)] {
             memory.write(&mut store, 0, &cond.to_le_bytes()).unwrap();
-            assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).unwrap() as u64, expected, "cond={cond}");
+            assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).unwrap() as u64, expected, "cond={cond}");
         }
     }
 
@@ -5063,9 +5592,9 @@ mod tests {
         externs.push(memory.into());
         let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
-        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).unwrap() as u64, 0xE770);
+        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).unwrap() as u64, 0xE770);
         assert_eq!(THROWN.with(|c| c.get()) as u64, 0x1234, "thrown value reached the helper");
     }
 
@@ -5096,9 +5625,9 @@ mod tests {
         externs.push(memory.into());
         let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
-        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).unwrap() as u64, 2 | 0xABC0);
+        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).unwrap() as u64, 2 | 0xABC0);
     }
 
     // Boxed in-place int local inc/dec: `local0 = 5; ++;++;-- → 6`. The non-int
@@ -5130,9 +5659,9 @@ mod tests {
         externs.push(memory.into());
         let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
-        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).unwrap() as u64, VALUE_INT_MARK | 6);
+        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).unwrap() as u64, VALUE_INT_MARK | 6);
     }
 
     // Boxed primitive constant push: `PushConst(bits)` puts exactly `bits` on the
@@ -5197,9 +5726,9 @@ mod tests {
             )
             .expect("instantiates");
             let run = instance
-                .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+                .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
                 .expect("run export");
-            run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs") as u64
+            run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs") as u64
         };
 
         assert_eq!(go(0), SENTINEL); // constructsuper consumed only receiver+arg → sentinel returned
@@ -5269,9 +5798,9 @@ mod tests {
             externs.push(memory.into());
             let instance = Instance::new(&mut store, &module, &externs).expect("instantiates");
             let run = instance
-                .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+                .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
                 .expect("run export");
-            run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs") as u64
+            run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs") as u64
         };
 
         // a=10, b=3: (10-3)*10 + 1 = 71.
@@ -5341,10 +5870,10 @@ mod tests {
         )
         .expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
         // 5 → (loop) → 0 → increment → 1.
-        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs") as u64, 1);
+        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs") as u64, 1);
     }
 
     #[test]
@@ -5400,9 +5929,9 @@ mod tests {
         )
         .expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
-        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs") as u64, UNDEFINED_BITS);
+        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs") as u64, UNDEFINED_BITS);
         let calls = &store.data().1;
         assert_eq!(
             calls,
@@ -5465,9 +5994,9 @@ mod tests {
         )
         .expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
-        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs"), 0x4242);
+        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs"), 0x4242);
         let int7 = (VALUE_INT_MARK | 7) as i64;
         let int9 = (VALUE_INT_MARK | 9) as i64;
         let calls = &store.data().1;
@@ -5535,15 +6064,269 @@ mod tests {
         )
         .expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("run export");
         // The returned value is the object receiver's slot 2, read INLINE.
-        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0)).expect("runs"), 0xABCD);
+        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs"), 0xABCD);
         assert_eq!(
             store.data().as_slice(),
             &[(int_bits as i64, 3)],
             "only the non-object receiver may reach the gs fallback"
         );
+    }
+
+    #[test]
+    fn call_direct_guard_hit_writes_frame_and_call_indirects() {
+        // Isolated test of the JIT→JIT direct-call codegen (argc=0). Hand-build a
+        // module whose `run` inlines `emit_call_direct`; a mock callee sits in the
+        // funcref table (reached by `call_indirect`) and returns the receiver bits it
+        // reads back out of the frame we wrote. Drives hit / vtable-miss / sentinel.
+        use wasm_encoder::{
+            CodeSection, ConstExpr as CE, ElementSection, Elements, EntityType, ExportKind,
+            ExportSection, Function as EncFn, FunctionSection, ImportSection, Instruction as Ins,
+            MemoryType as EncMem, Module as EncModule, RefType as ERef, TableSection,
+            TableType as ETable, TypeSection, ValType as VT,
+        };
+        use wasmi::{
+            Caller, Config, Engine, Func, Instance, Memory, MemoryType as WMemoryType, Module, Store,
+        };
+
+        const VTABLE_OFF: u32 = 16;
+        const CELL: u32 = 256;
+        const STRIDE_T: u32 = 64;
+        const STATE_PTR_V: i32 = 0; // caller frame base → callee at +STRIDE_T = 64
+        const DISP: u32 = 5;
+        const CM_RET: i64 = 0xDEAD;
+
+        // Types: 0=callee run(6×i32)->i64, 1=caller run(i64,i32,i32,i32,i32)->i64,
+        //        2=cm(i64,i64,i64)->i64, 3=pca(i64)->().
+        let mut types = TypeSection::new();
+        types.ty().function([VT::I32; 6], [VT::I64]); // 0: standalone run
+        types.ty().function([VT::I64, VT::I32, VT::I32, VT::I32, VT::I32], [VT::I64]); // 1: caller
+        types.ty().function([VT::I64, VT::I64, VT::I64, VT::I32], [VT::I64]); // 2: cmi(recv,disp,argc,cell_addr)
+        types.ty().function([VT::I64], []); // 3: pca
+        types.ty().function([VT::I32; 7], [VT::I64]); // 4: dispatcher (validates the dead member branch)
+        let mut imports = ImportSection::new();
+        imports.import("env", "cm", EntityType::Function(2)); // func 0
+        imports.import("env", "pca", EntityType::Function(3)); // func 1
+        let mem = || EncMem { minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None };
+        imports.import("env", "mem0", EntityType::Memory(mem())); // memory 0 (frame)
+        imports.import("env", "mem1", EntityType::Memory(mem())); // memory 1 (heap)
+        let mut functions = FunctionSection::new();
+        functions.function(0); // callee = func 2
+        functions.function(1); // caller = func 3
+        // Table 0: one funcref slot holding the callee (table index 0).
+        let mut tables = TableSection::new();
+        tables.table(ETable { element_type: ERef::FUNCREF, table64: false, minimum: 1, maximum: Some(1), shared: false });
+        let mut exports = ExportSection::new();
+        exports.export("run", ExportKind::Func, 3);
+        let mut elements = ElementSection::new();
+        elements.active(Some(0), &CE::i32_const(0), Elements::Functions([2u32][..].into()));
+        // Callee: `return i64.load(memory0, state_ptr + 0)` — the receiver we wrote.
+        let mut callee = EncFn::new([]);
+        callee.instruction(&Ins::LocalGet(0)); // state_ptr
+        callee.instruction(&Ins::I64Load(MemArg { offset: 0, align: 3, memory_index: 0 }));
+        callee.instruction(&Ins::End);
+        // Caller: params recv(0), state_ptr(1), cell_base(2), dm_base(3), dm_len(4);
+        // scratch locals 5,6 (i32), 7 (i64).
+        let mut caller = EncFn::new([(2, VT::I32), (1, VT::I64)]);
+        caller.instruction(&Ins::LocalGet(0)); // receiver on stack
+        emit_call_direct(
+            &mut caller, /*argc*/ 0, DISP, VTABLE_OFF, /*cell_base_local*/ 2, /*cell_offset*/ 0,
+            /*state_ptr_local*/ 1, /*dm_base*/ 3, /*dm_len*/ 4, /*run_type*/ 0,
+            /*dispatch_type*/ 4, /*cmi*/ 0, /*pca*/ 1, /*sp*/ 5, /*ptr*/ 6, /*bits*/ 7, STRIDE_T,
+            /*push*/ true,
+        );
+        caller.instruction(&Ins::End);
+        let mut code = CodeSection::new();
+        code.function(&callee);
+        code.function(&caller);
+        let mut m = EncModule::new();
+        m.section(&types);
+        m.section(&imports);
+        m.section(&functions);
+        m.section(&tables);
+        m.section(&exports);
+        m.section(&elements);
+        m.section(&code);
+        let bytes = m.finish();
+
+        let mut config = Config::default();
+        config.wasm_multi_memory(true);
+        let engine = Engine::new(&config);
+        let module = Module::new(&engine, &bytes).expect("valid wasm");
+        let mut store = Store::new(&engine, Vec::<(i64, i64, i64)>::new());
+        let mem0 = Memory::new(&mut store, WMemoryType::new(1, None).unwrap()).unwrap();
+        let mem1 = Memory::new(&mut store, WMemoryType::new(1, None).unwrap()).unwrap();
+        let cm = Func::wrap(&mut store, |mut c: Caller<'_, Vec<(i64, i64, i64)>>, r: i64, d: i64, a: i64, _cell: i32| -> i64 {
+            c.data_mut().push((r, d, a));
+            CM_RET
+        });
+        let pca = Func::wrap(&mut store, |_: Caller<'_, Vec<(i64, i64, i64)>>, _v: i64| {});
+        let instance = Instance::new(&mut store, &module, &[cm.into(), pca.into(), mem0.into(), mem1.into()]).expect("instantiates");
+        let run = instance.get_typed_func::<(i64, i32, i32, i32, i32), i64>(&store, "run").expect("run");
+
+        // Object @64 in memory 1: vtable@80 = 0xAAAA.
+        mem1.write(&mut store, 64 + VTABLE_OFF as usize, &0xAAAAu32.to_le_bytes()).unwrap();
+        let obj = ((VALUE_OBJECT_TAG16 as u64) << 48 | 64) as i64;
+
+        // 1) HIT (standalone): cell = {vtable:0xAAAA, run_index:0 (table slot),
+        // ic_base:0, member_idx:NO_MEMBER}.
+        mem1.write(&mut store, CELL as usize, &0xAAAAu32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 4, &0u32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 8, &0u32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 12, &CALL_NO_MEMBER.to_le_bytes()).unwrap();
+        let got = run.call(&mut store, (obj, STATE_PTR_V, CELL as i32, 0, 0)).unwrap();
+        assert_eq!(got, obj, "hit: call_indirect ran the callee, which read the receiver from the frame we wrote");
+        assert!(store.data().is_empty(), "hit must NOT call cm");
+        // The receiver was written into the callee frame slot 0 at state_ptr+STRIDE.
+        let mut buf = [0u8; 8];
+        mem0.read(&store, STATE_PTR_V as usize + STRIDE_T as usize, &mut buf).unwrap();
+        assert_eq!(i64::from_le_bytes(buf), obj, "receiver written to callee frame slot 0");
+
+        // 2) MISS (vtable mismatch) → cm(receiver, disp, argc=0).
+        mem1.write(&mut store, CELL as usize, &0xBBBBu32.to_le_bytes()).unwrap();
+        assert_eq!(run.call(&mut store, (obj, STATE_PTR_V, CELL as i32, 0, 0)).unwrap(), CM_RET);
+        assert_eq!(store.data().as_slice(), &[(obj, DISP as i64, 0)]);
+
+        // 3) SENTINEL (vtable matches but run_index == CALL_SENTINEL) → cm.
+        store.data_mut().clear();
+        mem1.write(&mut store, CELL as usize, &0xAAAAu32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 4, &CALL_SENTINEL.to_le_bytes()).unwrap();
+        assert_eq!(run.call(&mut store, (obj, STATE_PTR_V, CELL as i32, 0, 0)).unwrap(), CM_RET);
+        assert_eq!(store.data().as_slice(), &[(obj, DISP as i64, 0)]);
+    }
+
+    #[test]
+    fn directable_only_for_pure_numeric_dm_leaves() {
+        // Pure numeric leaf: `local1 + local2; return` → directable.
+        let pure = [JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::AddI, JitOp::ReturnValue];
+        assert!(manifest(&pure).directable(false), "pure numeric leaf is a direct-call target");
+
+        // Inline domainMemory leaf (li8): NOT directable in v1 — the inline path
+        // keeps a `dm_load8` helper fallback that reads `activation()` (domain +
+        // `coerce_to_i32`, which can re-enter via `valueOf`). Widening to dm needs
+        // that helper proven activation-independent + non-re-entrant first.
+        let dm = [JitOp::GetLocal(1), JitOp::DmLoad(1), JitOp::ReturnValue];
+        assert!(!manifest(&dm).directable(true), "dm leaf keeps an activation-reading fallback helper");
+
+        // A call → NOT directable (would re-enter Rust with the stale DEPTH).
+        let calls = [JitOp::GetLocalValue(0), JitOp::CallMethod(1, 0, true), JitOp::ReturnValueBoxed];
+        assert!(!manifest(&calls).directable(true), "a call is not directable");
+
+        // A property read (helper / IC) → NOT directable (object model may re-enter).
+        let prop = [JitOp::GetLocalValue(0), JitOp::GetProperty(0), JitOp::ReturnValueBoxed];
+        assert!(!manifest(&prop).directable(true), "getproperty is not directable");
+
+        // A getslot leaf: directable IFF all getslots are null-safe (then the
+        // activation-reading slow path is dead; the fast path is activation-free).
+        let slot = [JitOp::GetLocalValue(0), JitOp::GetSlot(0, false), JitOp::ReturnValueBoxed];
+        assert!(manifest(&slot).directable(true), "null-safe getslot leaf IS directable");
+        assert!(!manifest(&slot).directable(false), "a non-null-safe getslot may hit the throwing slow path");
+    }
+
+    #[test]
+    fn getprop_ic_guard_hit_miss() {
+        // Exercises the property-IC codegen in ISOLATION (before it is wired into
+        // the manifest/runner machinery): hand-build a tiny module whose `run`
+        // inlines `emit_getprop_ic`, drive it under wasmi with a mock `gpi` + a
+        // mock object/cell in memory 1, and check all three arms.
+        use wasm_encoder::{
+            CodeSection, EntityType, ExportKind, ExportSection, Function as EncFn,
+            FunctionSection, ImportSection, Instruction as Ins, MemoryType as EncMem,
+            Module as EncModule, TypeSection, ValType as VT,
+        };
+        use wasmi::{
+            Caller, Config, Engine, Func, Instance, Memory, MemoryType as WMemoryType, Module,
+            Store,
+        };
+
+        // Mock layout (arbitrary, 4-byte aligned). Object @64, slots @128, cell @256.
+        const VTABLE_OFF: u32 = 16;
+        const SLOTS_PTR_OFF: u32 = 8;
+        const CELL: u32 = 256;
+        const K: u64 = 5;
+        const SITE: u32 = 0;
+        const GPI_RET: i64 = 0x9999;
+
+        // run(recv: i64, ic_base: i32) -> i64 { <IC guard> }. gpi = func 0, run = func 1.
+        let mut types = TypeSection::new();
+        types.ty().function([VT::I64, VT::I64, VT::I32], [VT::I64]); // 0: gpi
+        types.ty().function([VT::I64, VT::I32], [VT::I64]); // 1: run
+        let mut imports = ImportSection::new();
+        imports.import("env", "gpi", EntityType::Function(0));
+        let mem = || EncMem {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        };
+        imports.import("env", "mem0", EntityType::Memory(mem()));
+        imports.import("env", "mem1", EntityType::Memory(mem()));
+        let mut functions = FunctionSection::new();
+        functions.function(1);
+        let mut exports = ExportSection::new();
+        exports.export("run", ExportKind::Func, 1);
+        // Params: 0 = recv (i64), 1 = ic_base (i32). Locals: 2 = i32 scratch, 3 = i64 scratch.
+        let mut body = EncFn::new([(1, VT::I32), (1, VT::I64)]);
+        body.instruction(&Ins::LocalGet(0));
+        emit_getprop_ic(&mut body, SLOTS_PTR_OFF, VTABLE_OFF, /*ic_base_local*/ 1, K, SITE, 0, 2, 3);
+        body.instruction(&Ins::End);
+        let mut code = CodeSection::new();
+        code.function(&body);
+        let mut m = EncModule::new();
+        m.section(&types);
+        m.section(&imports);
+        m.section(&functions);
+        m.section(&exports);
+        m.section(&code);
+        let bytes = m.finish();
+
+        let mut config = Config::default();
+        config.wasm_multi_memory(true);
+        let engine = Engine::new(&config);
+        let module = Module::new(&engine, &bytes).expect("valid wasm");
+        // Store data records the (recv, k, site) triples the `gpi` mock received.
+        let mut store = Store::new(&engine, Vec::<(i64, i64, i32)>::new());
+        let mem0 = Memory::new(&mut store, WMemoryType::new(1, None).unwrap()).unwrap();
+        let mem1 = Memory::new(&mut store, WMemoryType::new(1, None).unwrap()).unwrap();
+        let gpi = Func::wrap(
+            &mut store,
+            |mut c: Caller<'_, Vec<(i64, i64, i32)>>, recv: i64, k: i64, site: i32| -> i64 {
+                c.data_mut().push((recv, k, site));
+                GPI_RET
+            },
+        );
+        let instance = Instance::new(&mut store, &module, &[gpi.into(), mem0.into(), mem1.into()])
+            .expect("instantiates");
+        let run = instance
+            .get_typed_func::<(i64, i32), i64>(&store, "run")
+            .expect("run export");
+
+        // Mock object @64: vtable@80 = 0xAAAA, slots_ptr@72 = 128; slots@128: slot[2]@144 = 0xDEAD.
+        mem1.write(&mut store, 64 + VTABLE_OFF as usize, &0xAAAAu32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, 64 + SLOTS_PTR_OFF as usize, &128u32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, 128 + 2 * 8, &0xDEADu64.to_le_bytes()).unwrap();
+        let obj = ((VALUE_OBJECT_TAG16 as u64) << 48 | 64) as i64;
+
+        // 1) HIT: cell.class == obj.vtable, cell.slot_id = 2 → inline load; gpi untouched.
+        mem1.write(&mut store, CELL as usize, &0xAAAAu32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 4, &2u32.to_le_bytes()).unwrap();
+        assert_eq!(run.call(&mut store, (obj, CELL as i32)).unwrap(), 0xDEAD, "guard hit loads the cached slot inline");
+        assert!(store.data().is_empty(), "a guard hit must NOT call gpi");
+
+        // 2) MISS (class mismatch): cell.class != obj.vtable → gpi with the cell
+        // address (`ic_base + site*8` = CELL, since site 0).
+        mem1.write(&mut store, CELL as usize, &0xBBBBu32.to_le_bytes()).unwrap();
+        assert_eq!(run.call(&mut store, (obj, CELL as i32)).unwrap(), GPI_RET, "class miss routes to gpi");
+        assert_eq!(store.data().as_slice(), &[(obj, K as i64, CELL as i32)]);
+
+        // 3) Non-object receiver (int-boxed) → gpi (guard never loads an object).
+        store.data_mut().clear();
+        let int = (VALUE_INT_MARK | 7) as i64;
+        assert_eq!(run.call(&mut store, (int, CELL as i32)).unwrap(), GPI_RET, "non-object routes to gpi");
+        assert_eq!(store.data().as_slice(), &[(int, K as i64, CELL as i32)]);
     }
 
     #[test]
@@ -5581,13 +6364,13 @@ mod tests {
         let instance = Instance::new(&mut store, &module, &[h0.into(), memory.into()])
             .expect("instantiates");
         let run = instance
-            .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&store, "run")
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32, i32), i64>(&store, "run")
             .expect("dispatcher export");
         // Method 0: 3 + 4 → int-boxed 7.
-        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0)).expect("runs") as u64, int_bits(7));
+        assert_eq!(run.call(&mut store, (0, 0, 0, 0, 0, 0, 0)).expect("runs") as u64, int_bits(7));
         // Method 1: h0(local1 bits) = bits ^ 0xFF.
         assert_eq!(
-            run.call(&mut store, (1, 0, 0, 0, 0, 0)).expect("runs") as u64,
+            run.call(&mut store, (1, 0, 0, 0, 0, 0, 0)).expect("runs") as u64,
             int_bits(3) ^ 0xFF
         );
     }

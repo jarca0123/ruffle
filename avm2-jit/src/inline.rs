@@ -27,8 +27,13 @@
 
 use crate::lower::JitOp;
 
-/// Max callee op count to inline (keeps the frame + code size bounded).
-pub(crate) const MAX_INLINE_OPS: usize = 24;
+/// Max callee op count to inline (keeps the frame + code size bounded). Raised
+/// from 24: many real leaf accessors/computations (this-calls on final classes,
+/// super ctors) run 25–40 ops, and each inline removes a full `Activation` build
+/// (`function::exec` was ~7% of a Starling profile). The frame-slot gate
+/// (`base + callee_locals <= MAX_FRAME_SLOTS`) still bounds locals; the only extra
+/// cost above the threshold is caller code size. MEASURE before pushing higher.
+pub(crate) const MAX_INLINE_OPS: usize = 40;
 
 /// How the caller consumes the inlined callee's result.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -222,6 +227,11 @@ fn remap_op(op: JitOp, local_base: u32, mn_base: u32, target_base: usize) -> Jit
         JitOp::SetLocalDouble(i) => JitOp::SetLocalDouble(i + local_base),
         JitOp::StoreLocalDouble(i) => JitOp::StoreLocalDouble(i + local_base),
         JitOp::GetProperty(k) => JitOp::GetProperty(k + mn_base),
+        // The callee's multiname `k` is remapped into the combined list; the IC
+        // `site` is left as-is here and re-assigned globally by `renumber_ic_sites`
+        // AFTER all splices (callee sites would otherwise collide with the
+        // caller's), so the per-site cache cells stay one-to-one.
+        JitOp::GetPropertyIc(k, site) => JitOp::GetPropertyIc(k + mn_base, site),
         JitOp::GetPropertyFast(k, num) => JitOp::GetPropertyFast(k + mn_base, num),
         JitOp::Jump(t) => JitOp::Jump(target_base + t),
         JitOp::IfTrue(t) => JitOp::IfTrue(target_base + t),
@@ -361,6 +371,30 @@ mod tests {
                 JitOp::GetLocalValue(5), // callee getlocal0 remapped
                 JitOp::GetProperty(7),   // callee getproperty(0) → mn_base+0 = 7
                 JitOp::ReturnValueBoxed, // caller's own return (value kept on stack)
+            ]
+        );
+    }
+
+    #[test]
+    fn splice_remaps_callee_ic_multiname_keeps_site() {
+        // A callee whose property read is behind the inline cache (wasm32 shape):
+        // `getlocal0; getpropertyic(k=0, site=0); returnvalue`. The `k` must be
+        // remapped by `mn_base` like `GetProperty`; the `site` is left for the
+        // global `renumber_ic_sites` pass (so it can't collide with caller sites).
+        let caller = [JitOp::CallMethod(0, 0, true), JitOp::ReturnValueBoxed];
+        let callee = [
+            JitOp::GetLocalValue(0),
+            JitOp::GetPropertyIc(0, 0),
+            JitOp::ReturnValueBoxed,
+        ];
+        let out = splice(&caller, 0, &callee, 5, 7, 0, ResultMode::Push).expect("inlinable");
+        assert_eq!(
+            out,
+            vec![
+                JitOp::SetLocalValue(5),
+                JitOp::GetLocalValue(5),
+                JitOp::GetPropertyIc(7, 0), // k → mn_base+0 = 7; site unchanged here
+                JitOp::ReturnValueBoxed,
             ]
         );
     }

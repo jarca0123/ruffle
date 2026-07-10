@@ -4,6 +4,7 @@ members = [
     "core/macros",
     "core/build_playerglobal",
     "avm2-jit",
+    "avm2-jit2",
     "desktop",
     "swf",
     "flv",

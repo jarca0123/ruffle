@@ -97,7 +97,7 @@ pub use crate::avm2::function::FunctionArgs;
 pub use crate::avm2::globals::flash::ui::context_menu::make_context_menu_state;
 pub use crate::avm2::multiname::Multiname;
 pub use crate::avm2::namespace::{CommonNamespaces, Namespace};
-pub use crate::avm2::object::jit_slots_layout;
+pub use crate::avm2::object::{jit_slots_layout, jit_vtable_offset};
 pub use crate::avm2::object::{
     ArrayObject, BitmapDataObject, ClassObject, EventObject, FunctionObject, LoaderInfoObject,
     NamespaceObject, Object, ScriptObject, SharedObjectObject, SoundChannelObject, Stage3DObject,

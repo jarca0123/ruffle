@@ -1,0 +1,53 @@
+[package]
+name = "ruffle_avm2_jit2"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+# Greenfield AVM2 -> WebAssembly JIT (see AVM2_JIT_DESIGN.md). This is the
+# clean rebuild that follows the design brief's typed-SSA / WASM-locals model;
+# the older `ruffle_avm2_jit` crate is kept only as a reference for the mistakes
+# the brief distils into LESSONs (boxed memory frame + stack-mirror IR).
+[dependencies]
+ruffle_core = { path = "../core" }
+# The GC `Mutation` type the slot-write helper needs (write barrier).
+gc-arena = { workspace = true }
+# Runtime WASM module emission: we build a `WebAssembly.Module` at run time and
+# let the host engine (browser on web; wasmtime/cranelift natively) compile it.
+wasm-encoder = "0.221"
+tracing = { workspace = true }
+# Pointer-keyed method cache (compiled-method lookup on the hot path); FNV beats
+# the DoS-resistant SipHash default on the small integer/pointer keys we use.
+fnv = { workspace = true }
+
+# Native execution of the emitted module — the differential harness and the
+# desktop path run the emitted bytes through wasmtime (cranelift -> native code),
+# the same emitted-module pipeline the browser drives on the web.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wasmtime = { version = "46", default-features = false, features = ["cranelift", "runtime"] }
+
+# Web execution: hand the emitted bytes to the browser's own WASM engine via the
+# `WebAssembly` JS API (js-sys), with helper imports bound as Ruffle's own wasm
+# funcrefs and `run` called across the JS boundary (i64 as BigInt).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+
+# Not used directly — declared only to enable getrandom's `wasm_js` feature on
+# WASM (a transitive `ruffle_core` dependency needs it to build for wasm32).
+[target.'cfg(target_family = "wasm")'.dependencies.getrandom]
+version = "0.3"
+features = ["wasm_js"]
+
+[dev-dependencies]
+# End-to-end differential test: hand-assemble an AVM2 method into a SWF, run it
+# through a real headless Player, and check the JIT against the interpreter.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+swf = { path = "../swf" }
+tracing-subscriber = { workspace = true }

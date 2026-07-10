@@ -29,7 +29,7 @@
 struct PooledRun {
     store: wasmtime::Store<()>,
     memory: wasmtime::Memory,
-    run: wasmtime::TypedFunc<(i32, i32, i32, i32, i32), i64>,
+    run: wasmtime::TypedFunc<(i32, i32, i32, i32, i32, i32), i64>,
 }
 
 // The wasmtime state lives in `ManuallyDrop`: a thread's TLS destructors must
@@ -68,7 +68,7 @@ thread_local! {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn run(bytes: &[u8], regs: &[u64], m: &crate::lower::Manifest) -> Option<u64> {
+pub fn run(bytes: &[u8], regs: &[u64], m: &crate::lower::Manifest, ic_base: u32) -> Option<u64> {
     let key = bytes.as_ptr() as usize;
     let pooled = NATIVE_INSTANCES.with(|p| p.borrow_mut().get_mut(&key).and_then(Vec::pop));
     let mut pr = match pooled {
@@ -92,11 +92,12 @@ pub fn run(bytes: &[u8], regs: &[u64], m: &crate::lower::Manifest) -> Option<u64
     }[..];
     pr.memory.write(&mut pr.store, 0, buf).ok()?;
 
-    // `run(state_ptr, dm_base, dm_len, regs_ptr, regs_len)`. Native production
-    // modules use the helper path for domainMemory (never `has_dm`) and the frame
-    // was written into the instance memory above (no register-copy prologue on
-    // native), so everything but `state_ptr` is unused → 0.
-    let result = pr.run.call(&mut pr.store, (0, 0, 0, 0, 0)).ok();
+    // `run(state_ptr, dm_base, dm_len, regs_ptr, regs_len, ic_base)`. Native
+    // production modules use the helper path for domainMemory (never `has_dm`)
+    // and the frame was written into the instance memory above (no register-copy
+    // prologue on native); the inline property-IC is web-only (native declines to
+    // the `gp` helper), so `ic_base` is unused too — everything but `state_ptr` → 0.
+    let result = pr.run.call(&mut pr.store, (0, 0, 0, 0, 0, ic_base as i32)).ok();
     // Return the instance to the pool even on a trap — a trap doesn't poison
     // the store, and the next call rewrites the frame anyway.
     NATIVE_INSTANCES.with(|p| p.borrow_mut().entry(key).or_default().push(pr));
@@ -148,6 +149,15 @@ fn build_instance(bytes: &[u8], m: &crate::lower::Manifest) -> Option<PooledRun>
             .into(),
         );
     }
+    // `gpi` follows `gs` — MUST match the import-section order in `emit_imports`.
+    if m.has_ic {
+        externs.push(
+            Func::wrap(&mut store, |recv: i64, k: i64, cell_addr: i32| -> i64 {
+                crate::helpers::get_property_ic(recv, k, cell_addr)
+            })
+            .into(),
+        );
+    }
     if m.has_getprop_fast {
         externs.push(
             Func::wrap(&mut store, |recv: i64, name: i64, k: i64| -> i64 {
@@ -182,6 +192,15 @@ fn build_instance(bytes: &[u8], m: &crate::lower::Manifest) -> Option<PooledRun>
         externs.push(
             Func::wrap(&mut store, |r: i64, id: i64, argc: i64| -> i64 {
                 crate::helpers::call_method(r, id, argc)
+            })
+            .into(),
+        );
+    }
+    // `cmi` follows `cm` — MUST match `emit_imports`' order.
+    if m.has_call_direct {
+        externs.push(
+            Func::wrap(&mut store, |r: i64, id: i64, argc: i64, cell: i32| -> i64 {
+                crate::helpers::call_method_ic(r, id, argc, cell)
             })
             .into(),
         );
@@ -241,7 +260,7 @@ fn build_instance(bytes: &[u8], m: &crate::lower::Manifest) -> Option<PooledRun>
     let instance = Instance::new(&mut store, &module, &externs).ok()?;
     // (The inline dm path + memory 1 is exercised by `lower::tests::lowers_dm_inline`.)
     let run = instance
-        .get_typed_func::<(i32, i32, i32, i32, i32), i64>(&mut store, "run")
+        .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&mut store, "run")
         .ok()?;
     Some(PooledRun { store, memory, run })
 }
@@ -289,7 +308,7 @@ mod web {
     /// Bytes per frame in the shared memory; a method's `num_locals` slots must fit
     /// (checked — else it declines). 512 slots ≫ any real `num_locals` (the operand
     /// stack lives on the WASM value stack, not here).
-    const STRIDE: usize = 4096;
+    const STRIDE: usize = crate::lower::FRAME_STRIDE as usize;
     /// Shared memory size in 64 KiB pages — fully committed, bounded. `MEM_BYTES /
     /// STRIDE` = max JIT nesting depth (1024) before a run declines.
     const PAGES: u32 = 64;
@@ -488,6 +507,13 @@ mod web {
         // inline `li*`/`si*` (when present) `i32.load`/`store` domainMemory at
         // `dm_base + addr`.
         Reflect::set(&env, &"dm".into(), &wasm_bindgen::memory()).ok()?;
+        // Shared `__indirect_function_table` (holding the reserved `run`/dispatcher
+        // slots) for the JIT→JIT direct-call `call_indirect` — imported only when the
+        // module makes direct calls.
+        if m.has_call_direct {
+            Reflect::set(&env, &"__indirect_function_table".into(), &wasm_bindgen::function_table())
+                .ok()?;
+        }
 
         // Bind every helper import to Ruffle's OWN wasm function — a funcref pulled
         // from the module's indirect function table — instead of a JS `Closure`
@@ -509,6 +535,9 @@ mod web {
         if m.has_getslot {
             bind_fn(&env, &table, "gs", crate::helpers::get_slot as fn(i64, i64) -> i64 as usize)?;
         }
+        if m.has_ic {
+            bind_fn(&env, &table, "gpi", crate::helpers::get_property_ic as fn(i64, i64, i32) -> i64 as usize)?;
+        }
         if m.has_getprop_fast {
             bind_fn(&env, &table, "gpf", crate::helpers::get_property_fast as fn(i64, i64, i64) -> i64 as usize)?;
         }
@@ -528,6 +557,9 @@ mod web {
         // `perr` (()->i32).
         if m.has_call {
             bind_fn(&env, &table, "cm", crate::helpers::call_method as fn(i64, i64, i64) -> i64 as usize)?;
+        }
+        if m.has_call_direct {
+            bind_fn(&env, &table, "cmi", crate::helpers::call_method_ic as fn(i64, i64, i64, i32) -> i64 as usize)?;
         }
         if m.has_callprop {
             bind_fn(&env, &table, "cp", crate::helpers::call_property as fn(i64, i64, i64) -> i64 as usize)?;
@@ -653,7 +685,12 @@ mod web {
         Some(())
     }
 
-    pub(super) fn run(bytes: &[u8], regs: &[u64], m: &crate::lower::Manifest) -> Option<u64> {
+    pub(super) fn run(
+        bytes: &[u8],
+        regs: &[u64],
+        m: &crate::lower::Manifest,
+        ic_base: u32,
+    ) -> Option<u64> {
         let frame_bytes = regs.len() * 8;
         let depth = DEPTH.with(|d| d.get());
         let state_ptr = depth * STRIDE;
@@ -675,9 +712,10 @@ mod web {
             (0, 0)
         };
 
-        type RunFn6 = unsafe extern "C" fn(i32, i32, i32, i32, i32, i32) -> i64;
+        // dispatch(method_idx, state_ptr, dm_base, dm_len, regs_ptr, regs_len, ic_base).
+        type RunFn7 = unsafe extern "C" fn(i32, i32, i32, i32, i32, i32, i32) -> i64;
         let call_dispatcher = |idx: usize, member: u32| -> u64 {
-            let run: RunFn6 = unsafe { core::mem::transmute::<usize, RunFn6>(idx) };
+            let run: RunFn7 = unsafe { core::mem::transmute::<usize, RunFn7>(idx) };
             DEPTH.with(|d| d.set(depth + 1));
             let r = unsafe {
                 run(
@@ -687,6 +725,13 @@ mod web {
                     dm_len as i32,
                     regs_ptr as i32,
                     regs_len as i32,
+                    // ic_base: the property-IC cache base of the method being
+                    // dispatched. Each dispatch call targets exactly ONE member
+                    // (`run` is called per method `key`), so the dispatcher just
+                    // forwards this single value to that member — no per-member
+                    // table needed (design B). `ic_base` is threaded in from
+                    // `lib.rs` (0 for methods without IC sites; nothing reads it then).
+                    ic_base as i32,
                 )
             } as u64;
             DEPTH.with(|d| d.set(depth));
@@ -725,6 +770,7 @@ mod web {
                         &JsValue::from(regs_ptr),
                     );
                     args.push(&JsValue::from(regs_len));
+                    args.push(&JsValue::from(ic_base)); // ic_base (see call_dispatcher)
                     let r = generation
                         .run
                         .apply(&JsValue::NULL, &args)
@@ -770,7 +816,7 @@ mod web {
             // a JIT trap aborts here (no catchable fallback) — acceptable, the JIT
             // shouldn't trap (bounds explicit, throws go out-of-band via `perr`).
             Some(idx) => {
-                type RunFn = unsafe extern "C" fn(i32, i32, i32, i32, i32) -> i64;
+                type RunFn = unsafe extern "C" fn(i32, i32, i32, i32, i32, i32) -> i64;
                 let run: RunFn = unsafe { core::mem::transmute::<usize, RunFn>(idx) };
                 Some(unsafe {
                     run(
@@ -779,6 +825,10 @@ mod web {
                         dm_len as i32,
                         regs_ptr as i32,
                         regs_len as i32,
+                        // ic_base: this method's property-IC cache buffer offset in
+                        // memory 1 (0 for methods without IC sites; nothing reads
+                        // IC_BASE then).
+                        ic_base as i32,
                     )
                 } as u64)
             }
@@ -794,6 +844,7 @@ mod web {
                     &JsValue::from(regs_ptr),
                     &JsValue::from(regs_len),
                 );
+                args.push(&JsValue::from(ic_base)); // ic_base (0 without IC sites)
                 inst.run
                     .apply(&JsValue::NULL, &args)
                     .ok()
@@ -805,11 +856,43 @@ mod web {
         DEPTH.with(|d| d.set(depth));
         result
     }
+
+    /// The direct-call target for a compiled method (by its `bytes` pointer): the
+    /// shared `__indirect_function_table` slot to `call_indirect`, plus a
+    /// `member_idx`. STANDALONE → its own `run` slot + [`CALL_NO_MEMBER`]; a
+    /// GENERATION member → its amalgam's DISPATCHER slot + the member's index (the
+    /// member's own `run` lives in the amalgam's internal table, but the dispatcher
+    /// forwards to it). `None` if uncompiled, or the (dispatcher/run) never got a
+    /// shared-table slot (JS-apply fallback → not directly callable).
+    pub(super) fn run_index_for(bytes_ptr: usize) -> Option<(u32, u32)> {
+        if let Some(idx) =
+            INSTANCES.with(|c| c.borrow().get(&bytes_ptr).and_then(|cached| cached.run_index))
+        {
+            return Some((idx as u32, crate::lower::CALL_NO_MEMBER));
+        }
+        GEN_ENTRIES.with(|g| {
+            g.borrow()
+                .get(&bytes_ptr)
+                .and_then(|(generation, member)| generation.run_index.map(|slot| (slot as u32, *member)))
+        })
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
-pub fn run(bytes: &[u8], regs: &[u64], m: &crate::lower::Manifest) -> Option<u64> {
-    web::run(bytes, regs, m)
+pub fn run(bytes: &[u8], regs: &[u64], m: &crate::lower::Manifest, ic_base: u32) -> Option<u64> {
+    web::run(bytes, regs, m, ic_base)
+}
+
+/// The direct-call table slot for a compiled method's `run` (web: its shared-table
+/// index; native: `None` — the in-wasm direct call is web-only). Keyed by the
+/// method's `bytes` pointer.
+#[cfg(target_arch = "wasm32")]
+pub fn run_index_for(bytes_ptr: usize) -> Option<(u32, u32)> {
+    web::run_index_for(bytes_ptr)
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run_index_for(_bytes_ptr: usize) -> Option<(u32, u32)> {
+    None
 }
 
 /// Installs a GENERATION (amalgam) module — see [`web::install_generation`].

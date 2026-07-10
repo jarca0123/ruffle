@@ -86,6 +86,25 @@ struct Compiled {
     /// The method's `num_locals`, cached so `try_run` skips the per-call
     /// `method.body()` deref chain (a `Gc` pointer walk on EVERY invocation).
     num_locals: u32,
+    /// This method's property-IC cache cells — one zeroed `u64` per
+    /// [`lower::JitOp::GetPropertyIc`] site (`{ class_word: u32, slot_id: u32 }`).
+    /// Held here so the buffer stays alive for the method's lifetime; behind an
+    /// `Rc` so a `Compiled` clone shares the SAME address (the emitted code holds
+    /// a raw offset into it). Empty for methods without IC sites.
+    ic_cells: Rc<[std::cell::Cell<u64>]>,
+    /// Memory-1 byte offset of `ic_cells` (the `ic_base` `run` param). 0 when the
+    /// method has no IC site (`!has_ic`) — then no emitted code reads it.
+    ic_base: u32,
+    /// Whether this compiled method is a safe JIT→JIT **direct-call target**
+    /// (`Manifest::directable`) — a caller's `emit_call_direct` may `call_indirect`
+    /// its `run` without building an `Activation`. Consulted by the call-cache refill.
+    directable: bool,
+    /// The method's declared parameter count. A direct call sets up the callee frame
+    /// itself (this + the call's args); it is only sound when the call provides
+    /// EXACTLY the params (`argc == param_count` → no defaults to fill) and the method
+    /// has no locals beyond them (`num_locals == param_count + 1` → no stale
+    /// uninitialized temporaries). The refill checks both before caching a target.
+    param_count: u32,
     /// The lowered inputs, kept for GENERATION rebuilds (see
     /// [`lower::compile_generation`]): batches of compiled methods are re-emitted
     /// into one shared "amalgam" module against their union import layout.
@@ -135,7 +154,12 @@ type CacheEntry = Option<Rc<Compiled>>;
 /// each **per method**, which exhausted the browser's page-granular
 /// executable-code arena ("failed to allocate executable memory for module") and
 /// the reserved entry-slot pool on method-heavy content (OpenTTD).
-const GEN_BATCH: usize = 128;
+// Smaller amalgams (was 128): a method becomes a JIT→JIT direct-call target only
+// once it is installed in an amalgam with a shared-table dispatcher slot, so smaller
+// batches install sooner → the call-cache warms up faster. The cost is more
+// dispatchers (one shared-table slot each) + more re-emits; with RESERVED_SLOT_COUNT
+// = 2048 that still covers ~65k methods, well beyond real content.
+const GEN_BATCH: usize = 32;
 
 /// Inline-cache table size (power of two — the mask is `IC_SIZE - 1`). Direct-
 /// mapped method-ptr → `Compiled`, fronting the `cache` HashMap on the hot path.
@@ -280,6 +304,26 @@ impl WasmJit {
         Self::default()
     }
 
+    /// Resolve a callee (by its `Method` `Gc` pointer) to a JIT→JIT direct-call
+    /// target `(table_slot, ic_base, member_idx)` — it must be compiled,
+    /// [`Compiled::directable`], and hold a shared-table slot (its own `run`, or its
+    /// amalgam dispatcher for a generation member). `None` otherwise, so the
+    /// call-cache refill records the sentinel. Called by the `cmi` helper via the
+    /// `RunCtx`'s erased `self` pointer.
+    pub(crate) fn direct_target(&self, callee_ptr: usize, argc: u32) -> Option<(u32, u32, u32)> {
+        let cache = self.cache.borrow();
+        let compiled = cache.get(&callee_ptr)?.as_deref()?;
+        // Sound only when the caller's direct-call frame — exactly `{this, argc args}`
+        // — matches what the callee reads: every param provided (no defaults to fill)
+        // and no locals beyond them (no stale, uninitialized temporaries). Otherwise
+        // fall to the helper (which builds a full, coerced, default-filled frame).
+        if !compiled.directable || compiled.param_count != argc || compiled.num_locals != argc + 1 {
+            return None;
+        }
+        let (slot, member_idx) = runner::run_index_for(compiled.bytes.as_ptr() as usize)?;
+        Some((slot, compiled.ic_base, member_idx))
+    }
+
     /// Enables the differential self-check (compare every JIT run against the
     /// interpreter). For testing/validation; do not enable in production.
     pub fn with_verify(mut self, verify: bool) -> Self {
@@ -422,10 +466,38 @@ impl WasmJit {
             .and_then(|(int_seed, double_seed, numeric_seed)| {
                 compile_method(method, &int_seed, &double_seed, &numeric_seed)
             })
-            .map(|(bytes, manifest, mn_list, mut gen_src)| {
+            .map(|(bytes, manifest, mn_list, mut gen_src, directable)| {
                 // Record the method name for the amalgam's wasm name section
                 // (this is the only place with the `Method` in scope).
                 gen_src.name = method.method_name().as_ref().into();
+                // Property-IC cache: one zeroed cell per `GetPropertyIc` site. The
+                // cells live in memory 1 (a normal Rust allocation IS in Ruffle's
+                // single linear memory on wasm32), so the slice's data pointer IS
+                // the `ic_base` memory-1 offset the emitted guard/miss address. Only
+                // meaningful where the inline IC is emitted (`has_ic`, wasm32); the
+                // pointer is truncated to 0 elsewhere (nothing reads it).
+                // Shared per-method cache buffer, `[property-IC cells | call-cache
+                // cells]` in memory 1. IC cell = 8 bytes (1 `u64`); call cell = 16
+                // bytes (2 `u64`). `ic_base` (the run param) points at the start; the
+                // call region begins at `ic_sites * IC_CELL_SIZE` (see `emit_body`).
+                let ic_sites = gen_src
+                    .ops
+                    .iter()
+                    .filter(|op| matches!(op, lower::JitOp::GetPropertyIc(..)))
+                    .count();
+                let call_sites = gen_src
+                    .ops
+                    .iter()
+                    .filter(|op| matches!(op, lower::JitOp::CallMethodDirect(..)))
+                    .count();
+                let total_u64 = ic_sites + call_sites * 2;
+                let ic_cells: Rc<[std::cell::Cell<u64>]> =
+                    (0..total_u64).map(|_| std::cell::Cell::new(0u64)).collect();
+                let ic_base = if manifest.has_ic || manifest.has_call_direct {
+                    ic_cells.as_ptr() as usize as u32
+                } else {
+                    0
+                };
                 // Build the per-method side tables ONCE, here (the only place with
                 // both the compile result and an activation for script-globals
                 // resolution) — the hot path then just installs the cached slices.
@@ -462,6 +534,10 @@ impl WasmJit {
                     mn_table: mn_list,
                     direct_ops: direct::eligible(&gen_src.ops).then(|| gen_src.ops.clone()),
                     num_locals: method.body().map(|b| b.num_locals).unwrap_or(0),
+                    ic_cells,
+                    ic_base,
+                    directable,
+                    param_count: method.resolved_param_config().len() as u32,
                     gen_src,
                 }
             })
@@ -644,17 +720,24 @@ fn compile_method<'gc>(
     int_seed: &[bool],
     double_seed: &[bool],
     numeric_seed: &[bool],
-) -> Option<(Rc<[u8]>, lower::Manifest, Rc<[*const ()]>, GenSource)> {
+) -> Option<(Rc<[u8]>, lower::Manifest, Rc<[*const ()]>, GenSource, bool)> {
     method.body()?;
     let core_ops = &method.get_verified_info().parsed_code;
 
     // `mn_list`: the combined multiname pointer list (see [`Compiled`]). The fast paths
     // read no properties → empty; the boxed path passes the caller's + inlined callees'.
+    // `directable` = safe as a JIT→JIT direct-call target (see `Manifest::directable`).
+    // `all_getslots_null_safe`: every `GetSlot` on the FINAL ops is verifier-proven
+    // not-null → the activation-reading throw path of `helpers::get_slot` is dead, so
+    // a leaf whose only "helper" is getslot is a safe direct-call target
+    // ([`lower::Manifest::directable`]). The fast paths have no getslots (vacuously
+    // true); the boxed path computes it below.
     let finish = |ops: &[lower::JitOp],
                   switches: &[lower::SwitchTable],
                   exceptions: &[lower::ExcRange],
-                  mn_list: Vec<*const ()>|
-     -> Option<(Rc<[u8]>, lower::Manifest, Rc<[*const ()]>, GenSource)> {
+                  mn_list: Vec<*const ()>,
+                  all_getslots_null_safe: bool|
+     -> Option<(Rc<[u8]>, lower::Manifest, Rc<[*const ()]>, GenSource, bool)> {
         let bytes = Rc::from(
             lower::compile_full(ops, switches, exceptions, numeric_seed)?.into_boxed_slice(),
         );
@@ -666,20 +749,24 @@ fn compile_method<'gc>(
             name: Rc::from(""),
             numeric_seed: numeric_seed.into(),
         };
-        Some((bytes, lower::manifest(ops), mn_list.into(), gen_src))
+        let manifest = lower::manifest(ops);
+        let directable = manifest.directable(all_getslots_null_safe);
+        Some((bytes, manifest, mn_list.into(), gen_src, directable))
     };
 
-    // Int fast path (raw i32) — only when provably int-sound.
+    // Int fast path (raw i32) — only when provably int-sound. Pure register/frame
+    // arithmetic, no helpers → a direct-call target.
     if let Some(ops) = translate::translate(core_ops) {
         if analysis::int_sound(&ops, int_seed) {
-            return finish(&ops, &[], &[], Vec::new());
+            return finish(&ops, &[], &[], Vec::new(), true);
         }
     }
 
     // Double fast path (unboxed f64, inline arithmetic) — only when Number-sound.
+    // Also pure numeric → a direct-call target.
     if let Some(ops) = translate::translate_double(core_ops) {
         if analysis::double_sound(&ops, double_seed) {
-            return finish(&ops, &[], &[], Vec::new());
+            return finish(&ops, &[], &[], Vec::new(), true);
         }
     }
 
@@ -690,6 +777,17 @@ fn compile_method<'gc>(
     // Boxed (GC-aware) path — raw `Value`s + imported helper `call`s.
     let (mut ops, switches) =
         translate::translate_boxed(core_ops, &method.get_verified_info().number_slots)?;
+    // Whether every `GetSlot` is verifier-proven not-null — computed HERE, while op
+    // indices are still 1:1 with `parsed_code` (the `null_safe_getslots` indices refer
+    // to those). A direct-call-eligible method is a leaf (no calls → inlining never
+    // fires) and `hoist` only ever moves already-null-safe getslots, so this survives
+    // both passes. Gates `getslot` leaves into `directable`.
+    let all_getslots_null_safe = {
+        let null_safe = &method.get_verified_info().null_safe_getslots;
+        ops.iter().enumerate().all(|(i, op)| {
+            !matches!(op, lower::JitOp::GetSlot(..)) || null_safe.contains(&(i as u32))
+        })
+    };
     // The caller's multiname pointers; the inline pass appends each inlined callee's
     // (and remaps that callee's `k`s), keeping this list in sync with the final ops.
     let mut mn_list = multiname_table(method);
@@ -722,6 +820,12 @@ fn compile_method<'gc>(
     if JIT_INLINE && switches.is_empty() && exceptions.is_empty() {
         inline_pass(&mut ops, &mut mn_list, method, hoisted_locals);
     }
+    // Property-IC `site` ids must be a dense `0..n` over the FINAL op stream so each
+    // maps to a distinct cache cell. Inlining splices a callee's sites (also `0..`)
+    // into the caller, colliding — a global renumber after all splicing restores
+    // uniqueness. Idempotent for un-inlined methods (translate already numbers them
+    // sequentially) and a no-op where no IC is emitted (native).
+    renumber_cache_sites(&mut ops);
     // Decline helper-dominated methods: when a boxed method is mostly JS-boundary
     // crossings (getproperty/getslot/callmethod/generic helpers) with little inline
     // compute, the interpreter's fast native dispatch beats the JIT's per-call reg
@@ -730,7 +834,30 @@ fn compile_method<'gc>(
     if DECLINE_HELPER_DOMINATED && lower::helper_dominated(&ops) {
         return None;
     }
-    finish(&ops, &switches, &exceptions, mn_list)
+    // Boxed path: not a direct-call target in v1 (its `getslot`/`dm`/coerce helpers
+    // are activation-coupled; the null-safe-getslot widening comes later).
+    finish(&ops, &switches, &exceptions, mn_list, all_getslots_null_safe)
+}
+
+/// Re-assign property-IC and direct-call `site` indices to dense `0..n` sequences
+/// over the final op stream (see the call site). Each op family is one-to-one with
+/// its region of the per-method cache buffer, so the two counters are independent.
+fn renumber_cache_sites(ops: &mut [lower::JitOp]) {
+    let mut ic = 0u32;
+    let mut call = 0u32;
+    for op in ops.iter_mut() {
+        match op {
+            lower::JitOp::GetPropertyIc(_, site) => {
+                *site = ic;
+                ic += 1;
+            }
+            lower::JitOp::CallMethodDirect(_, _, _, site) => {
+                *site = call;
+                call += 1;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The method's exception handlers as [`lower::ExcRange`]s (op-index ranges).
@@ -1264,13 +1391,14 @@ impl JitBackend for WasmJit {
             &compiled.natives,
             &compiled.namespaces,
             method,
+            self as *const WasmJit as *const (),
         );
         let result_bits = helpers::with_run_ctx(&ctx, || match &compiled.direct_ops {
             // Direct-exec tier: a tiny straight-line method runs as a Rust
             // match-loop over its ops — same helpers, same side tables, no wasm
             // engine (whose per-call setup dominates 3-op accessors like `LI8`).
             Some(ops) => direct::run(ops, regs),
-            None => runner::run(bytes, regs, manifest),
+            None => runner::run(bytes, regs, manifest, compiled.ic_base),
         })?;
 
         // A `callmethod` that threw is captured out-of-band (the ABI is infallible
@@ -1385,8 +1513,9 @@ impl JitBackend for WasmJit {
             &compiled.natives,
             &compiled.namespaces,
             method,
+            self as *const WasmJit as *const (),
         );
-        let _ = helpers::with_run_ctx(&ctx2, || runner::run(bytes, regs, manifest));
+        let _ = helpers::with_run_ctx(&ctx2, || runner::run(bytes, regs, manifest, compiled.ic_base));
         let _ = helpers::take_pending_error();
         let jit2_slots = slots_snapshot(activation, &slot_ids);
         let (jit2, jit2_len) = capture(activation, &mut pre, false);

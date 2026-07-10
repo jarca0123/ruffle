@@ -5102,6 +5102,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruffle_avm2_jit2"
+version = "0.3.0"
+dependencies = [
+ "fnv",
+ "gc-arena",
+ "getrandom 0.3.4",
+ "js-sys",
+ "ruffle_core",
+ "swf 0.2.2",
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
+ "wasm-encoder 0.221.3",
+ "wasmtime",
+]
+
+[[package]]
 name = "ruffle_common"
 version = "0.3.0"
 dependencies = [
@@ -5544,6 +5561,7 @@ dependencies = [
  "rfd",
  "rlsf",
  "ruffle_avm2_jit",
+ "ruffle_avm2_jit2",
  "ruffle_core",
  "ruffle_render",
  "ruffle_render_canvas",

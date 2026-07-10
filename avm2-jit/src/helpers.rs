@@ -37,6 +37,10 @@ use ruffle_core::avm2::{
 pub(crate) struct RunCtx {
     /// The current activation (`&mut Activation`, erased). See [`activation`].
     activation: *mut (),
+    /// The `WasmJit` backend (erased `*const`), so the direct-call refill
+    /// (`call_method_ic`) can resolve a callee to its compiled `run` slot. See
+    /// [`current_jit`].
+    jit: *const (),
     /// The method's declared return type (`Class`, erased; null = none/`*`),
     /// for [`coerce_return`].
     return_type: *const (),
@@ -73,9 +77,11 @@ impl RunCtx {
         natives: &[*const ()],
         namespaces: &[*const ()],
         method: Method<'gc>,
+        jit: *const (),
     ) -> Self {
         RunCtx {
             activation: activation as *mut Activation<'_, 'gc> as *mut (),
+            jit,
             // SAFETY: `Class`/`Method` are pointer-sized `Gc` handles alive for
             // the run; erased for storage, reconstructed within the same run.
             return_type: match return_type {
@@ -117,6 +123,19 @@ unsafe fn run_ctx<'a>() -> &'a RunCtx {
     // SAFETY: delegated to the caller — the context lives on `try_run`'s stack
     // for the whole synchronous run.
     unsafe { &*ptr }
+}
+
+/// The installed `WasmJit` backend (see [`RunCtx::jit`]) — the direct-call refill
+/// resolves a callee to its compiled `run` slot through it. `None` if none was
+/// installed (defensive; a real run always sets it).
+///
+/// # Safety
+/// Only call from a helper invoked while inside [`with_run_ctx`]; the reference must
+/// not escape the call.
+#[cfg(target_arch = "wasm32")]
+unsafe fn current_jit<'a>() -> Option<&'a crate::WasmJit> {
+    let ptr = unsafe { run_ctx() }.jit;
+    (!ptr.is_null()).then(|| unsafe { &*(ptr as *const crate::WasmJit) })
 }
 
 /// The installed [`RunCtx`] (null outside a run). See [`with_run_ctx`]. A raw
@@ -1131,6 +1150,71 @@ pub(crate) fn get_property(receiver: i64, k: i64) -> i64 {
     }
 }
 
+/// The property inline-cache miss helper (`gpi`, [`crate::lower::JitOp::GetPropertyIc`]):
+/// resolves `receiver.get_property(mn_k)` exactly like [`get_property`] (same
+/// value, same `PENDING_ERROR` behaviour), and — on web — refills the per-site
+/// cache cell at `cell_addr` (memory 1) so a later access with the same receiver
+/// class hits inline.
+///
+/// The cell is `{ class_word: u32, slot_id: u32 }`. It is filled ONLY when the
+/// receiver is an object whose vtable resolves `mn` to a plain (const-)slot — the
+/// one shape the inline guard can serve with a direct slot load. `class_word` is
+/// read from the SAME word the inline guard reads (`obj_ptr + jit_vtable_offset`),
+/// so a subsequent guard match is exact regardless of `Gc` box-vs-data pointer
+/// representation. Anything else (virtual getter, method, dynamic/prototype
+/// property, non-object receiver) leaves the cell's `class == 0` sentinel, so the
+/// guard keeps missing to here — correct, just not accelerated.
+///
+/// Web only: the raw-pointer cell write treats `cell_addr` (a memory-1 offset) as
+/// a real pointer, valid only under 32-bit pointers. Native never emits
+/// `GetPropertyIc` (no inline object layout), so the fill is compiled out; the
+/// resolve/return path is identical to [`get_property`] there.
+pub(crate) fn get_property_ic(receiver: i64, k: i64, cell_addr: i32) -> i64 {
+    // SAFETY: helpers run only inside `with_run_ctx`.
+    let activation = unsafe { activation() };
+    let mn = unsafe { multiname(k as usize) };
+
+    let recv = to_value(receiver);
+    let result = recv
+        .null_check(activation, Some(mn))
+        .and_then(|obj| obj.get_property(mn, activation));
+
+    // Refill the cache cell (web) when the property is a plain fixed slot.
+    #[cfg(target_arch = "wasm32")]
+    if result.is_ok() {
+        use ruffle_core::avm2::property::Property;
+        if let Some(obj) = recv.as_object() {
+            let slot_id = match obj.vtable().get_trait(mn) {
+                Some(Property::Slot { slot_id }) | Some(Property::ConstSlot { slot_id }) => {
+                    Some(slot_id)
+                }
+                _ => None,
+            };
+            if let Some(slot_id) = slot_id {
+                // `class_word`: the exact word the inline guard loads (the object's
+                // vtable pointer at `obj_ptr + vtable_off` in memory 1). The receiver
+                // is object-boxed, so its low 32 bits are the `Gc` data pointer =
+                // its memory-1 offset.
+                let obj_ptr = (receiver as u64 as u32) as usize;
+                let vtable_off = ruffle_core::avm2::jit_vtable_offset() as usize;
+                let class_word = unsafe { *((obj_ptr + vtable_off) as *const u32) };
+                let cell = (cell_addr as u32) as usize as *mut u32;
+                // SAFETY: `cell_addr` is this site's cell in the method's JIT-owned
+                // IC buffer (memory 1); single-threaded, no aliasing `&mut` exists.
+                unsafe {
+                    *cell = class_word;
+                    *cell.add(1) = slot_id as u32;
+                }
+            }
+        }
+    }
+
+    match result {
+        Ok(v) => from_value(v),
+        Err(e) => stash_pending_error(e),
+    }
+}
+
 /// The arity-2 findprop helper (`FindProp(k, strict)`): resolve the method's
 /// `k`-th multiname through the scope chain and return the scope object that
 /// defines it. Mirrors `op_find_prop_strict` (`strict != 0`) / `op_find_property`:
@@ -1463,6 +1547,50 @@ pub(crate) fn call_method(receiver: i64, index: i64, argc: i64) -> i64 {
     match result {
         Ok(v) => from_value(v),
         Err(e) => stash_pending_error(e),
+    }
+}
+
+/// `cmi` — the JIT→JIT direct-call **miss** helper: performs the `callmethod`
+/// exactly like [`call_method`], then refills the call-cache cell at `cell_addr` so
+/// a later call with the same receiver class takes the inline `call_indirect` fast
+/// path ([`crate::lower::emit_call_direct`]). Web only — the cell + shared-table
+/// `run` slot exist only on wasm32; natively this is just a `call_method`.
+pub(crate) fn call_method_ic(receiver: i64, disp_id: i64, argc: i64, cell_addr: i32) -> i64 {
+    let result = call_method(receiver, disp_id, argc);
+    #[cfg(target_arch = "wasm32")]
+    refill_call_cell(receiver, disp_id as u32, argc as u32, cell_addr);
+    let _ = cell_addr;
+    result
+}
+
+/// Refills the direct-call cache cell `{ vtable: u32, run_index: u32, ic_base: u32 }`
+/// at `cell_addr` (memory 1). Writes the callee's shared-table `run` slot + `ic_base`
+/// when it resolves to a compiled **directable** target; otherwise the
+/// `CALL_SENTINEL` (observed-but-not-directable → the guard's vtable may match but
+/// the site keeps taking this helper). A non-object receiver / unresolved method
+/// leaves the fresh (zero) cell so the next call retries.
+#[cfg(target_arch = "wasm32")]
+fn refill_call_cell(receiver: i64, disp_id: u32, argc: u32, cell_addr: i32) {
+    let recv = to_value(receiver);
+    let Some(obj) = recv.as_object() else { return };
+    let Some(callee) = obj.vtable().get_method(disp_id as usize) else { return };
+    // Class-guard word = the object's vtable pointer, read from the SAME location the
+    // emitted guard reads (`obj_ptr + vtable_off`) so a match is exact.
+    let obj_ptr = (receiver as u64 as u32) as usize;
+    let vtable_off = ruffle_core::avm2::jit_vtable_offset() as usize;
+    let class_word = unsafe { *((obj_ptr + vtable_off) as *const u32) };
+    let (slot, ic_base, member_idx) = unsafe { current_jit() }
+        .and_then(|jit| jit.direct_target(callee.as_ptr() as usize, argc))
+        .unwrap_or((crate::lower::CALL_SENTINEL, 0, crate::lower::CALL_NO_MEMBER));
+    let cell = (cell_addr as u32) as usize as *mut u32;
+    // SAFETY: `cell_addr` is this site's 16-byte cell in the method's JIT-owned cache
+    // buffer (memory 1); single-threaded, no aliasing `&mut`.
+    // Cell = { vtable, table_slot, ic_base, member_idx }.
+    unsafe {
+        *cell = class_word;
+        *cell.add(1) = slot;
+        *cell.add(2) = ic_base;
+        *cell.add(3) = member_idx;
     }
 }
 

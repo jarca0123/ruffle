@@ -141,7 +141,7 @@ pub(crate) fn stack_arity(op: &JitOp) -> (u32, u32) {
         CallHelper(_) => (1, 1),
 
         // Property/slot reads: pop the receiver, push the value.
-        GetProperty(_) | GetSlot(_, _) => (1, 1),
+        GetProperty(_) | GetPropertyIc(_, _) | GetSlot(_, _) => (1, 1),
         // findpropstrict/findproperty: searches the scope chain by its multiname
         // immediate and pushes the found object — no operand-stack pop.
         FindProp(_, _) => (0, 1),
@@ -175,6 +175,8 @@ pub(crate) fn stack_arity(op: &JitOp) -> (u32, u32) {
         CallMethod(_, argc, push) | CallProperty(_, argc, push) => {
             (argc + 1, push as u32)
         }
+        // Direct-call (§8): same stack effect as `callmethod`.
+        CallMethodDirect(_, argc, push, _) => (argc + 1, push as u32),
         // `call value`: function + receiver + argc args.
         CallValue(argc) => (argc + 2, 1),
         // constructsuper: receiver + argc args, pushes nothing.

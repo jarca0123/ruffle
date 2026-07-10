@@ -100,6 +100,20 @@ pub fn translate(ops: &[Op]) -> Option<Vec<JitOp>> {
 /// call-only call-aware verify and catch the corruptor. Ship value is `false`.
 const JIT_CALLMETHOD: bool = true;
 
+/// Whether `callmethod` is compiled behind the JIT→JIT direct-call cache
+/// ([`crate::lower::emit_call_direct`]). **Currently `false`** — the whole machinery
+/// is built and native-green, but once the cache actually HITS on web (after the
+/// generation-member + getslot-leaf-directable widening) the in-wasm HIT path
+/// corrupts state: an early symptom was `#1034` (default params / stale extra locals
+/// not filled — fixed by the `argc == param_count && num_locals == argc+1` gate in
+/// `WasmJit::direct_target`), then a deeper one — a `Method should exist` panic in a
+/// LATER `callmethod` whose receiver was already corrupted by a prior HIT. That
+/// corruption is a runtime-only (wasm) behaviour not findable by inspection; needs
+/// web-side diagnosis (e.g. `shared_verified` diff mode to catch the first diverging
+/// method) before re-enabling. Args are also passed UNCOERCED (sound only for
+/// well-typed calls). Kept off so the machinery doesn't ship a silent corruptor.
+const JIT_DIRECT_CALL: bool = false;
+
 /// Whether `callproperty`/`callpropvoid` (the multiname method-call form — the hot
 /// FlasCC C-call path) JIT. Only **non-lazy** multinames compile (a lazy multiname
 /// pops its runtime name/namespace off the operand stack in `fill_with_runtime_params`,
@@ -309,6 +323,8 @@ pub fn translate_boxed(
     let mut next_coerce: u32 = 0;
     let mut next_native: u32 = 0;
     let mut next_ns: u32 = 0;
+    let mut next_ic_site: u32 = 0;
+    let mut next_call_site: u32 = 0;
     for (i, op) in ops.iter().enumerate() {
         let returns_number = number_slots.binary_search(&(i as u32)).is_ok();
         out.push(boxed_op(
@@ -319,6 +335,8 @@ pub fn translate_boxed(
             &mut next_coerce,
             &mut next_native,
             &mut next_ns,
+            &mut next_ic_site,
+            &mut next_call_site,
             needs_scope,
             scope_this,
             &mut switches,
@@ -365,6 +383,8 @@ fn boxed_op(
     next_coerce: &mut u32,
     next_native: &mut u32,
     next_ns: &mut u32,
+    next_ic_site: &mut u32,
+    next_call_site: &mut u32,
     needs_scope: bool,
     scope_this: bool,
     switches: &mut Vec<SwitchTable>,
@@ -498,7 +518,16 @@ fn boxed_op(
         Op::GetPropertyStatic { .. } => {
             let k = *next_mn;
             *next_mn += 1;
-            JitOp::GetProperty(k)
+            // Behind a monomorphic inline cache where the object layout is known
+            // (web); otherwise the generic `gp` helper path. Same semantics; the IC
+            // only adds an inline vtable guard + cached slot load on hits.
+            if crate::lower::ic_available() {
+                let site = *next_ic_site;
+                *next_ic_site += 1;
+                JitOp::GetPropertyIc(k, site)
+            } else {
+                JitOp::GetProperty(k)
+            }
         }
         Op::GetPropertySlow { .. } => return None,
         // `findpropstrict`/`findproperty` — resolve a multiname through the scope
@@ -634,7 +663,19 @@ fn boxed_op(
             index,
             num_args,
             push_return_value,
-        } if JIT_CALLMETHOD => JitOp::CallMethod(index as u32, num_args, push_return_value),
+        } if JIT_CALLMETHOD => {
+            // Behind the JIT→JIT direct-call cache where the inline object layout +
+            // shared table are available (web); else the generic `cm` helper. Same
+            // semantics; the cache adds an inline vtable guard + `call_indirect` on a
+            // hit to a directable callee.
+            if JIT_DIRECT_CALL && crate::lower::ic_available() {
+                let site = *next_call_site;
+                *next_call_site += 1;
+                JitOp::CallMethodDirect(index as u32, num_args, push_return_value, site)
+            } else {
+                JitOp::CallMethod(index as u32, num_args, push_return_value)
+            }
+        }
         // `callproperty`/`callpropvoid` — a multiname method call (the hot FlasCC
         // C-call path). Only non-lazy multinames compile (a lazy one consumes runtime
         // name/ns off the stack, which the spill doesn't model). `k` indexes the run's
@@ -819,6 +860,8 @@ pub fn first_unsupported_boxed(ops: &[Op]) -> Option<String> {
     let mut next_coerce = 0;
     let mut next_native = 0;
     let mut next_ns = 0;
+    let mut next_ic_site = 0;
+    let mut next_call_site = 0;
     let mut switches = Vec::new();
     ops.iter()
         .find(|op| {
@@ -830,6 +873,8 @@ pub fn first_unsupported_boxed(ops: &[Op]) -> Option<String> {
                 &mut next_coerce,
                 &mut next_native,
                 &mut next_ns,
+                &mut next_ic_site,
+                &mut next_call_site,
                 true,
                 false,
                 &mut switches,
@@ -1025,6 +1070,7 @@ pub(crate) fn reference_run(ops: &[JitOp], regs: &[u64]) -> u64 {
             | JitOp::IncrementIBoxed
             | JitOp::DecrementIBoxed
             | JitOp::GetProperty(_)
+            | JitOp::GetPropertyIc(_, _)
             | JitOp::GetPropertyFast(_, _)
             | JitOp::GetSlot(_, _)
             | JitOp::PushIntValue(_)
@@ -1053,6 +1099,7 @@ pub(crate) fn reference_run(ops: &[JitOp], regs: &[u64]) -> u64 {
             | JitOp::NegateD
             | JitOp::ReturnDouble
             | JitOp::CallMethod(_, _, _)
+            | JitOp::CallMethodDirect(_, _, _, _)
             | JitOp::CallProperty(_, _, _)
             | JitOp::ConstructSuper(_)
             | JitOp::CallValue(_)
@@ -1193,7 +1240,7 @@ mod diff_tests {
     /// Runs `ops` both ways and asserts equality.
     fn assert_equiv(ops: &[JitOp], regs: &[u64]) {
         let bytes = compile(ops).expect("compiles");
-        let jit = run(&bytes, regs, &crate::lower::manifest(ops)).expect("native runner");
+        let jit = run(&bytes, regs, &crate::lower::manifest(ops), 0).expect("native runner");
         let interp = reference_run(ops, regs);
         assert_eq!(jit, interp, "JIT != interpreter for regs {regs:?}");
     }
@@ -1276,7 +1323,7 @@ mod diff_tests {
             assert_equiv(&ops, &regs);
             // And it computes the actual triangular number.
             let bytes = compile(&ops).unwrap();
-            let got = run(&bytes, &regs, &crate::lower::manifest(&ops)).unwrap();
+            let got = run(&bytes, &regs, &crate::lower::manifest(&ops), 0).unwrap();
             let expected: i32 = (0..n).sum();
             assert_eq!(got, int_bits(expected), "sum({n})");
         }
@@ -1319,7 +1366,7 @@ mod diff_tests {
         for n in [0, 1, 2, 16, 100] {
             let regs =
                 [int_bits(0), int_bits(n), int_bits(0), int_bits(0), int_bits(0), int_bits(0)];
-            let got = run(&bytes, &regs, &crate::lower::manifest(&ops)).expect("runs");
+            let got = run(&bytes, &regs, &crate::lower::manifest(&ops), 0).expect("runs");
             let expected: i32 = (0..n).sum();
             assert_eq!(got, int_bits(expected), "sum({n})");
         }
@@ -1362,7 +1409,7 @@ mod diff_tests {
         for n in [0, 1, 2, 16, 100] {
             let regs =
                 [int_bits(0), int_bits(n), int_bits(0), int_bits(0), int_bits(0), int_bits(0)];
-            let got = run(&bytes, &regs, &crate::lower::manifest(&ops)).expect("runs");
+            let got = run(&bytes, &regs, &crate::lower::manifest(&ops), 0).expect("runs");
             let expected: i32 = (0..n).sum();
             assert_eq!(got, int_bits(expected), "countdown sum({n})");
         }
