@@ -92,6 +92,8 @@ features = [
 version = "0.3"
 features = ["wasm_js"]
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+
 # TLSF (two-level segregated fit) allocator, used as the wasm `#[global_allocator]`.
 # `default-features = false` keeps it `no_std` (we only use the core `Tlsf` engine
 # and back it onto `memory.grow` ourselves — see `src/tlsf_alloc.rs`).

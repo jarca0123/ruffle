@@ -185,15 +185,6 @@ opt-level = 3
 [profile.dev.package.wasmi]
 opt-level = 3
 
-[profile.dev.package.wasmi_core]
-opt-level = 3
-
-[profile.dev.package.wasmi_collections]
-opt-level = 3
-
-[profile.dev.package.wasmi_ir]
-opt-level = 3
-
 # The JIT's own per-call path (run context install, register snapshot, helper
 # dispatch) runs once per JIT'd method invocation — millions per exception-heavy
 # test — so it gets the same treatment as wasmi.

@@ -14,7 +14,9 @@ mod ui;
 
 // Replace the default wasm allocator (`dlmalloc`, which walks free lists and
 // thrashes under our mixed huge-bitmap/tiny-alloc workload) with an O(1) TLSF
-// allocator. See `tlsf_alloc` for the full rationale.
+// allocator. See `tlsf_alloc` for the full rationale. (Talc was tried and was ~4×
+// WORSE on the Starling object-count benchmark — 600 vs 2400 objects — for this
+// coalescing-heavy huge-bitmap/tiny-alloc mix, so TLSF stays.)
 #[cfg(target_arch = "wasm32")]
 #[global_allocator]
 static ALLOC: tlsf_alloc::TlsfAlloc = tlsf_alloc::TlsfAlloc::new();

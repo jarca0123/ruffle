@@ -25,8 +25,8 @@ use std::collections::BTreeSet;
 
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, Elements, ElementSection, EntityType, ExportKind,
-    ExportSection, Function, FunctionSection, ImportSection, Instruction, MemArg, MemoryType,
-    Module, NameMap, NameSection, RefType, TableSection, TableType, TypeSection, ValType,
+    ExportSection, Function, FunctionSection, GlobalType, ImportSection, Instruction, MemArg,
+    MemoryType, Module, NameMap, NameSection, RefType, TableSection, TableType, TypeSection, ValType,
 };
 
 /// Bit pattern OR-ed onto a 32-bit integer to form an AVM2 int [`Value`].
@@ -77,6 +77,15 @@ const SPILL_POOL: u32 = 8;
 /// `state_ptr + FRAME_STRIDE`, so this MUST equal the runner's frame stride
 /// (`runner::web::STRIDE`, which is defined as this).
 pub(crate) const FRAME_STRIDE: u32 = 4096;
+
+/// Total committed bytes of the shared JIT frame memory (memory 0), = the runner's
+/// `web::MEM_BYTES` (`PAGES * 65536`). A JIT→JIT direct call to a **non-leaf** callee
+/// (one that itself calls) can chain frames without going through the runner's
+/// per-`run` depth-decline check, so [`emit_call_direct`] bounds-checks the callee
+/// frame against this before the `call_indirect` (over → falls to the `cm` helper,
+/// which re-enters `run` and declines to the interpreter). MUST equal
+/// `runner::web::MEM_BYTES`.
+pub(crate) const FRAME_MEM_BYTES: u32 = 64 * 65536;
 
 /// The canonical NaN bit pattern Ruffle stores for a NaN `Number` (must match
 /// `core::avm2::value`'s `CANON_NAN`).
@@ -139,6 +148,18 @@ fn vtable_offset() -> Option<u32> {
     if cfg!(target_arch = "wasm32") {
         static VOFF: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         Some(*VOFF.get_or_init(ruffle_core::avm2::jit_vtable_offset))
+    } else {
+        None
+    }
+}
+
+/// Byte offset of an object's `instance_class` `Gc` word (web only) — the direct-call
+/// exact-class arg guard reads it. `None` natively (direct calls are web-only). No test
+/// hook: the codegen tests pass the offset to `emit_call_direct` directly.
+fn instance_class_offset() -> Option<u32> {
+    if cfg!(target_arch = "wasm32") {
+        static OFF: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        Some(*OFF.get_or_init(ruffle_core::avm2::jit_instance_class_offset))
     } else {
         None
     }
@@ -233,17 +254,28 @@ fn emit_box_double(body: &mut Function) {
 /// helper support (works on the web runner, which can't yet vend helpers). The
 /// runner binds `i` to [`crate::helpers::HELPERS`]`[i]`.
 pub(crate) fn helper_count(ops: &[JitOp]) -> u32 {
+    // Imports are contiguous `h0..=h{max}`, so the count is `max invoked index + 1`.
+    let mask = helper_mask(ops);
+    if mask == 0 { 0 } else { mask.ilog2() + 1 }
+}
+
+/// Bit `i` set iff this method actually **invokes** helper `h{i}` (see
+/// [`crate::helpers::HELPERS`]). Unlike [`helper_count`] (which is `max index + 1`,
+/// covering imported-but-unused slots), this is the exact set of helpers whose Rust
+/// code runs — what [`Manifest::directable`] checks against [`SAFE_HELPER_MASK`] to
+/// decide whether a callee's helper calls are all activation-context-only (safe under
+/// a direct entry) or touch per-method/per-activation state (not).
+fn helper_mask(ops: &[JitOp]) -> u32 {
     ops.iter()
         .filter_map(|op| match op {
-            JitOp::CallHelper(i) => Some(i + 1),
-            // Some ops implicitly call a fixed arity-1 helper, so the module must
-            // import `h0..=h{that index}`.
-            JitOp::IfTrueBoxed(_) | JitOp::IfFalseBoxed(_) => Some(TO_BOOLEAN + 1),
-            JitOp::PushScopeReal => Some(PUSH_SCOPE + 1),
-            JitOp::PopScopeReal => Some(POP_SCOPE + 1),
-            JitOp::GetScopeObject(_) => Some(GET_SCOPE_OBJECT + 1),
-            JitOp::GetOuterScope(_) => Some(GET_OUTER_SCOPE + 1),
-            JitOp::CoerceString => Some(COERCE_S + 1),
+            JitOp::CallHelper(i) => Some(*i),
+            // Some ops implicitly call a fixed arity-1 helper.
+            JitOp::IfTrueBoxed(_) | JitOp::IfFalseBoxed(_) => Some(TO_BOOLEAN),
+            JitOp::PushScopeReal => Some(PUSH_SCOPE),
+            JitOp::PopScopeReal => Some(POP_SCOPE),
+            JitOp::GetScopeObject(_) => Some(GET_SCOPE_OBJECT),
+            JitOp::GetOuterScope(_) => Some(GET_OUTER_SCOPE),
+            JitOp::CoerceString => Some(COERCE_S),
             // Inline dm ops need their helper FALLBACK imported (taken when the
             // access misses the shared reservation — incl. an unshared
             // domainMemory, where `dm_len == 0`).
@@ -251,36 +283,54 @@ pub(crate) fn helper_count(ops: &[JitOp]) -> u32 {
                 1 => DM_LOAD8,
                 2 => DM_LOAD16,
                 _ => DM_LOAD32,
-            } + 1),
-            JitOp::DmLoadF(w) => Some(if *w == 4 { DM_LOADF32 } else { DM_LOADF64 } + 1),
-            JitOp::GetScriptGlobals(_) => Some(GET_SCRIPT_GLOBALS + 1),
-            JitOp::PushString(_) => Some(GET_PUSH_STRING + 1),
-            JitOp::Throw => Some(THROW + 1),
+            }),
+            JitOp::DmLoadF(w) => Some(if *w == 4 { DM_LOADF32 } else { DM_LOADF64 }),
+            JitOp::GetScriptGlobals(_) => Some(GET_SCRIPT_GLOBALS),
+            JitOp::PushString(_) => Some(GET_PUSH_STRING),
+            JitOp::Throw => Some(THROW),
             // A method with exception handlers always has `newcatch`; key the whole
-            // dispatch machinery (`dispatch_exc`, `new_catch`, `pop_caught`) on it so
-            // `h0..=h22` are imported whenever handlers are present.
-            JitOp::NewCatch(_) => Some(POP_CAUGHT + 1),
-            JitOp::ReturnValueCoerced => Some(COERCE_RETURN + 1),
+            // dispatch machinery (`dispatch_exc`, `new_catch`, `pop_caught`) on the
+            // highest of them so `h0..=h22` are imported whenever handlers are present.
+            // (`POP_CAUGHT` is unsafe, so the mask excludes such methods too.)
+            JitOp::NewCatch(_) => Some(POP_CAUGHT),
+            JitOp::ReturnValueCoerced => Some(COERCE_RETURN),
             // The inline coerce's fallback needs its arity-1 helper imported.
-            JitOp::CoerceInt(true) => Some(COERCE_I + 1),
-            JitOp::CoerceInt(false) => Some(COERCE_U + 1),
-            JitOp::CoerceBool => Some(TO_BOOLEAN + 1),
+            JitOp::CoerceInt(true) => Some(COERCE_I),
+            JitOp::CoerceInt(false) => Some(COERCE_U),
+            JitOp::CoerceBool => Some(TO_BOOLEAN),
             // The inline int inc/dec's non-int fallback (wrapping ToInt32 ± 1).
-            JitOp::IncrementIBoxed | JitOp::IncDecLocalIValue(_, true) => Some(INCREMENT_I + 1),
-            JitOp::DecrementIBoxed | JitOp::IncDecLocalIValue(_, false) => Some(DECREMENT_I + 1),
+            JitOp::IncrementIBoxed | JitOp::IncDecLocalIValue(_, true) => Some(INCREMENT_I),
+            JitOp::DecrementIBoxed | JitOp::IncDecLocalIValue(_, false) => Some(DECREMENT_I),
             // Number-semantics local inc/dec goes through h0/h1.
-            JitOp::IncDecLocalNum(_, true) => Some(INCREMENT_NUM + 1),
-            JitOp::IncDecLocalNum(_, false) => Some(DECREMENT_NUM + 1),
+            JitOp::IncDecLocalNum(_, true) => Some(INCREMENT_NUM),
+            JitOp::IncDecLocalNum(_, false) => Some(DECREMENT_NUM),
             // `hasnext2` fetches its two register outputs via h30/h31.
-            JitOp::HasNext2(..) => Some(HN2_OBJECT + 1),
+            JitOp::HasNext2(..) => Some(HN2_OBJECT),
             // `lookupswitch` coerces its selector to an i32 via the `coerce_i`
             // (ToInt32) helper before the `br_table`, so it must import `h0..=h12`.
-            JitOp::LookupSwitch(_) => Some(COERCE_I + 1),
+            JitOp::LookupSwitch(_) => Some(COERCE_I),
             _ => None,
         })
-        .max()
-        .unwrap_or(0)
+        .fold(0u32, |m, i| m | (1 << i))
 }
+
+/// Helpers (`h{i}`) that read the current activation ONLY as a GC/domain **context
+/// carrier** — no per-method table (multinames / coerce-classes / script-globals /
+/// push-strings / return-type) and no per-activation scope stack. These are sound to
+/// call from a **direct-entered** method: the caller's activation left in place is a
+/// valid context, and a `valueOf`/`toString` re-entry they trigger is frame-safe under
+/// the direct-call `DEPTH` bump ([`emit_call_direct`]). Bit `i` = `h{i}` is safe.
+///
+/// Included: `increment`/`decrement`/`negate`/`bit_not`/`not`/`to_boolean` (0–5),
+/// `coerce_u`/`coerce_i`/`sxi1`/`sxi8`/`sxi16` (11–15), `coerce_s` (25),
+/// `increment_i`/`decrement_i` (28–29). EXCLUDED (need state a direct entry doesn't set
+/// up): scope (6/7/23/24), `dm` (8/9/10/26/27), `coerce_return` (16),
+/// `get_script_globals` (17), `get_push_string` (18), the exception machinery (19–22),
+/// and `hasnext2` (30/31).
+pub(crate) const SAFE_HELPER_MASK: u32 = 0b11_1111        // 0..=5
+    | (0b1_1111 << 11)                                     // 11..=15
+    | (1 << COERCE_S)                                      // 25
+    | (0b11 << INCREMENT_I);                               // 28,29
 
 /// Whether a boxed method is **helper-dominated** — its work is mostly
 /// JS-boundary crossings (`getproperty`/`getslot`/`callmethod`/generic helpers) the
@@ -668,8 +718,12 @@ const DM_STORE_F_KIND: u32 = 4;
 /// re-derives it from `parsed_code`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Manifest {
-    /// Number of arity-1 `h{i}` helper imports (`= helper_count`).
+    /// Number of arity-1 `h{i}` helper imports (`= helper_count`, `= max invoked index
+    /// + 1`; imports are contiguous so this covers imported-but-unused slots too).
     pub num_helpers: u32,
+    /// Bit `i` set iff helper `h{i}` is actually INVOKED (`= helper_mask`). Finer than
+    /// `num_helpers`: [`Manifest::directable`] checks it against [`SAFE_HELPER_MASK`].
+    pub helper_mask: u32,
     /// Whether the arity-2 `gp` (getproperty) import is used.
     pub has_getprop: bool,
     /// Whether the arity-2 `gs` (getslot) import is used.
@@ -753,6 +807,7 @@ impl Manifest {
     pub(crate) fn union_with(&mut self, m: &Manifest) {
         let Manifest {
             num_helpers,
+            helper_mask,
             has_getprop,
             has_getslot,
             has_ic,
@@ -778,6 +833,7 @@ impl Manifest {
             has_hasnext2,
         } = *m;
         self.num_helpers = self.num_helpers.max(num_helpers);
+        self.helper_mask |= helper_mask;
         self.has_getprop |= has_getprop;
         self.has_getslot |= has_getslot;
         self.has_ic |= has_ic;
@@ -826,22 +882,25 @@ impl Manifest {
     /// Whether a JITed method with this manifest is a **direct-call target** for the
     /// in-wasm JIT→JIT `call_indirect` path (§8 / step 4): the caller places the
     /// callee's frame at `state_ptr + STRIDE` and calls its `run` wasm→wasm, without
-    /// building an interpreter `Activation` and without touching the Rust-side
-    /// `DEPTH` frame counter.
+    /// building an interpreter `Activation`.
     ///
-    /// That is sound ONLY if the callee makes **no Rust re-entry that allocates a
-    /// nested frame or needs the callee's own `Activation`** — otherwise a re-entrant
-    /// helper would read the stale caller `DEPTH` (frame collision) or the wrong
-    /// activation. This v1 is deliberately maximal-conservative: a leaf that imports
-    /// **no helper at all** (`perr` aside — a pure `PENDING_ERROR` flag read) — pure
-    /// register arithmetic + branches + locals. It EXCLUDES `dm`/`getslot` leaves:
-    /// even their inline fast paths keep an `activation()`-reading fallback
-    /// (`dm_load8` coerces the address — `valueOf` re-entry — and reads
-    /// `domain_memory`; `get_slot` reads the activation), so they are both a re-entry
-    /// risk and activation-dependent. Widening to those (the memory-touching numeric
-    /// win that actually matters — §10 `luaV_execute`, Starling `copyTo`) needs those
-    /// hot helpers refactored **Activation-free** (domain/gc passed explicitly) —
-    /// exactly the §8 LESSON's core rewrite. Kept narrow-but-sound until then.
+    /// A direct entry does NOT establish the callee's own `Activation`, so the callee
+    /// must need none of the state one carries: **scopes** (`findprop`/`getscriptglobals`),
+    /// the **property inline cache**, **coercions** (`coerce`/`coerce_s`/`coerce_int`/a
+    /// typed `returnvalue`), **domainMemory** (`dm`), or the generic unary/binary helpers
+    /// (`h{i}`/`t{i}`) that read `activation()`. Those stay excluded.
+    ///
+    /// **Calls ARE allowed** (`has_call`/`has_call_direct` — the non-leaf case): a callee
+    /// may invoke other methods via the `cm` helper or a nested direct call.
+    /// [`emit_call_direct`] save+bump+restores the runner's `DEPTH` frame counter around
+    /// every direct `call_indirect` (the `dp` global → memory 1), so a re-entrant `run`
+    /// the callee triggers frames ABOVE it rather than aliasing its live frame; and the
+    /// site bounds-checks the callee frame so an unbounded direct-recursion chain declines
+    /// to the interpreter instead of running off the memory. The `cm`/`call_method` helper
+    /// uses the current activation only as a GC/domain **context carrier** (it resolves the
+    /// method off the receiver's vtable and builds the callee's own activation), so the
+    /// outer activation left in place by the direct entry is correct.
+    ///
     /// `getslots_all_null_safe`: every `GetSlot` in the callee is verifier-proven
     /// not-null (`VerifiedMethodInfo::null_safe_getslots`). A `GetSlot` already
     /// implies an OBJECT receiver (the verifier only emits it after resolving the
@@ -852,22 +911,53 @@ impl Manifest {
     /// null-safe. (`gs` is still IMPORTED for the defensive non-object fallback, but
     /// that arm is dead here — hence `has_getslot` is allowed under the flag.)
     pub(crate) fn directable(&self, getslots_all_null_safe: bool) -> bool {
-        self.num_helpers == 0
-            && self.num_helpers2 == 0
-            && self.set3_mask == 0
-            && !self.has_getprop
+        // `set_slot_no_coerce` (kind 1) IS allowed: it writes a slot with the GC write
+        // barrier and never re-enters AS3 (no coercion → no `valueOf`), so it needs no
+        // nested frame — it unblocks field-copy/setter methods as direct-call targets. The
+        // coercing `set_slot` (0) and `set_slot_coerce_i` (2) can re-enter, dm stores (3–4)
+        // are `has_dm`, so only bit 1 is cleared.
+        (self.set3_mask & !(1 << 1)) == 0
+            // `has_call`/`has_call_direct` (a `cm` helper call or a nested JIT→JIT direct
+            // call) ARE now allowed: [`emit_call_direct`] saves+bumps+restores the Rust-side
+            // `DEPTH` frame counter (via the `dp` global, memory 1) around every direct
+            // `call_indirect`, so a non-leaf callee's re-entrant `run`s (a `cm` → `run`, or a
+            // nested direct call's miss) frame ABOVE the callee, not aliasing its live frame;
+            // and the site bounds-checks the callee frame so an unbounded direct-recursion
+            // chain declines to the interpreter rather than running off the memory. What stays
+            // excluded is everything that needs the callee's OWN activation state (scopes,
+            // property IC, coercions, typed returns, dm) — a direct entry doesn't establish it.
+            // Arity-1 helpers: allowed iff every INVOKED helper is context-only
+            // (`SAFE_HELPER_MASK` — numeric coercions/`to_boolean`/`coerce_s`); a scope,
+            // dm, script-globals, push-string, coerce-return or exception helper needs
+            // per-method/per-activation state a direct entry doesn't establish → excluded.
+            && (self.helper_mask & !SAFE_HELPER_MASK) == 0
+            // Arity-2 compare/arithmetic helpers (`t{i}`, [`crate::helpers::HELPERS2`])
+            // are all context-only — `coerce_to_number`/`abstract_eq` etc. read the
+            // activation only as a GC/domain context and a `valueOf` re-entry is
+            // frame-safe under the direct-call `DEPTH` bump — so they're ALLOWED. (The
+            // throwing `astypelate`/`istypelate` set `h2_throws`, still excluded below.)
+            // `getproperty` (`gp`) and its inline cache (`gpi` miss) ARE now allowed: the
+            // emitter BAKES the `Gc<Multiname>` pointer at each site (`mn_list[k]`), so the
+            // helper reads no per-method `RUN_CTX.multinames` table — it needs only the
+            // activation as context (valid under a direct entry) and its IC cell is the
+            // callee's (`ic_base` threaded through the direct call). A triggered getter
+            // re-enters via `run` and is frame-safe under the DEPTH bump.
             && (!self.has_getslot || getslots_all_null_safe)
-            && !self.has_ic
+            // `getpropertyfast` (`arr[i]` — pushes runtime params onto the activation
+            // stack) and `findproperty` (`fp` — searches the SCOPE chain, which a direct
+            // entry leaves as the caller's) stay excluded.
             && !self.has_getprop_fast
             && !self.has_findprop
-            && !self.has_call
             && !self.has_callprop
             && !self.has_construct_super
             && !self.has_call_value
             && !self.has_vcall
+            // `has_coerce` (`Op::Coerce{class}`) reads the per-method resolved
+            // coerce-class table (`RunCtx::coerce_classes`), which a direct entry doesn't
+            // build → excluded. The INLINE numeric coercions (`has_coerce_int` /
+            // `has_coerce_s`) use only the context-only `coerce_i`/`coerce_u`/`coerce_s`
+            // helpers (in `SAFE_HELPER_MASK`), so they're allowed.
             && !self.has_coerce
-            && !self.has_coerce_s
-            && !self.has_coerce_int
             && !self.h2_throws
             && !self.has_hasnext2
             && !self.has_script_globals
@@ -893,6 +983,7 @@ pub(crate) fn manifest(ops: &[JitOp]) -> Manifest {
     }
     Manifest {
         num_helpers: helper_count(ops),
+        helper_mask: helper_mask(ops),
         has_getprop: has_getprop(ops),
         has_getslot: has_getslot(ops),
         has_ic: ops.iter().any(|op| matches!(op, JitOp::GetPropertyIc(..))),
@@ -996,8 +1087,11 @@ fn layout_of(m: &Manifest) -> Layout {
     // `vcall` spills its extra operands through the same `pca`, so it gates it too.
     let any_call =
         m.has_call || m.has_call_direct || m.has_callprop || m.has_construct_super || m.has_call_value || m.has_vcall;
+    // `cm` (plain call_method) is imported for plain `CallMethod` ops AND for the
+    // direct-call SENTINEL short-circuit (a known-non-directable callee calls `cm`
+    // without re-refilling — see `emit_call_direct`), so `has_call_direct` needs it too.
     let call_index = next;
-    next += m.has_call as u32;
+    next += (m.has_call || m.has_call_direct) as u32;
     let cmi_index = next;
     next += m.has_call_direct as u32;
     let callprop_index = next;
@@ -1607,7 +1701,8 @@ fn emit_getprop_ic(
     slots_ptr_off: u32,
     vtable_off: u32,
     ic_base_local: u32,
-    k: u64,
+    // The baked `Gc<Multiname>` POINTER for this site (from `mn_list[k]`), not the index.
+    mn: u64,
     site: u32,
     gpi_index: u32,
     scratch_i32: u32,
@@ -1616,7 +1711,7 @@ fn emit_getprop_ic(
     use Instruction::*;
     let mem1 = |offset: u32, align: u32| MemArg { offset: offset as u64, align, memory_index: 1 };
     let cell = site * IC_CELL_SIZE;
-    // The miss path: `gpi(receiver_bits, k, cell_addr) -> value_bits`, where
+    // The miss path: `gpi(receiver_bits, mn_ptr, cell_addr) -> value_bits`, where
     // `cell_addr = ic_base + site*IC_CELL_SIZE` is this site's cell address in
     // memory 1. Passing the absolute cell address (not the site index) lets
     // `gp_ic` refill the cell with a plain store, needing no side channel for the
@@ -1624,7 +1719,7 @@ fn emit_getprop_ic(
     // keeps the receiver on the wasm stack across the branch.
     let emit_miss = |body: &mut Function| {
         body.instruction(&LocalGet(scratch_i64)); // receiver bits
-        body.instruction(&I64Const(k as i64));
+        body.instruction(&I64Const(mn as i64));
         body.instruction(&LocalGet(ic_base_local));
         body.instruction(&I32Const(cell as i32));
         body.instruction(&I32Add); // cell_addr = ic_base + site*IC_CELL_SIZE
@@ -1667,16 +1762,40 @@ fn emit_getprop_ic(
     body.instruction(&End);
 }
 
-/// Size (bytes) of one JIT→JIT call-target inline-cache cell in memory 1:
-/// `{ cached_vtable: u32 @+0, callee_run_index: u32 @+4, callee_ic_base: u32 @+8 }`
-/// (padded to 16 for alignment). `cached_vtable == 0` (fresh) or
-/// `callee_run_index == CALL_SENTINEL` → the guard misses to the helper.
-pub(crate) const CALL_CELL_SIZE: u32 = 16;
+/// Max args a direct call may carry when the callee has **typed** params: each needs
+/// a per-arg check-word pair in the cache cell (below), so the cell — and the number
+/// of inline checks emitted — is bounded. A call with more args, or an all-untyped
+/// callee with more args, stays on the coercing helper.
+pub(crate) const MAX_DIRECT_ARGC: u32 = 8;
+
+/// Size (bytes) of one JIT→JIT call-target inline-cache cell in memory 1. The 16-byte
+/// header `{ cached_vtable: u32 @+0, callee_run_index: u32 @+4, callee_ic_base: u32
+/// @+8, member_idx: u32 @+12 }` is followed by [`MAX_DIRECT_ARGC`] **arg check-word
+/// pairs** `{ mask_and_want: u64, expected: u64 }` (16 bytes each, at `@+16 + i*16`),
+/// written by `refill_call_cell` from the callee's param types. The HIT path checks each
+/// provided arg: a primitive/untyped param with `((arg & (mask_and_want & !1)) ==
+/// expected) == (mask_and_want & 1)`, or — when `mask_and_want == CALL_CLASS_MARK` — a
+/// concrete-class param with `arg == null || obj.instance_class == expected`. Both are the
+/// runtime form of `Value::coerces_identically_to`, so an uncoerced direct pass is
+/// bit-identical to the interpreter; a mismatch misses to the coercing helper.
+/// `cached_vtable == 0` (fresh) or `callee_run_index == CALL_SENTINEL` → helper.
+pub(crate) const CALL_CELL_SIZE: u32 = 16 + MAX_DIRECT_ARGC * 16;
 
 /// `callee_run_index` value meaning "observed but NOT a direct-call target" (the
 /// callee isn't a compiled directable leaf) — the guard's vtable may match but this
 /// forces the helper path, without re-resolving directability every call.
 pub(crate) const CALL_SENTINEL: u32 = 0xFFFF_FFFF;
+
+/// Value of an arg check-word's `mask_and_want` marking an **exact-class** param (rather
+/// than a uniform tag check): the `expected` word then holds the class's `Gc` pointer and
+/// the HIT guard checks `arg == null || obj.instance_class == expected`. `2` can't be a
+/// real `mask_and_want` (tag masks only set the top 16 bits, the uint sign bit, and the
+/// want bit 0 — never bit 1), so it's an unambiguous discriminator.
+pub(crate) const CALL_CLASS_MARK: u64 = 2;
+
+/// Bit pattern of `Value::Null` (`BOX_MARK | (TAG_NULL=1 << 48)`, must match
+/// `core::avm2::value`). A `null` arg coerces identically to any class param.
+const NULL_BITS: u64 = 0xFFF9_0000_0000_0000;
 
 /// `member_idx` cell value (`@+12`) meaning the target is a STANDALONE method (its
 /// own 6-param `run` in the shared table). Any other value = the amalgam-member index
@@ -1701,6 +1820,7 @@ fn emit_call_direct(
     argc: u32,
     disp_id: u32,
     vtable_off: u32,
+    instance_class_off: u32,
     cell_base_local: u32,
     cell_offset: u32,
     state_ptr_local: u32,
@@ -1709,11 +1829,13 @@ fn emit_call_direct(
     run_type_index: u32,
     dispatch_type_index: u32,
     miss_index: u32,
+    cm_index: u32,
     pca_index: u32,
     scratch_sp: u32,
     scratch_ptr: u32,
     scratch_bits: u32,
     stride: u32,
+    mem_bytes: u32,
     push: bool,
 ) {
     use Instruction::*;
@@ -1740,8 +1862,9 @@ fn emit_call_direct(
     }
 
     // Miss: reconstruct the generic call. Spill args top-first (arg{argc-1}…arg0) via
-    // `pca`, reading them back out of the callee frame, then `cm(receiver, disp, argc)`.
-    let emit_miss = |body: &mut Function| {
+    // `pca`, reading them back out of the callee frame, then leave `receiver, disp,
+    // argc` on the stack for the call — shared by both miss tails below.
+    let emit_spill = |body: &mut Function| {
         for i in (1..=argc).rev() {
             body.instruction(&LocalGet(scratch_sp));
             body.instruction(&I64Load(frame(i * 8, 3)));
@@ -1750,10 +1873,24 @@ fn emit_call_direct(
         body.instruction(&LocalGet(scratch_bits)); // receiver bits
         body.instruction(&I64Const(disp_id as i64));
         body.instruction(&I64Const(argc as i64));
+    };
+    // REFILL miss (fresh cell / vtable changed): `cmi(receiver, disp, argc, cell_addr)`
+    // — does the generic call AND (re)resolves + refills this site's cell, so a later
+    // same-class call can take the HIT (or the plain-`cm` short-circuit).
+    let emit_miss_refill = |body: &mut Function| {
+        emit_spill(body);
         body.instruction(&LocalGet(cell_base_local));
         body.instruction(&I32Const(cell as i32));
         body.instruction(&I32Add); // cell_addr for the refill
         body.instruction(&Call(miss_index));
+    };
+    // SENTINEL miss (cell says this class's callee is NOT directable): plain
+    // `cm(receiver, disp, argc)` — the generic call WITHOUT re-running the refill
+    // (which would just re-record the same sentinel every call — the measured
+    // `call_method_ic` thrash). The vtable already matched, so this stays monomorphic.
+    let emit_miss_plain = |body: &mut Function| {
+        emit_spill(body);
+        body.instruction(&Call(cm_index));
     };
 
     // Guard: object receiver? (nested so the vtable load never runs on a non-object)
@@ -1766,19 +1903,117 @@ fn emit_call_direct(
     body.instruction(&LocalGet(scratch_bits));
     body.instruction(&I32WrapI64);
     body.instruction(&LocalSet(scratch_ptr)); // obj ptr (memory 1)
-    // obj.vtable == cell.vtable ?
+    // obj.vtable == cell.vtable ? (monomorphic — the cached class still matches)
     body.instruction(&LocalGet(scratch_ptr));
     body.instruction(&I32Load(mem1(vtable_off, 2)));
     body.instruction(&LocalGet(cell_base_local));
     body.instruction(&I32Load(mem1(cell, 2)));
     body.instruction(&I32Eq);
-    // AND cell.run_index != CALL_SENTINEL (callee is a directable target)
+    body.instruction(&If(BlockType::Result(ValType::I64)));
+    // cell.run_index != CALL_SENTINEL (callee is a directable target) → HIT; else the
+    // callee for this (matched) class is known non-directable → plain `cm`, NO refill.
     body.instruction(&LocalGet(cell_base_local));
     body.instruction(&I32Load(mem1(cell + 4, 2)));
     body.instruction(&I32Const(CALL_SENTINEL as i32));
     body.instruction(&I32Ne);
-    body.instruction(&I32And);
     body.instruction(&If(BlockType::Result(ValType::I64)));
+    // Arg type guard: a direct call writes the caller's args UNCOERCED, sound only when
+    // each already matches its param type (`Value::coerces_identically_to`). Check each
+    // provided arg against its per-arg cell check-word pair (`{mask_and_want, expected}`
+    // at `@+16 + i*16`): `match_i = ((arg & (m & !1)) == expected) == (m & 1)`. AND them;
+    // all match → HIT (uncoerced write is bit-identical to the interpreter), any mismatch
+    // → the coercing `cm` (the cell stays, so a later matching-typed call HITs again).
+    // An all-untyped callee wrote ANY words (mask 0, want 1) → every check is vacuously
+    // true. A site with more args than the cell can hold is never a directable target
+    // (see `direct_target`), so force a miss rather than read past the cell.
+    if argc > MAX_DIRECT_ARGC {
+        body.instruction(&I32Const(0));
+    } else {
+        for i in 0..argc {
+            let e = cell + 16 + i * 16; // arg i's {mask_and_want, expected} pair
+            let arg = |body: &mut Function| {
+                body.instruction(&LocalGet(scratch_sp));
+                body.instruction(&I64Load(frame((i + 1) * 8, 3))); // arg i (slot 0 = receiver)
+            };
+            // Selector: an exact-class param (`mask_and_want == CALL_CLASS_MARK`) needs an
+            // object-model check; any other word is a uniform tag check.
+            body.instruction(&LocalGet(cell_base_local));
+            body.instruction(&I64Load(mem1(e, 3)));
+            body.instruction(&I64Const(CALL_CLASS_MARK as i64));
+            body.instruction(&I64Eq);
+            body.instruction(&If(BlockType::Result(ValType::I32)));
+            // CLASS check: `arg == null` OR (arg is object AND `obj.instance_class` ==
+            // the cached class pointer) — the runtime form of `coerces_identically_to`.
+            arg(body);
+            body.instruction(&I64Const(48));
+            body.instruction(&I64ShrU);
+            body.instruction(&I64Const(VALUE_OBJECT_TAG16));
+            body.instruction(&I64Eq); // object?
+            body.instruction(&If(BlockType::Result(ValType::I32)));
+            arg(body);
+            body.instruction(&I32WrapI64); // obj ptr (memory 1)
+            body.instruction(&I32Load(mem1(instance_class_off, 2))); // obj.instance_class
+            body.instruction(&LocalGet(cell_base_local));
+            body.instruction(&I32Load(mem1(e + 8, 2))); // cached class ptr (low word of expected)
+            body.instruction(&I32Eq);
+            body.instruction(&Else);
+            arg(body);
+            body.instruction(&I64Const(NULL_BITS as i64));
+            body.instruction(&I64Eq); // non-object: only null matches a class param
+            body.instruction(&End);
+            body.instruction(&Else);
+            // TAG check: `((arg & (mask & !1)) == expected) == (mask & 1)`.
+            arg(body);
+            body.instruction(&LocalGet(cell_base_local));
+            body.instruction(&I64Load(mem1(e, 3))); // mask_and_want
+            body.instruction(&I64Const(!1i64)); // clear the want bit → mask
+            body.instruction(&I64And);
+            body.instruction(&I64And); // arg & mask
+            body.instruction(&LocalGet(cell_base_local));
+            body.instruction(&I64Load(mem1(e + 8, 3))); // expected
+            body.instruction(&I64Eq); // (arg & mask) == expected → i32 0/1
+            body.instruction(&LocalGet(cell_base_local));
+            body.instruction(&I64Load(mem1(e, 3)));
+            body.instruction(&I64Const(1));
+            body.instruction(&I64And);
+            body.instruction(&I32WrapI64); // want → i32
+            body.instruction(&I32Eq); // (eq == want)
+            body.instruction(&End); // close class-vs-tag selector
+            if i > 0 {
+                body.instruction(&I32And); // fold into running all_match
+            }
+        }
+        if argc == 0 {
+            body.instruction(&I32Const(1)); // no args → vacuously match
+        }
+    }
+    // In-bounds guard, AND-ed into the HIT condition: a NON-LEAF callee can chain
+    // direct frames without the runner's per-`run` depth-decline check, so the callee
+    // frame `[callee_sp, callee_sp + stride)` must lie within the committed frame
+    // memory. Over → fall to the plain `cm` (miss), which re-enters `run` and declines
+    // to the interpreter (bounded). Leaf callees always pass (one frame within the
+    // guard band), so this only ever fires on deep non-leaf/direct recursion.
+    body.instruction(&LocalGet(scratch_sp));
+    body.instruction(&I32Const(stride as i32));
+    body.instruction(&I32Add);
+    body.instruction(&I32Const(mem_bytes as i32));
+    body.instruction(&I32LeU);
+    body.instruction(&I32And); // all_match & in_bounds
+    body.instruction(&If(BlockType::Result(ValType::I64)));
+    // Save + bump `DEPTH` (memory 1 @ `dp`) around the call. The callee runs at
+    // `callee_sp = state_ptr + stride`; setting `DEPTH = DEPTH + 1` makes it equal the
+    // callee's own frame depth, so any re-entrant `run` the callee triggers (a `cm`
+    // helper call, or a nested direct call's miss) frames ABOVE the callee rather than
+    // aliasing its live frame. `scratch_ptr` (free past the vtable guard) holds the old
+    // value; the restore after the call rebalances it (no drift, even under recursion).
+    body.instruction(&GlobalGet(DEPTH_PTR_GLOBAL));
+    body.instruction(&I32Load(mem1(0, 2)));
+    body.instruction(&LocalSet(scratch_ptr)); // saved DEPTH
+    body.instruction(&GlobalGet(DEPTH_PTR_GLOBAL));
+    body.instruction(&LocalGet(scratch_ptr));
+    body.instruction(&I32Const(1));
+    body.instruction(&I32Add);
+    body.instruction(&I32Store(mem1(0, 2))); // DEPTH = saved + 1
     // HIT: invoke the callee's compiled `run`. `regs_ptr`/`regs_len` = 0 → its prologue
     // copies nothing; its args are the frame slots we just wrote. `member_idx` (@+12)
     // selects the entry shape: `CALL_NO_MEMBER` → a STANDALONE method's own 6-param
@@ -1789,38 +2024,53 @@ fn emit_call_direct(
     body.instruction(&I32Const(CALL_NO_MEMBER as i32));
     body.instruction(&I32Eq);
     body.instruction(&If(BlockType::Result(ValType::I64)));
-    // Standalone: run(callee_sp, dm_base, dm_len, 0, 0, ic_base).
+    // Standalone: run(callee_sp, dm_base, dm_len, regs_ptr=0, regs_len=(argc+1)*8, ic_base).
+    // `regs_ptr = 0` tells the callee prologue this is a DIRECT call; `regs_len` = the
+    // bytes we pre-wrote (this + argc args), from which the prologue zeroes any locals
+    // beyond them to `undefined`.
     body.instruction(&LocalGet(scratch_sp));
     body.instruction(&LocalGet(dm_base_local));
     body.instruction(&LocalGet(dm_len_local));
-    body.instruction(&I32Const(0));
-    body.instruction(&I32Const(0));
+    body.instruction(&I32Const(0)); // regs_ptr = 0 (direct-call marker)
+    body.instruction(&I32Const(((argc + 1) * 8) as i32)); // regs_len = pre-written bytes
     body.instruction(&LocalGet(cell_base_local));
     body.instruction(&I32Load(mem1(cell + 8, 2))); // callee ic_base
     body.instruction(&LocalGet(cell_base_local));
     body.instruction(&I32Load(mem1(cell + 4, 2))); // run slot
     body.instruction(&CallIndirect { type_index: run_type_index, table_index: 0 });
     body.instruction(&Else);
-    // Generation member: dispatch(member_idx, callee_sp, dm_base, dm_len, 0, 0, ic_base).
+    // Generation member: dispatch(member_idx, callee_sp, dm_base, dm_len, regs_ptr=0,
+    // regs_len=(argc+1)*8, ic_base) — same direct-call prologue signal as standalone.
     body.instruction(&LocalGet(cell_base_local));
     body.instruction(&I32Load(mem1(cell + 12, 2))); // member_idx
     body.instruction(&LocalGet(scratch_sp));
     body.instruction(&LocalGet(dm_base_local));
     body.instruction(&LocalGet(dm_len_local));
-    body.instruction(&I32Const(0));
-    body.instruction(&I32Const(0));
+    body.instruction(&I32Const(0)); // regs_ptr = 0 (direct-call marker)
+    body.instruction(&I32Const(((argc + 1) * 8) as i32)); // regs_len = pre-written bytes
     body.instruction(&LocalGet(cell_base_local));
     body.instruction(&I32Load(mem1(cell + 8, 2))); // callee ic_base
     body.instruction(&LocalGet(cell_base_local));
     body.instruction(&I32Load(mem1(cell + 4, 2))); // dispatcher slot
     body.instruction(&CallIndirect { type_index: dispatch_type_index, table_index: 0 });
-    body.instruction(&End);
+    body.instruction(&End); // close: standalone vs generation
+    // Restore `DEPTH` to the caller's value (the call result i64 stays on the stack —
+    // the store consumes only its own address/value operands).
+    body.instruction(&GlobalGet(DEPTH_PTR_GLOBAL));
+    body.instruction(&LocalGet(scratch_ptr));
+    body.instruction(&I32Store(mem1(0, 2))); // DEPTH = saved
     body.instruction(&Else);
-    emit_miss(body); // vtable/sentinel miss
-    body.instruction(&End);
+    emit_miss_plain(body); // arg type mismatch → coercing cm, cell kept for next call
+    body.instruction(&End); // close: args match
     body.instruction(&Else);
-    emit_miss(body); // non-object receiver
-    body.instruction(&End);
+    emit_miss_plain(body); // vtable matched but SENTINEL → plain cm, NO refill
+    body.instruction(&End); // close: run_index != SENTINEL
+    body.instruction(&Else);
+    emit_miss_refill(body); // vtable mismatch (fresh / megamorphic) → cmi (call + refill)
+    body.instruction(&End); // close: vtable match
+    body.instruction(&Else);
+    emit_miss_refill(body); // non-object receiver → cmi
+    body.instruction(&End); // close: object receiver
 
     if !push {
         body.instruction(&Drop);
@@ -1838,6 +2088,8 @@ fn emit_linear(
     // the shared per-method buffer (`= num_ic_sites * IC_CELL_SIZE`). Only read by
     // `CallMethodDirect`.
     call_region_offset: u32,
+    // Resolved multiname pointers, indexed by an mn-bearing op's `k` (see `compile_full`).
+    mn_list: &[*const ()],
 ) -> Option<()> {
     match op {
         JitOp::GetLocal(i) => {
@@ -2469,9 +2721,15 @@ fn emit_linear(
             if *depth < 1 {
                 return None;
             }
-            // Stack: [.., receiver]. Push the multiname index and call the arity-2
-            // `gp` helper: pops (receiver, k), pushes the result — net depth 0.
-            body.instruction(&Instruction::I64Const(k as i64));
+            // Stack: [.., receiver]. Push the multiname POINTER (baked from `mn_list[k]`,
+            // not the index) and call the arity-2 `gp` helper: pops (receiver, mn), pushes
+            // the result — net depth 0. Baking the pointer frees `gp` from reading the
+            // per-method `RUN_CTX.multinames` table, so a `getproperty` method can be a
+            // direct-call target (a direct entry doesn't build that table). `?` declines
+            // (→ interpreter) if `mn_list` lacks the entry — never happens for a real
+            // method (its table is complete); guards the convenience wrappers.
+            let mn = *mn_list.get(k as usize)?;
+            body.instruction(&Instruction::I64Const(mn as usize as i64));
             body.instruction(&Instruction::Call(lay.gp_index));
         }
         JitOp::GetPropertyIc(k, site) => {
@@ -2479,17 +2737,19 @@ fn emit_linear(
                 return None;
             }
             // Inline monomorphic cache: guard the receiver's vtable, load the
-            // cached slot on a hit, else `gpi(receiver, k, site)`. Net depth 0.
+            // cached slot on a hit, else `gpi(receiver, mn, site)`. Net depth 0.
             // The layout is present whenever translate emits this op; `?` is a
-            // belt-and-braces bail (an emitter bug, not a semantic path).
+            // belt-and-braces bail (an emitter bug, not a semantic path). The miss
+            // passes the baked multiname POINTER (see `GetProperty`).
             let (ptr_off, _len_off) = slot_layout()?;
             let vtable_off = vtable_offset()?;
+            let mn = *mn_list.get(k as usize)?;
             emit_getprop_ic(
                 body,
                 ptr_off,
                 vtable_off,
                 IC_BASE,
-                k as u64,
+                mn as usize as u64,
                 site,
                 lay.gpi_index,
                 SCRATCH,
@@ -2893,19 +3153,22 @@ fn emit_linear(
             // Stack: [.., receiver, arg0, .., arg{argc-1}]. `emit_call_direct` consumes
             // them (writes them into the callee frame), guards the receiver's vtable,
             // and either `call_indirect`s the callee's `run` (hit) or `cmi(receiver,
-            // disp, argc, cell_addr)` (miss, which also refills the cell). The hit path
-            // can't throw (a directable callee is a pure/null-safe leaf); the miss can,
-            // so a `perr` bail follows (a no-op on the non-throwing hit).
+            // disp, argc, cell_addr)` (miss, which also refills the cell). A non-leaf
+            // callee reached on the hit path can throw — its own `cm` stashes the error in
+            // `PENDING_ERROR`/`PENDING_FLAG` and it bails — so the `perr` bail after the
+            // call propagates it out of the caller too (a no-op when nothing threw).
             if *depth < argc as i32 + 1 {
                 return None;
             }
             let vtable_off = vtable_offset()?;
+            let instance_class_off = instance_class_offset()?;
             let cell_offset = call_region_offset + site * CALL_CELL_SIZE;
             emit_call_direct(
                 body,
                 argc,
                 disp_id,
                 vtable_off,
+                instance_class_off,
                 IC_BASE,
                 cell_offset,
                 STATE_PTR,
@@ -2914,11 +3177,13 @@ fn emit_linear(
                 /*run_type_index*/ 0,
                 /*dispatch_type_index*/ 6,
                 lay.cmi_index,
+                lay.call_index,
                 lay.pca_index,
                 SCRATCH,
                 SCRATCH2,
                 SCRATCH64,
                 FRAME_STRIDE,
+                FRAME_MEM_BYTES,
                 push,
             );
             if lay.inline_perr {
@@ -3388,13 +3653,13 @@ pub struct ExcRange {
 }
 
 pub fn compile(ops: &[JitOp]) -> Option<Vec<u8>> {
-    compile_full(ops, &[], &[], &[])
+    compile_full(ops, &[], &[], &[], &[])
 }
 
 /// Switch-aware [`compile`]: `switches` supplies the targets for each
 /// [`JitOp::LookupSwitch`] op (see [`SwitchTable`]).
 pub fn compile_with_switches(ops: &[JitOp], switches: &[SwitchTable]) -> Option<Vec<u8>> {
-    compile_full(ops, switches, &[], &[])
+    compile_full(ops, switches, &[], &[], &[])
 }
 
 /// Full [`compile`]: also takes the method's exception handlers. A throw inside a
@@ -3406,6 +3671,11 @@ pub fn compile_full(
     switches: &[SwitchTable],
     exceptions: &[ExcRange],
     numeric_seed: &[bool],
+    // Resolved `Gc<Multiname>` pointers, one per mn-bearing op in op order (see
+    // `multiname_table`). `getproperty`/IC bake `mn_list[k]` as an immediate so the
+    // helper needs no per-method `RUN_CTX.multinames` table (making it directable).
+    // Empty on the switch/int-path convenience wrappers (which never emit `getproperty`).
+    mn_list: &[*const ()],
 ) -> Option<Vec<u8>> {
     if ops.is_empty() {
         return None;
@@ -3415,7 +3685,7 @@ pub fn compile_full(
     // With handlers, throwable ops dispatch (in the compile loop) rather than emit
     // their own inline `perr` return — so suppress the call arms' inline bail.
     lay.inline_perr = exceptions.is_empty();
-    let body = emit_body(ops, switches, exceptions, &lay, numeric_seed)?;
+    let body = emit_body(ops, switches, exceptions, &lay, numeric_seed, mn_list)?;
 
     // Assemble module.
     let mut module = Module::new();
@@ -3445,6 +3715,8 @@ pub struct GenMember<'a> {
     pub name: &'a str,
     /// Per-local "is numeric on entry" (param types) — seeds check-elision.
     pub numeric_seed: &'a [bool],
+    /// This member's resolved multiname pointers (see [`compile_full`]'s `mn_list`).
+    pub mn_list: &'a [*const ()],
 }
 
 /// Compiles MANY methods into ONE module (an "amalgam" generation): every member
@@ -3484,6 +3756,7 @@ pub fn compile_generation(members: &[GenMember<'_>]) -> Option<(Vec<u8>, Manifes
             mem.exceptions,
             &member_lay,
             mem.numeric_seed,
+            mem.mn_list,
         )?);
     }
     // The dispatcher: push the six `run` args (incl. `ic_base`), then the method
@@ -3525,6 +3798,16 @@ pub fn compile_generation(members: &[GenMember<'_>]) -> Option<(Vec<u8>, Manifes
     // Members occupy function indices `run_index..run_index + n` (after the
     // imports); the dispatcher follows them.
     exports.export("run", ExportKind::Func, lay.run_index + n);
+    // Also export each member directly as `m{i}`, so `install_generation` can pull a
+    // member's funcref into its OWN permanent shared-table slot — then BOTH a direct call
+    // (`emit_call_direct`) AND the normal `run` dispatch reach the member's 6-param `run`
+    // straight, with no dispatcher `call_indirect` + member-index branch. Each member `run`
+    // is regs-prologue-shaped exactly like a standalone module's, so a direct call
+    // (regs_len = 0, args pre-written to the frame) works identically. The runner slots
+    // members budget-permitting (directable first); the rest fall back to the dispatcher.
+    for i in 0..n {
+        exports.export(&format!("m{i}"), ExportKind::Func, lay.run_index + i);
+    }
     module.section(&exports);
     let mut elements = ElementSection::new();
     let member_funcs: Vec<u32> = (lay.run_index..lay.run_index + n).collect();
@@ -3640,8 +3923,9 @@ fn emit_imports(m: &Manifest) -> ImportSection {
     }
     // Then (if the method calls) the call imports: `cm` (call_method, type 3),
     // `pca` (push_call_arg, type 4). `perr` (pending_error, type 5) follows and is
-    // also needed by `has_dm` methods (dm ops throw #1506 out of band).
-    if m.has_call {
+    // also needed by `has_dm` methods (dm ops throw #1506 out of band). `has_call_direct`
+    // imports it too, for the SENTINEL short-circuit (see the `call_index` note).
+    if m.has_call || m.has_call_direct {
         imports.import("env", "cm", EntityType::Function(3));
     }
     // `cmi` (direct-call miss + refill) is `(receiver, disp, argc, cell_addr) -> value`
@@ -3729,9 +4013,31 @@ fn emit_imports(m: &Manifest) -> ImportSection {
                 shared: false,
             }),
         );
+        // `dp` (global 0): the memory-1 byte address of the runner's `DEPTH` frame
+        // counter (`&raw mut runner::web::DEPTH`). A direct call to a NON-LEAF callee
+        // must bump `DEPTH` around the `call_indirect` so the callee's own re-entrant
+        // helper calls (`cm` → `run`) place their frames ABOVE the callee's, not
+        // aliasing it (see `emit_call_direct`). `emit_call_direct` reads/writes `DEPTH`
+        // inline via memory 1 at this address — no Rust round-trip on the hot path.
+        // Imported iff a direct call is emitted (same gate as the table above); the web
+        // runner binds it in `instantiate`, native prod never sets `has_call_direct`.
+        imports.import(
+            "env",
+            "dp",
+            EntityType::Global(GlobalType {
+                val_type: ValType::I32,
+                mutable: false,
+                shared: false,
+            }),
+        );
     }
     imports
 }
+
+/// The imported-global index of `dp` (the `DEPTH` cell address). Only global in the
+/// module, so index 0 (globals are a separate index space from functions/memories, so
+/// adding it perturbs no function/`run` index). Valid only when `has_call_direct`.
+const DEPTH_PTR_GLOBAL: u32 = 0;
 
 /// The table index of a generation module's LOCAL member table: `1` when the shared
 /// `__indirect_function_table` is imported (some member makes a direct call, so it is
@@ -3755,6 +4061,8 @@ fn emit_body(
     // repr analysis so a `:Number`/`:int`/`:uint` parameter is `Numeric` at block
     // 0. Empty → all `Boxed` (numeric-ness then only flows from in-method producers).
     numeric_seed: &[bool],
+    // Resolved multiname pointers baked at `getproperty`/IC sites (see `compile_full`).
+    mn_list: &[*const ()],
 ) -> Option<Function> {
     let has_handlers = !exceptions.is_empty();
     // Shared cache buffer layout: `[property-IC cells | call-cache cells]`. The call
@@ -3823,10 +4131,46 @@ fn emit_body(
     // per-call JS `Uint8Array.set` copy. Native (wasmi) writes the frame memory
     // directly, so it emits no prologue and imports memory 1 only for dm ops.
     if cfg!(target_arch = "wasm32") {
+        // `regs_ptr != 0` — NORMAL entry: copy the whole register snapshot (`num_locals`
+        // slots) from Ruffle's memory (memory 1) into this frame (memory 0).
+        // `regs_ptr == 0` — a JIT→JIT DIRECT call: the caller pre-wrote `regs_len / 8`
+        // slots (this + args) straight into the frame and the rest of the locals
+        // (`regs_len/8 .. num_locals`) are stale scratch, so set them to `undefined` —
+        // exactly what `init_from_method` does for locals beyond the arguments. This is
+        // what lets a callee with extra locals be a direct-call target. `regs_ptr` is a
+        // real heap address on the normal path, so it's never 0 there.
+        let num_locals_bytes = (numeric_seed.len() as u32) * 8;
+        body.instruction(&Instruction::LocalGet(REGS_PTR));
+        body.instruction(&Instruction::If(BlockType::Empty));
         body.instruction(&Instruction::LocalGet(STATE_PTR)); // dst (memory 0)
         body.instruction(&Instruction::LocalGet(REGS_PTR)); // src (memory 1)
         body.instruction(&Instruction::LocalGet(REGS_LEN)); // bytes
         body.instruction(&Instruction::MemoryCopy { src_mem: 1, dst_mem: 0 });
+        body.instruction(&Instruction::Else);
+        // ptr = state_ptr + regs_len (first stale local); end = state_ptr + num_locals*8.
+        body.instruction(&Instruction::LocalGet(STATE_PTR));
+        body.instruction(&Instruction::LocalGet(REGS_LEN));
+        body.instruction(&Instruction::I32Add);
+        body.instruction(&Instruction::LocalSet(SCRATCH));
+        body.instruction(&Instruction::Block(BlockType::Empty));
+        body.instruction(&Instruction::Loop(BlockType::Empty));
+        body.instruction(&Instruction::LocalGet(SCRATCH));
+        body.instruction(&Instruction::LocalGet(STATE_PTR));
+        body.instruction(&Instruction::I32Const(num_locals_bytes as i32));
+        body.instruction(&Instruction::I32Add);
+        body.instruction(&Instruction::I32GeU);
+        body.instruction(&Instruction::BrIf(1)); // ptr >= end → break the block
+        body.instruction(&Instruction::LocalGet(SCRATCH));
+        body.instruction(&Instruction::I64Const(UNDEFINED_BITS as i64));
+        body.instruction(&Instruction::I64Store(MemArg { offset: 0, align: 3, memory_index: 0 }));
+        body.instruction(&Instruction::LocalGet(SCRATCH));
+        body.instruction(&Instruction::I32Const(8));
+        body.instruction(&Instruction::I32Add);
+        body.instruction(&Instruction::LocalSet(SCRATCH));
+        body.instruction(&Instruction::Br(0)); // continue loop
+        body.instruction(&Instruction::End); // loop
+        body.instruction(&Instruction::End); // block
+        body.instruction(&Instruction::End); // if
     }
 
     // Whether the boxed path is in use (its operand stack is i64, so live values can
@@ -4197,7 +4541,7 @@ fn emit_body(
                     }
                     depth -= 1;
                 }
-                other => emit_linear(&mut body, other, &mut depth, &lay, call_region_offset)?,
+                other => emit_linear(&mut body, other, &mut depth, &lay, call_region_offset, mn_list)?,
             }
 
             // Phase-2: keep `phys` aligned with the authoritative `depth` after the
@@ -4297,10 +4641,10 @@ mod tests {
         let m3 = [JitOp::VCall(vc::NEW_FUNCTION, 0, 0, true), JitOp::ReturnValueBoxed];
         let m4 = [JitOp::GetLocalValue(1), JitOp::CoerceInt(false), JitOp::ReturnValueBoxed];
         let members = [
-            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
-            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
-            GenMember { ops: &m3, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
-            GenMember { ops: &m4, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
+            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[] },
+            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[] },
+            GenMember { ops: &m3, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[] },
+            GenMember { ops: &m4, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[] },
         ];
         let (bytes, _union) = compile_generation(&members).expect("generation compiles");
         let engine = Engine::default();
@@ -5441,7 +5785,7 @@ mod tests {
         // Handlers present ⇒ imports h0..=h22 (dispatch/new_catch/pop_caught).
         assert_eq!(manifest(&ops).num_helpers, POP_CAUGHT + 1);
 
-        let bytes = compile_full(&ops, &[], &exceptions, &[]).expect("compiles");
+        let bytes = compile_full(&ops, &[], &exceptions, &[], &[]).expect("compiles");
         let engine = Engine::default();
         let module = Module::new(&engine, &bytes).expect("valid wasm");
         let mut store = Store::new(&engine, ());
@@ -5484,7 +5828,7 @@ mod tests {
         let exceptions = [ExcRange { from: 1, to: 2, target: 3 }];
         assert_eq!(manifest(&ops).num_helpers, POP_CAUGHT + 1); // h0..=h22
 
-        let bytes = compile_full(&ops, &[], &exceptions, &[]).expect("compiles");
+        let bytes = compile_full(&ops, &[], &exceptions, &[], &[]).expect("compiles");
         let go = |err: i32| -> u64 {
             let engine = Engine::default();
             let module = Module::new(&engine, &bytes).expect("valid wasm");
@@ -6085,10 +6429,11 @@ mod tests {
             CodeSection, ConstExpr as CE, ElementSection, Elements, EntityType, ExportKind,
             ExportSection, Function as EncFn, FunctionSection, ImportSection, Instruction as Ins,
             MemoryType as EncMem, Module as EncModule, RefType as ERef, TableSection,
-            TableType as ETable, TypeSection, ValType as VT,
+            TableType as ETable, TypeSection, ValType as VT, GlobalType as EGlobal,
         };
         use wasmi::{
-            Caller, Config, Engine, Func, Instance, Memory, MemoryType as WMemoryType, Module, Store,
+            Caller, Config, Engine, Func, Global, Instance, Memory, MemoryType as WMemoryType,
+            Module, Mutability, Store, Val as WVal,
         };
 
         const VTABLE_OFF: u32 = 16;
@@ -6106,22 +6451,26 @@ mod tests {
         types.ty().function([VT::I64, VT::I64, VT::I64, VT::I32], [VT::I64]); // 2: cmi(recv,disp,argc,cell_addr)
         types.ty().function([VT::I64], []); // 3: pca
         types.ty().function([VT::I32; 7], [VT::I64]); // 4: dispatcher (validates the dead member branch)
+        types.ty().function([VT::I64, VT::I64, VT::I64], [VT::I64]); // 5: cm(recv,disp,argc)
         let mut imports = ImportSection::new();
-        imports.import("env", "cm", EntityType::Function(2)); // func 0
-        imports.import("env", "pca", EntityType::Function(3)); // func 1
+        imports.import("env", "cmi", EntityType::Function(2)); // func 0 (miss/refill)
+        imports.import("env", "cm", EntityType::Function(5)); // func 1 (sentinel → plain, no refill)
+        imports.import("env", "pca", EntityType::Function(3)); // func 2
         let mem = || EncMem { minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None };
         imports.import("env", "mem0", EntityType::Memory(mem())); // memory 0 (frame)
         imports.import("env", "mem1", EntityType::Memory(mem())); // memory 1 (heap)
+        // `dp` (global 0): DEPTH-cell address for the direct-call frame bump.
+        imports.import("env", "dp", EntityType::Global(EGlobal { val_type: VT::I32, mutable: false, shared: false }));
         let mut functions = FunctionSection::new();
-        functions.function(0); // callee = func 2
-        functions.function(1); // caller = func 3
+        functions.function(0); // callee = func 3
+        functions.function(1); // caller = func 4
         // Table 0: one funcref slot holding the callee (table index 0).
         let mut tables = TableSection::new();
         tables.table(ETable { element_type: ERef::FUNCREF, table64: false, minimum: 1, maximum: Some(1), shared: false });
         let mut exports = ExportSection::new();
-        exports.export("run", ExportKind::Func, 3);
+        exports.export("run", ExportKind::Func, 4);
         let mut elements = ElementSection::new();
-        elements.active(Some(0), &CE::i32_const(0), Elements::Functions([2u32][..].into()));
+        elements.active(Some(0), &CE::i32_const(0), Elements::Functions([3u32][..].into()));
         // Callee: `return i64.load(memory0, state_ptr + 0)` — the receiver we wrote.
         let mut callee = EncFn::new([]);
         callee.instruction(&Ins::LocalGet(0)); // state_ptr
@@ -6132,10 +6481,11 @@ mod tests {
         let mut caller = EncFn::new([(2, VT::I32), (1, VT::I64)]);
         caller.instruction(&Ins::LocalGet(0)); // receiver on stack
         emit_call_direct(
-            &mut caller, /*argc*/ 0, DISP, VTABLE_OFF, /*cell_base_local*/ 2, /*cell_offset*/ 0,
+            &mut caller, /*argc*/ 0, DISP, VTABLE_OFF, /*instance_class_off*/ VTABLE_OFF,
+            /*cell_base_local*/ 2, /*cell_offset*/ 0,
             /*state_ptr_local*/ 1, /*dm_base*/ 3, /*dm_len*/ 4, /*run_type*/ 0,
-            /*dispatch_type*/ 4, /*cmi*/ 0, /*pca*/ 1, /*sp*/ 5, /*ptr*/ 6, /*bits*/ 7, STRIDE_T,
-            /*push*/ true,
+            /*dispatch_type*/ 4, /*cmi*/ 0, /*cm*/ 1, /*pca*/ 2, /*sp*/ 5, /*ptr*/ 6, /*bits*/ 7,
+            STRIDE_T, /*mem_bytes*/ 65536, /*push*/ true,
         );
         caller.instruction(&Ins::End);
         let mut code = CodeSection::new();
@@ -6158,12 +6508,22 @@ mod tests {
         let mut store = Store::new(&engine, Vec::<(i64, i64, i64)>::new());
         let mem0 = Memory::new(&mut store, WMemoryType::new(1, None).unwrap()).unwrap();
         let mem1 = Memory::new(&mut store, WMemoryType::new(1, None).unwrap()).unwrap();
-        let cm = Func::wrap(&mut store, |mut c: Caller<'_, Vec<(i64, i64, i64)>>, r: i64, d: i64, a: i64, _cell: i32| -> i64 {
+        // `cmi` (miss/refill) and `cm` (sentinel/plain) both record the generic call so
+        // the assertions can tell each miss variant fired; the cell_addr arg is ignored.
+        let cmi = Func::wrap(&mut store, |mut c: Caller<'_, Vec<(i64, i64, i64)>>, r: i64, d: i64, a: i64, _cell: i32| -> i64 {
+            c.data_mut().push((r, d, a));
+            CM_RET
+        });
+        let cm = Func::wrap(&mut store, |mut c: Caller<'_, Vec<(i64, i64, i64)>>, r: i64, d: i64, a: i64| -> i64 {
             c.data_mut().push((r, d, a));
             CM_RET
         });
         let pca = Func::wrap(&mut store, |_: Caller<'_, Vec<(i64, i64, i64)>>, _v: i64| {});
-        let instance = Instance::new(&mut store, &module, &[cm.into(), pca.into(), mem0.into(), mem1.into()]).expect("instantiates");
+        // `dp` global: the memory-1 address of the DEPTH cell the direct-call
+        // save/bump/restore reads/writes. A scratch offset (2048) clear of the frame
+        // (0..) / object (64) / cell (256) the test uses; the bump there is inert.
+        let dp = Global::new(&mut store, WVal::I32(2048), Mutability::Const);
+        let instance = Instance::new(&mut store, &module, &[cmi.into(), cm.into(), pca.into(), mem0.into(), mem1.into(), dp.into()]).expect("instantiates");
         let run = instance.get_typed_func::<(i64, i32, i32, i32, i32), i64>(&store, "run").expect("run");
 
         // Object @64 in memory 1: vtable@80 = 0xAAAA.
@@ -6184,12 +6544,12 @@ mod tests {
         mem0.read(&store, STATE_PTR_V as usize + STRIDE_T as usize, &mut buf).unwrap();
         assert_eq!(i64::from_le_bytes(buf), obj, "receiver written to callee frame slot 0");
 
-        // 2) MISS (vtable mismatch) → cm(receiver, disp, argc=0).
+        // 2) MISS (vtable mismatch) → cmi(receiver, disp, argc=0, cell_addr): call + refill.
         mem1.write(&mut store, CELL as usize, &0xBBBBu32.to_le_bytes()).unwrap();
         assert_eq!(run.call(&mut store, (obj, STATE_PTR_V, CELL as i32, 0, 0)).unwrap(), CM_RET);
         assert_eq!(store.data().as_slice(), &[(obj, DISP as i64, 0)]);
 
-        // 3) SENTINEL (vtable matches but run_index == CALL_SENTINEL) → cm.
+        // 3) SENTINEL (vtable matches but run_index == CALL_SENTINEL) → plain cm, NO refill.
         store.data_mut().clear();
         mem1.write(&mut store, CELL as usize, &0xAAAAu32.to_le_bytes()).unwrap();
         mem1.write(&mut store, CELL as usize + 4, &CALL_SENTINEL.to_le_bytes()).unwrap();
@@ -6198,7 +6558,394 @@ mod tests {
     }
 
     #[test]
-    fn directable_only_for_pure_numeric_dm_leaves() {
+    fn call_direct_bumps_and_restores_depth() {
+        // The DEPTH-management contract for NON-LEAF callees: around the HIT
+        // `call_indirect`, `emit_call_direct` sets the `DEPTH` cell (memory 1 @ the `dp`
+        // global) to `DEPTH + 1` so the callee's own re-entrant `run`s frame above it,
+        // then restores it. Callee here observes the live `DEPTH` and returns it; the
+        // caller checks it was `base + 1` during the call and `base` again after.
+        use wasm_encoder::{
+            CodeSection, ConstExpr as CE, ElementSection, Elements, EntityType, ExportKind,
+            ExportSection, Function as EncFn, FunctionSection, GlobalType as EGlobal, ImportSection,
+            Instruction as Ins, MemoryType as EncMem, Module as EncModule, RefType as ERef,
+            TableSection, TableType as ETable, TypeSection, ValType as VT,
+        };
+        use wasmi::{
+            Config, Engine, Func, Global, Instance, Memory, MemoryType as WMemoryType, Module,
+            Mutability, Store, Val as WVal,
+        };
+
+        const VTABLE_OFF: u32 = 16;
+        const CELL: u32 = 256;
+        const STRIDE_T: u32 = 64;
+        const STATE_PTR_V: i32 = 0;
+        const DISP: u32 = 5;
+        const DP_CELL: u32 = 2048; // memory-1 offset of the DEPTH cell (clear of frame/obj/cell)
+        const BASE_DEPTH: i32 = 7;
+
+        let mut types = TypeSection::new();
+        types.ty().function([VT::I32; 6], [VT::I64]); // 0: standalone run
+        types.ty().function([VT::I64, VT::I32, VT::I32, VT::I32, VT::I32], [VT::I64]); // 1: caller
+        types.ty().function([VT::I64, VT::I64, VT::I64, VT::I32], [VT::I64]); // 2: cmi
+        types.ty().function([VT::I64], []); // 3: pca
+        types.ty().function([VT::I32; 7], [VT::I64]); // 4: dispatcher
+        types.ty().function([VT::I64, VT::I64, VT::I64], [VT::I64]); // 5: cm
+        let mut imports = ImportSection::new();
+        imports.import("env", "cmi", EntityType::Function(2));
+        imports.import("env", "cm", EntityType::Function(5));
+        imports.import("env", "pca", EntityType::Function(3));
+        let mem = || EncMem { minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None };
+        imports.import("env", "mem0", EntityType::Memory(mem()));
+        imports.import("env", "mem1", EntityType::Memory(mem()));
+        imports.import("env", "dp", EntityType::Global(EGlobal { val_type: VT::I32, mutable: false, shared: false }));
+        let mut functions = FunctionSection::new();
+        functions.function(0); // callee = func 3
+        functions.function(1); // caller = func 4
+        let mut tables = TableSection::new();
+        tables.table(ETable { element_type: ERef::FUNCREF, table64: false, minimum: 1, maximum: Some(1), shared: false });
+        let mut exports = ExportSection::new();
+        exports.export("run", ExportKind::Func, 4);
+        let mut elements = ElementSection::new();
+        elements.active(Some(0), &CE::i32_const(0), Elements::Functions([3u32][..].into()));
+        // Callee: returns the live DEPTH it observes — `i64(load mem1[dp])`.
+        let mut callee = EncFn::new([]);
+        callee.instruction(&Ins::GlobalGet(0)); // dp = DEPTH-cell address
+        callee.instruction(&Ins::I32Load(MemArg { offset: 0, align: 2, memory_index: 1 }));
+        callee.instruction(&Ins::I64ExtendI32U);
+        callee.instruction(&Ins::End);
+        let mut caller = EncFn::new([(2, VT::I32), (1, VT::I64)]);
+        caller.instruction(&Ins::LocalGet(0)); // receiver
+        emit_call_direct(
+            &mut caller, /*argc*/ 0, DISP, VTABLE_OFF, /*instance_class_off*/ VTABLE_OFF,
+            /*cell_base_local*/ 2, /*cell_offset*/ 0,
+            /*state_ptr_local*/ 1, /*dm_base*/ 3, /*dm_len*/ 4, /*run_type*/ 0,
+            /*dispatch_type*/ 4, /*cmi*/ 0, /*cm*/ 1, /*pca*/ 2, /*sp*/ 5, /*ptr*/ 6, /*bits*/ 7,
+            STRIDE_T, /*mem_bytes*/ 65536, /*push*/ true,
+        );
+        caller.instruction(&Ins::End);
+        let mut code = CodeSection::new();
+        code.function(&callee);
+        code.function(&caller);
+        let mut m = EncModule::new();
+        m.section(&types);
+        m.section(&imports);
+        m.section(&functions);
+        m.section(&tables);
+        m.section(&exports);
+        m.section(&elements);
+        m.section(&code);
+        let bytes = m.finish();
+
+        let mut config = Config::default();
+        config.wasm_multi_memory(true);
+        let engine = Engine::new(&config);
+        let module = Module::new(&engine, &bytes).expect("valid wasm");
+        let mut store = Store::new(&engine, ());
+        let mem0 = Memory::new(&mut store, WMemoryType::new(1, None).unwrap()).unwrap();
+        let mem1 = Memory::new(&mut store, WMemoryType::new(1, None).unwrap()).unwrap();
+        let cmi = Func::wrap(&mut store, |_r: i64, _d: i64, _a: i64, _c: i32| -> i64 { 0 });
+        let cm = Func::wrap(&mut store, |_r: i64, _d: i64, _a: i64| -> i64 { 0 });
+        let pca = Func::wrap(&mut store, |_v: i64| {});
+        let dp = Global::new(&mut store, WVal::I32(DP_CELL as i32), Mutability::Const);
+        let instance = Instance::new(&mut store, &module, &[cmi.into(), cm.into(), pca.into(), mem0.into(), mem1.into(), dp.into()]).expect("instantiates");
+        let run = instance.get_typed_func::<(i64, i32, i32, i32, i32), i64>(&store, "run").expect("run");
+
+        // Object @64: vtable@80 = 0xAAAA; a HIT cell to the standalone callee (slot 0).
+        mem1.write(&mut store, 64 + VTABLE_OFF as usize, &0xAAAAu32.to_le_bytes()).unwrap();
+        let obj = ((VALUE_OBJECT_TAG16 as u64) << 48 | 64) as i64;
+        mem1.write(&mut store, CELL as usize, &0xAAAAu32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 4, &0u32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 8, &0u32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 12, &CALL_NO_MEMBER.to_le_bytes()).unwrap();
+        // Pre-seed DEPTH = BASE_DEPTH.
+        mem1.write(&mut store, DP_CELL as usize, &BASE_DEPTH.to_le_bytes()).unwrap();
+
+        let observed = run.call(&mut store, (obj, STATE_PTR_V, CELL as i32, 0, 0)).unwrap();
+        assert_eq!(observed, (BASE_DEPTH + 1) as i64, "callee must observe DEPTH bumped to base+1");
+        let mut buf = [0u8; 4];
+        mem1.read(&store, DP_CELL as usize, &mut buf).unwrap();
+        assert_eq!(i32::from_le_bytes(buf), BASE_DEPTH, "DEPTH restored to base after the call");
+    }
+
+    #[test]
+    fn call_direct_guard_typed_arg_hits_only_on_matching_tag() {
+        // argc=1 with an `int` param: the cell holds an int check-word pair, so the HIT
+        // guard `call_indirect`s only when the arg is int-tagged; a Number arg (tag
+        // mismatch) misses to the coercing `cm` (the cell stays for the next call).
+        use wasm_encoder::{
+            CodeSection, ConstExpr as CE, ElementSection, Elements, EntityType, ExportKind,
+            ExportSection, Function as EncFn, FunctionSection, ImportSection, Instruction as Ins,
+            MemoryType as EncMem, Module as EncModule, RefType as ERef, TableSection,
+            TableType as ETable, TypeSection, ValType as VT, GlobalType as EGlobal,
+        };
+        use wasmi::{
+            Caller, Config, Engine, Func, Global, Instance, Memory, MemoryType as WMemoryType,
+            Module, Mutability, Store, Val as WVal,
+        };
+
+        const VTABLE_OFF: u32 = 16;
+        const CELL: u32 = 256;
+        const STRIDE_T: u32 = 128; // > 16-byte header + 1 arg pair (fits the callee frame)
+        const DISP: u32 = 5;
+        const CM_RET: i64 = 0xDEAD;
+
+        // Types: 0=callee run(6×i32)->i64, 1=caller run(i64,i64,i32,i32)->i64,
+        //        2=cmi(i64,i64,i64,i32)->i64, 3=pca(i64)->(), 4=dispatcher(7×i32)->i64,
+        //        5=cm(i64,i64,i64)->i64.
+        let mut types = TypeSection::new();
+        types.ty().function([VT::I32; 6], [VT::I64]); // 0
+        types.ty().function([VT::I64, VT::I64, VT::I32, VT::I32], [VT::I64]); // 1: caller(recv,arg0,state_ptr,cell)
+        types.ty().function([VT::I64, VT::I64, VT::I64, VT::I32], [VT::I64]); // 2: cmi
+        types.ty().function([VT::I64], []); // 3: pca
+        types.ty().function([VT::I32; 7], [VT::I64]); // 4: dispatcher
+        types.ty().function([VT::I64, VT::I64, VT::I64], [VT::I64]); // 5: cm
+        let mut imports = ImportSection::new();
+        imports.import("env", "cmi", EntityType::Function(2)); // func 0
+        imports.import("env", "cm", EntityType::Function(5)); // func 1
+        imports.import("env", "pca", EntityType::Function(3)); // func 2
+        let mem = || EncMem { minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None };
+        imports.import("env", "mem0", EntityType::Memory(mem()));
+        imports.import("env", "mem1", EntityType::Memory(mem()));
+        // `dp` (global 0): DEPTH-cell address for the direct-call frame bump.
+        imports.import("env", "dp", EntityType::Global(EGlobal { val_type: VT::I32, mutable: false, shared: false }));
+        let mut functions = FunctionSection::new();
+        functions.function(0); // callee = func 3
+        functions.function(1); // caller = func 4
+        let mut tables = TableSection::new();
+        tables.table(ETable { element_type: ERef::FUNCREF, table64: false, minimum: 1, maximum: Some(1), shared: false });
+        let mut exports = ExportSection::new();
+        exports.export("run", ExportKind::Func, 4);
+        let mut elements = ElementSection::new();
+        elements.active(Some(0), &CE::i32_const(0), Elements::Functions([3u32][..].into()));
+        // Callee: return `i64.load(memory0, state_ptr + 8)` — the ARG we wrote (slot 1),
+        // proving the HIT ran with the arg in place.
+        let mut callee = EncFn::new([]);
+        callee.instruction(&Ins::LocalGet(0));
+        callee.instruction(&Ins::I64Load(MemArg { offset: 8, align: 3, memory_index: 0 }));
+        callee.instruction(&Ins::End);
+        // Caller(recv=0, arg0=1, state_ptr=2, cell_base=3); scratch 4,5 (i32), 6 (i64).
+        let mut caller = EncFn::new([(2, VT::I32), (1, VT::I64)]);
+        caller.instruction(&Ins::LocalGet(0)); // receiver
+        caller.instruction(&Ins::LocalGet(1)); // arg0 (on top)
+        emit_call_direct(
+            &mut caller, /*argc*/ 1, DISP, VTABLE_OFF, /*instance_class_off*/ VTABLE_OFF,
+            /*cell_base_local*/ 3, /*cell_offset*/ 0,
+            /*state_ptr_local*/ 2, /*dm_base*/ 4, /*dm_len*/ 4, /*run_type*/ 0,
+            /*dispatch_type*/ 4, /*cmi*/ 0, /*cm*/ 1, /*pca*/ 2, /*sp*/ 4, /*ptr*/ 5, /*bits*/ 6,
+            STRIDE_T, /*mem_bytes*/ 65536, /*push*/ true,
+        );
+        caller.instruction(&Ins::End);
+        let mut code = CodeSection::new();
+        code.function(&callee);
+        code.function(&caller);
+        let mut m = EncModule::new();
+        m.section(&types);
+        m.section(&imports);
+        m.section(&functions);
+        m.section(&tables);
+        m.section(&exports);
+        m.section(&elements);
+        m.section(&code);
+        let bytes = m.finish();
+
+        let mut config = Config::default();
+        config.wasm_multi_memory(true);
+        let engine = Engine::new(&config);
+        let module = Module::new(&engine, &bytes).expect("valid wasm");
+        let mut store = Store::new(&engine, Vec::<(i64, i64, i64)>::new());
+        let mem0 = Memory::new(&mut store, WMemoryType::new(1, None).unwrap()).unwrap();
+        let mem1 = Memory::new(&mut store, WMemoryType::new(1, None).unwrap()).unwrap();
+        let cmi = Func::wrap(&mut store, |mut c: Caller<'_, Vec<(i64, i64, i64)>>, r: i64, d: i64, a: i64, _cell: i32| -> i64 {
+            c.data_mut().push((r, d, a));
+            CM_RET
+        });
+        let cm = Func::wrap(&mut store, |mut c: Caller<'_, Vec<(i64, i64, i64)>>, r: i64, d: i64, a: i64| -> i64 {
+            c.data_mut().push((r, d, a));
+            CM_RET
+        });
+        // `pca` records the arg it spilled (so the miss path is observable).
+        let pca = Func::wrap(&mut store, |_: Caller<'_, Vec<(i64, i64, i64)>>, _v: i64| {});
+        // `dp` global: the memory-1 address of the DEPTH cell the direct-call
+        // save/bump/restore reads/writes. A scratch offset (2048) clear of the frame
+        // (0..) / object (64) / cell (256) the test uses; the bump there is inert.
+        let dp = Global::new(&mut store, WVal::I32(2048), Mutability::Const);
+        let instance = Instance::new(&mut store, &module, &[cmi.into(), cm.into(), pca.into(), mem0.into(), mem1.into(), dp.into()]).expect("instantiates");
+        let run = instance.get_typed_func::<(i64, i64, i32, i32), i64>(&store, "run").expect("run");
+
+        // Object @64 in memory 1, vtable@80 = 0xAAAA.
+        mem1.write(&mut store, 64 + VTABLE_OFF as usize, &0xAAAAu32.to_le_bytes()).unwrap();
+        let obj = ((VALUE_OBJECT_TAG16 as u64) << 48 | 64) as i64;
+
+        // Cell: {vtable:0xAAAA, run_index:0, ic_base:0, member:NO_MEMBER} + arg0 word pair
+        // for an `int` param: mask_and_want = VALUE_TAG_MASK | 1, expected = INT tag.
+        mem1.write(&mut store, CELL as usize, &0xAAAAu32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 4, &0u32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 8, &0u32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 12, &CALL_NO_MEMBER.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 16, &(VALUE_TAG_MASK | 1).to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 24, &VALUE_INT_MARK.to_le_bytes()).unwrap();
+
+        // 1) HIT: int-tagged arg matches the check-word → call_indirect; callee returns
+        // the arg from the frame. cm/cmi NOT called.
+        let int_arg = (VALUE_INT_MARK | 7) as i64;
+        assert_eq!(run.call(&mut store, (obj, int_arg, 0, CELL as i32)).unwrap(), int_arg);
+        assert!(store.data().is_empty(), "matching-typed arg must HIT, not call the helper");
+
+        // 2) MISS: a Number (f64) arg fails the int check → coercing `cm` (cell kept).
+        let num_arg = 3.0f64.to_bits() as i64;
+        assert_eq!(run.call(&mut store, (obj, num_arg, 0, CELL as i32)).unwrap(), CM_RET);
+        assert_eq!(store.data().as_slice(), &[(obj, DISP as i64, 1)], "tag mismatch → cm");
+        // The cell is untouched (no refill), so a later matching arg HITs again.
+        store.data_mut().clear();
+        assert_eq!(run.call(&mut store, (obj, int_arg, 0, CELL as i32)).unwrap(), int_arg);
+        assert!(store.data().is_empty(), "int arg HITs again after a prior mismatch");
+    }
+
+    #[test]
+    fn call_direct_guard_class_arg_exact_class_and_null() {
+        // argc=1 with a concrete-CLASS param: the cell holds the exact-class marker + the
+        // expected `instance_class` pointer. The HIT guard `call_indirect`s only when the
+        // arg is `null` or an object whose `instance_class` == expected; a wrong-class
+        // object misses to the coercing `cm`.
+        use wasm_encoder::{
+            CodeSection, ConstExpr as CE, ElementSection, Elements, EntityType, ExportKind,
+            ExportSection, Function as EncFn, FunctionSection, ImportSection, Instruction as Ins,
+            MemoryType as EncMem, Module as EncModule, RefType as ERef, TableSection,
+            TableType as ETable, TypeSection, ValType as VT, GlobalType as EGlobal,
+        };
+        use wasmi::{
+            Caller, Config, Engine, Func, Global, Instance, Memory, MemoryType as WMemoryType,
+            Module, Mutability, Store, Val as WVal,
+        };
+
+        const VTABLE_OFF: u32 = 16;
+        const CLASS_OFF: u32 = 20;
+        const CELL: u32 = 256;
+        const STRIDE_T: u32 = 128;
+        const DISP: u32 = 5;
+        const CM_RET: i64 = 0xDEAD;
+        const WANT_CLASS: u32 = 0xC0DE; // expected instance_class pointer
+
+        let mut types = TypeSection::new();
+        types.ty().function([VT::I32; 6], [VT::I64]); // 0: callee run
+        types.ty().function([VT::I64, VT::I64, VT::I32, VT::I32], [VT::I64]); // 1: caller
+        types.ty().function([VT::I64, VT::I64, VT::I64, VT::I32], [VT::I64]); // 2: cmi
+        types.ty().function([VT::I64], []); // 3: pca
+        types.ty().function([VT::I32; 7], [VT::I64]); // 4: dispatcher
+        types.ty().function([VT::I64, VT::I64, VT::I64], [VT::I64]); // 5: cm
+        let mut imports = ImportSection::new();
+        imports.import("env", "cmi", EntityType::Function(2)); // func 0
+        imports.import("env", "cm", EntityType::Function(5)); // func 1
+        imports.import("env", "pca", EntityType::Function(3)); // func 2
+        let mem = || EncMem { minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None };
+        imports.import("env", "mem0", EntityType::Memory(mem()));
+        imports.import("env", "mem1", EntityType::Memory(mem()));
+        // `dp` (global 0): DEPTH-cell address for the direct-call frame bump.
+        imports.import("env", "dp", EntityType::Global(EGlobal { val_type: VT::I32, mutable: false, shared: false }));
+        let mut functions = FunctionSection::new();
+        functions.function(0); // callee = func 3
+        functions.function(1); // caller = func 4
+        let mut tables = TableSection::new();
+        tables.table(ETable { element_type: ERef::FUNCREF, table64: false, minimum: 1, maximum: Some(1), shared: false });
+        let mut exports = ExportSection::new();
+        exports.export("run", ExportKind::Func, 4);
+        let mut elements = ElementSection::new();
+        elements.active(Some(0), &CE::i32_const(0), Elements::Functions([3u32][..].into()));
+        let mut callee = EncFn::new([]);
+        callee.instruction(&Ins::LocalGet(0));
+        callee.instruction(&Ins::I64Load(MemArg { offset: 8, align: 3, memory_index: 0 })); // arg0
+        callee.instruction(&Ins::End);
+        let mut caller = EncFn::new([(2, VT::I32), (1, VT::I64)]);
+        caller.instruction(&Ins::LocalGet(0)); // receiver
+        caller.instruction(&Ins::LocalGet(1)); // arg0
+        emit_call_direct(
+            &mut caller, /*argc*/ 1, DISP, VTABLE_OFF, /*instance_class_off*/ CLASS_OFF,
+            /*cell_base_local*/ 3, /*cell_offset*/ 0,
+            /*state_ptr_local*/ 2, /*dm_base*/ 4, /*dm_len*/ 4, /*run_type*/ 0,
+            /*dispatch_type*/ 4, /*cmi*/ 0, /*cm*/ 1, /*pca*/ 2, /*sp*/ 4, /*ptr*/ 5, /*bits*/ 6,
+            STRIDE_T, /*mem_bytes*/ 65536, /*push*/ true,
+        );
+        caller.instruction(&Ins::End);
+        let mut code = CodeSection::new();
+        code.function(&callee);
+        code.function(&caller);
+        let mut m = EncModule::new();
+        m.section(&types);
+        m.section(&imports);
+        m.section(&functions);
+        m.section(&tables);
+        m.section(&exports);
+        m.section(&elements);
+        m.section(&code);
+        let bytes = m.finish();
+
+        let mut config = Config::default();
+        config.wasm_multi_memory(true);
+        let engine = Engine::new(&config);
+        let module = Module::new(&engine, &bytes).expect("valid wasm");
+        let mut store = Store::new(&engine, Vec::<(i64, i64, i64)>::new());
+        let mem0 = Memory::new(&mut store, WMemoryType::new(1, None).unwrap()).unwrap();
+        let mem1 = Memory::new(&mut store, WMemoryType::new(1, None).unwrap()).unwrap();
+        let cmi = Func::wrap(&mut store, |mut c: Caller<'_, Vec<(i64, i64, i64)>>, r: i64, d: i64, a: i64, _cell: i32| -> i64 {
+            c.data_mut().push((r, d, a));
+            CM_RET
+        });
+        let cm = Func::wrap(&mut store, |mut c: Caller<'_, Vec<(i64, i64, i64)>>, r: i64, d: i64, a: i64| -> i64 {
+            c.data_mut().push((r, d, a));
+            CM_RET
+        });
+        let pca = Func::wrap(&mut store, |_: Caller<'_, Vec<(i64, i64, i64)>>, _v: i64| {});
+        // `dp` global: the memory-1 address of the DEPTH cell the direct-call
+        // save/bump/restore reads/writes. A scratch offset (2048) clear of the frame
+        // (0..) / object (64) / cell (256) the test uses; the bump there is inert.
+        let dp = Global::new(&mut store, WVal::I32(2048), Mutability::Const);
+        let instance = Instance::new(&mut store, &module, &[cmi.into(), cm.into(), pca.into(), mem0.into(), mem1.into(), dp.into()]).expect("instantiates");
+        let run = instance.get_typed_func::<(i64, i64, i32, i32), i64>(&store, "run").expect("run");
+
+        // Receiver obj @64: vtable@80 = 0xAAAA (guards the receiver), instance_class@84 =
+        // WANT_CLASS. A same-class arg object obj_ok @160 also has instance_class WANT_CLASS;
+        // a wrong-class arg obj_bad @288 has a different instance_class.
+        mem1.write(&mut store, 64 + VTABLE_OFF as usize, &0xAAAAu32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, 64 + CLASS_OFF as usize, &WANT_CLASS.to_le_bytes()).unwrap();
+        mem1.write(&mut store, 160 + CLASS_OFF as usize, &WANT_CLASS.to_le_bytes()).unwrap();
+        mem1.write(&mut store, 288 + CLASS_OFF as usize, &0xBEEFu32.to_le_bytes()).unwrap();
+        let obj = ((VALUE_OBJECT_TAG16 as u64) << 48 | 64) as i64;
+        let obj_ok = ((VALUE_OBJECT_TAG16 as u64) << 48 | 160) as i64;
+        let obj_bad = ((VALUE_OBJECT_TAG16 as u64) << 48 | 288) as i64;
+
+        // Cell: header + arg0 = {CALL_CLASS_MARK, expected class ptr = WANT_CLASS}.
+        mem1.write(&mut store, CELL as usize, &0xAAAAu32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 4, &0u32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 8, &0u32.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 12, &CALL_NO_MEMBER.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 16, &CALL_CLASS_MARK.to_le_bytes()).unwrap();
+        mem1.write(&mut store, CELL as usize + 24, &(WANT_CLASS as u64).to_le_bytes()).unwrap();
+
+        // 1) HIT: exact-class arg → call_indirect; callee returns the arg.
+        assert_eq!(run.call(&mut store, (obj, obj_ok, 0, CELL as i32)).unwrap(), obj_ok);
+        assert!(store.data().is_empty(), "exact-class arg must HIT");
+
+        // 2) HIT: null arg coerces identically to any class param.
+        let null_arg = 0xFFF9_0000_0000_0000u64 as i64;
+        assert_eq!(run.call(&mut store, (obj, null_arg, 0, CELL as i32)).unwrap(), null_arg);
+        assert!(store.data().is_empty(), "null arg must HIT a class param");
+
+        // 3) MISS: a wrong-class object → coercing cm.
+        assert_eq!(run.call(&mut store, (obj, obj_bad, 0, CELL as i32)).unwrap(), CM_RET);
+        assert_eq!(store.data().as_slice(), &[(obj, DISP as i64, 1)], "wrong class → cm");
+
+        // 4) MISS: a non-object, non-null (int) arg → cm (cell kept, so 1) still HITs).
+        store.data_mut().clear();
+        let int_arg = (VALUE_INT_MARK | 7) as i64;
+        assert_eq!(run.call(&mut store, (obj, int_arg, 0, CELL as i32)).unwrap(), CM_RET);
+        assert_eq!(store.data().as_slice(), &[(obj, DISP as i64, 1)], "int for class param → cm");
+        store.data_mut().clear();
+        assert_eq!(run.call(&mut store, (obj, obj_ok, 0, CELL as i32)).unwrap(), obj_ok);
+        assert!(store.data().is_empty(), "exact-class arg HITs again after mismatches");
+    }
+
+    #[test]
+    fn directable_predicate_leaves_calls_slots_but_not_dm_or_props() {
         // Pure numeric leaf: `local1 + local2; return` → directable.
         let pure = [JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::AddI, JitOp::ReturnValue];
         assert!(manifest(&pure).directable(false), "pure numeric leaf is a direct-call target");
@@ -6210,13 +6957,42 @@ mod tests {
         let dm = [JitOp::GetLocal(1), JitOp::DmLoad(1), JitOp::ReturnValue];
         assert!(!manifest(&dm).directable(true), "dm leaf keeps an activation-reading fallback helper");
 
-        // A call → NOT directable (would re-enter Rust with the stale DEPTH).
+        // A call IS directable now (the non-leaf case): `emit_call_direct` bumps/restores
+        // DEPTH around the direct `call_indirect`, so a callee's own re-entrant `run`s
+        // frame above it. Both the helper `cm` (`CallMethod`) and a nested direct call
+        // (`CallMethodDirect`) qualify.
         let calls = [JitOp::GetLocalValue(0), JitOp::CallMethod(1, 0, true), JitOp::ReturnValueBoxed];
-        assert!(!manifest(&calls).directable(true), "a call is not directable");
+        assert!(manifest(&calls).directable(true), "a non-leaf method that calls IS directable");
+        let direct = [JitOp::GetLocalValue(0), JitOp::CallMethodDirect(1, 0, true, 0), JitOp::ReturnValueBoxed];
+        assert!(manifest(&direct).directable(true), "a method with a nested direct call IS directable");
 
-        // A property read (helper / IC) → NOT directable (object model may re-enter).
+        // A compare/arithmetic helper (`t{i}`, HELPERS2) IS directable: context-only, and
+        // a valueOf re-entry is frame-safe under the direct-call DEPTH bump.
+        let cmp = [JitOp::GetLocalValue(0), JitOp::GetLocalValue(1), JitOp::CallHelper2(0), JitOp::ReturnValueBoxed];
+        assert!(manifest(&cmp).directable(true), "an arity-2 compare helper IS directable");
+
+        // Inline numeric coercions (context-only `coerce_i`/`coerce_s` helpers) ARE
+        // directable; a safe arity-1 helper (`increment` = h0) too.
+        let ci = [JitOp::GetLocalValue(0), JitOp::CoerceInt(true), JitOp::ReturnValueBoxed];
+        assert!(manifest(&ci).directable(true), "inline CoerceInt IS directable");
+        let cs = [JitOp::GetLocalValue(0), JitOp::CoerceString, JitOp::ReturnValueBoxed];
+        assert!(manifest(&cs).directable(true), "CoerceString IS directable");
+        let inc = [JitOp::GetLocalValue(0), JitOp::CallHelper(0), JitOp::ReturnValueBoxed];
+        assert!(manifest(&inc).directable(true), "a context-only arity-1 helper (increment) IS directable");
+
+        // A SCOPE helper reads the current activation's scope stack — a direct entry
+        // leaves the CALLER's scope in place → NOT directable.
+        let scope = [JitOp::GetScopeObject(0), JitOp::ReturnValueBoxed];
+        assert!(!manifest(&scope).directable(true), "getscopeobject reads the caller's scope → not directable");
+        // `Op::Coerce{class}` reads the per-method coerce-class table → NOT directable.
+        let coerce = [JitOp::GetLocalValue(0), JitOp::Coerce(0), JitOp::ReturnValueBoxed];
+        assert!(!manifest(&coerce).directable(true), "Coerce{{class}} needs the per-method class table → not directable");
+
+        // A `getproperty` IS directable now: the emitter bakes the multiname pointer, so
+        // `gp` reads no per-method table (only the activation as context). (`getpropfast`
+        // / `findproperty` stay excluded — activation-stack / scope-chain dependent.)
         let prop = [JitOp::GetLocalValue(0), JitOp::GetProperty(0), JitOp::ReturnValueBoxed];
-        assert!(!manifest(&prop).directable(true), "getproperty is not directable");
+        assert!(manifest(&prop).directable(true), "baked-multiname getproperty IS directable");
 
         // A getslot leaf: directable IFF all getslots are null-safe (then the
         // activation-reading slow path is dead; the fast path is activation-free).
@@ -6344,8 +7120,8 @@ mod tests {
         ];
         let m1 = [JitOp::GetLocalValue(1), JitOp::CallHelper(0), JitOp::ReturnValueBoxed];
         let members = [
-            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
-            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
+            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[] },
+            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[] },
         ];
         let (bytes, union) = compile_generation(&members).expect("generation compiles");
         assert_eq!(union.num_helpers, 1); // the union carries m1's h0
@@ -6404,10 +7180,13 @@ mod tests {
             JitOp::GetProperty(0),         // gp
             JitOp::ReturnValueBoxed,
         ];
+        // m2's `GetProperty(0)` bakes `mn_list[0]` — a dummy non-null pointer here (the
+        // module is only VALIDATED, never run, so it's never dereferenced).
+        let m2_mn = [1usize as *const ()];
         let members = [
-            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
-            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
-            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "", numeric_seed: &[] },
+            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[] },
+            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[] },
+            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &m2_mn },
         ];
         let (bytes, union) = compile_generation(&members).expect("generation compiles");
         assert!(union.has_vcall && union.has_getslot && union.has_call && union.has_coerce);

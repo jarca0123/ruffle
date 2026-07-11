@@ -187,8 +187,9 @@ fn build_instance(bytes: &[u8], m: &crate::lower::Manifest) -> Option<PooledRun>
         }
     }
     // Call imports in layout order: `cm` (call_method), `cp` (call_property), then
-    // the shared `pca` (arg spill) and `perr` (error bail).
-    if m.has_call {
+    // the shared `pca` (arg spill) and `perr` (error bail). `cm` is also imported for
+    // `has_call_direct` (the SENTINEL short-circuit — see `emit_call_direct`).
+    if m.has_call || m.has_call_direct {
         externs.push(
             Func::wrap(&mut store, |r: i64, id: i64, argc: i64| -> i64 {
                 crate::helpers::call_method(r, id, argc)
@@ -229,8 +230,15 @@ fn build_instance(bytes: &[u8], m: &crate::lower::Manifest) -> Option<PooledRun>
             .into(),
         );
     }
-    let any_call =
-        m.has_call || m.has_callprop || m.has_construct_super || m.has_call_value || m.has_vcall;
+    // MUST match `emit_imports`/`layout`'s `any_call` (`has_call_direct` spills args via
+    // `pca` too). Native never sets `has_call_direct` (direct calls are web-only), so this
+    // is a no-op here — kept in sync with the web binder to avoid a future import mismatch.
+    let any_call = m.has_call
+        || m.has_call_direct
+        || m.has_callprop
+        || m.has_construct_super
+        || m.has_call_value
+        || m.has_vcall;
     if any_call {
         externs.push(Func::wrap(&mut store, |v: i64| crate::helpers::push_call_arg(v)).into());
     }
@@ -313,6 +321,20 @@ mod web {
     /// STRIDE` = max JIT nesting depth (1024) before a run declines.
     const PAGES: u32 = 64;
     const MEM_BYTES: usize = PAGES as usize * 65536;
+    // `emit_call_direct`'s non-leaf frame bounds check compares against this same limit
+    // (passed as `FRAME_MEM_BYTES`); they MUST agree or a direct call could write past
+    // the committed memory (over-large limit) or decline too early (too-small limit).
+    const _: () = assert!(MEM_BYTES == crate::lower::FRAME_MEM_BYTES as usize);
+    /// One extra `STRIDE` of **guard band** beyond `MEM_BYTES`, committed but never
+    /// counted by the depth-decline check below. A JIT→JIT **direct** call
+    /// (`emit_call_direct`) writes the callee frame at `state_ptr + STRIDE` WITHOUT
+    /// its own bounds check (unlike this `run`, which declines when a frame won't
+    /// fit). A directable callee is a leaf (no further direct/helper calls), so a
+    /// direct call adds at most ONE frame beyond the deepest runner-checked one —
+    /// this single guard STRIDE guarantees that write stays in-bounds even from the
+    /// last allowed frame. `MEM_BYTES` (the decline limit) is unchanged, so nesting
+    /// depth is still capped at 1024.
+    const ALLOC_PAGES: u32 = PAGES + (STRIDE as u32).div_ceil(65536);
 
     /// A cached instance. `run` (the exported function) is kept alive so its
     /// instance — and its slot in Ruffle's indirect function table — stays valid;
@@ -341,6 +363,14 @@ mod web {
         run_index: Option<usize>,
     }
 
+    /// Current JIT nesting depth → frame base `depth * STRIDE`. A raw `#[thread_local]`
+    /// (not a `thread_local!` `LocalKey`): `run` reads it once and writes it twice on the
+    /// hot dispatch path, and the `LocalKey::with` lazy-init check per access showed up in
+    /// `run`'s self-time on call-dense CrossBridge/Lua profiles. Same rationale as the
+    /// helpers' `RUN_CTX`/`PENDING_FLAG`. Per wasm instance = per worker thread.
+    #[thread_local]
+    static mut DEPTH: usize = 0;
+
     thread_local! {
         /// Compiled modules, keyed by `bytes.as_ptr()` (stable/unique — the
         /// `Rc<[u8]>` lives in `WasmJit`'s never-evicted cache). Codegen is the
@@ -353,8 +383,6 @@ mod web {
         static INSTANCES: RefCell<FnvHashMap<usize, Rc<Cached>>> = RefCell::new(FnvHashMap::default());
         /// The single shared frame memory (lazily created).
         static MEMORY: RefCell<Option<WebAssembly::Memory>> = RefCell::new(None);
-        /// Current JIT nesting depth → frame base `depth * STRIDE`.
-        static DEPTH: Cell<usize> = const { Cell::new(0) };
         /// Whether the wasm→wasm-entry diagnostic has been logged once (per thread).
         static ENTRY_MODE_LOGGED: Cell<bool> = const { Cell::new(false) };
         /// Free reserved `__indirect_function_table` slots (see [`reserved_slot`]),
@@ -366,6 +394,12 @@ mod web {
         /// member's `MODULE_CACHE`/`INSTANCES` entries when the generation installs.
         static GEN_ENTRIES: RefCell<FnvHashMap<usize, (Rc<Generation>, u32)>> =
             RefCell::new(FnvHashMap::default());
+        /// A directable generation member's OWN permanent `__indirect_function_table` slot
+        /// (member bytes-key → slot), holding that member's exported 6-param `run` funcref.
+        /// Direct calls resolve here first (`run_index_for`) so a HIT is a plain 6-param
+        /// `call_indirect` — no dispatcher indirection. The slot is NEVER recycled (a
+        /// generation is never uninstalled), so caching it is stale-slot-safe.
+        static MEMBER_SLOTS: RefCell<FnvHashMap<usize, usize>> = RefCell::new(FnvHashMap::default());
         /// Run-target **inline cache** fronting `GEN_ENTRIES` on the hot path:
         /// direct-mapped bytes-key → `(dispatcher fn-ptr, member index)`. The
         /// direct-call generation path needs only those two integers, so a hit
@@ -446,8 +480,8 @@ mod web {
                 return Some(m.clone());
             }
             let desc = Object::new();
-            Reflect::set(&desc, &"initial".into(), &JsValue::from(PAGES)).ok()?;
-            Reflect::set(&desc, &"maximum".into(), &JsValue::from(PAGES)).ok()?;
+            Reflect::set(&desc, &"initial".into(), &JsValue::from(ALLOC_PAGES)).ok()?;
+            Reflect::set(&desc, &"maximum".into(), &JsValue::from(ALLOC_PAGES)).ok()?;
             let m = WebAssembly::Memory::new(&desc).ok()?;
             *slot.borrow_mut() = Some(m.clone());
             Some(m)
@@ -513,6 +547,17 @@ mod web {
         if m.has_call_direct {
             Reflect::set(&env, &"__indirect_function_table".into(), &wasm_bindgen::function_table())
                 .ok()?;
+            // `dp` global = the memory-1 byte address of the `DEPTH` frame counter, so a
+            // direct call's inline save/bump/restore (see `emit_call_direct`) reads/writes
+            // it wasm→wasm with no Rust round-trip. `DEPTH` is a `#[thread_local]`, so its
+            // address is this worker's TLS slot — stable for the worker's lifetime (the
+            // cached instance is per-worker too). An immutable i32 global holds it.
+            let depth_addr = &raw mut DEPTH as u32;
+            let desc = Object::new();
+            Reflect::set(&desc, &"value".into(), &"i32".into()).ok()?;
+            Reflect::set(&desc, &"mutable".into(), &JsValue::FALSE).ok()?;
+            let dp = WebAssembly::Global::new(&desc, &JsValue::from(depth_addr)).ok()?;
+            Reflect::set(&env, &"dp".into(), &dp).ok()?;
         }
 
         // Bind every helper import to Ruffle's OWN wasm function — a funcref pulled
@@ -555,7 +600,7 @@ mod web {
         }
         // Call imports: `cm`/`cp` (ternary), then the shared `pca` (i64->()) and
         // `perr` (()->i32).
-        if m.has_call {
+        if m.has_call || m.has_call_direct {
             bind_fn(&env, &table, "cm", crate::helpers::call_method as fn(i64, i64, i64) -> i64 as usize)?;
         }
         if m.has_call_direct {
@@ -570,7 +615,16 @@ mod web {
         if m.has_call_value {
             bind_fn(&env, &table, "callv", crate::helpers::call_value as fn(i64, i64, i64) -> i64 as usize)?;
         }
+        // MUST match `emit_imports`/`layout`'s `any_call` — a direct call
+        // (`has_call_direct`) spills its args through `pca` on the miss path, so it
+        // imports `pca` too. Omitting `has_call_direct` here left a `has_call_direct`
+        // module's declared `pca` import unbound → `Instance()` LinkError → the method
+        // never cached in `INSTANCES` and re-instantiated on EVERY call (a measured
+        // `WebAssembly.Instance` hotspot on dm-heavy CrossBridge content, whose has_dm
+        // methods run standalone — never folded into a generation — so `build` is their
+        // only instantiate path).
         let any_call = m.has_call
+            || m.has_call_direct
             || m.has_callprop
             || m.has_construct_super
             || m.has_call_value
@@ -613,6 +667,9 @@ mod web {
         gen_bytes: &[u8],
         union: &crate::lower::Manifest,
         member_keys: &[usize],
+        // `directable[i]` = member `i` is worth its own permanent shared-table slot (a
+        // possible direct-call target). Parallel to `member_keys`.
+        directable: &[bool],
     ) -> bool {
         let Some(mem) = memory() else { return false };
         let byte_view = Uint8Array::from(gen_bytes);
@@ -639,9 +696,47 @@ mod web {
             );
             return false;
         };
-        let _ = instance;
         let table = wasm_bindgen::function_table().unchecked_into::<WebAssembly::Table>();
         let run_index = alloc_slot().filter(|&idx| table.set(idx as u32, &run).is_ok());
+        // Give each member its own permanent slot holding its exported `run` (`m{i}`)
+        // funcref, so BOTH a direct call (`emit_call_direct`) AND the normal `run`
+        // dispatch reach it as a plain 6-param `call_indirect` — skipping the amalgam
+        // DISPATCHER's `method_idx` indirection (a measured ~11% of the worker,
+        // `jit_dispatch`, on call-dense Lua). The funcref keeps the amalgam instance
+        // alive; the slot is never recycled. A member with no own slot (see the headroom
+        // guard) falls back to the dispatcher via `run_index_for` (correct, one
+        // indirection slower). DIRECTABLE members are slotted FIRST (they're direct-call
+        // targets, so their slot matters most). We stop while `DISPATCHER_HEADROOM` slots
+        // remain, so FUTURE generations can still claim their (essential) dispatcher slot
+        // — otherwise a slot-hungry early generation would starve later ones onto the slow
+        // JS entry.
+        const DISPATCHER_HEADROOM: usize = 128;
+        let exports = instance.exports();
+        let mut order: Vec<usize> = (0..member_keys.len()).collect();
+        order.sort_by_key(|&i| !directable.get(i).copied().unwrap_or(false));
+        for i in order {
+            let free = FREE_SLOTS.with(|s| s.borrow().as_ref().map_or(0, |v| v.len()));
+            if free <= DISPATCHER_HEADROOM {
+                break;
+            }
+            let key = member_keys[i];
+            let Some(slot) = alloc_slot() else { break }; // pool exhausted
+            let func = Reflect::get(&exports, &JsValue::from_str(&format!("m{i}")))
+                .ok()
+                .and_then(|f| f.dyn_into::<js_sys::Function>().ok());
+            match func {
+                Some(f) if table.set(slot as u32, &f).is_ok() => {
+                    MEMBER_SLOTS.with(|m| m.borrow_mut().insert(key, slot));
+                }
+                // Couldn't bind — return the slot to the pool.
+                _ => FREE_SLOTS.with(|s| {
+                    if let Some(p) = s.borrow_mut().as_mut() {
+                        p.push(slot);
+                    }
+                }),
+            }
+        }
+        let _ = instance;
         let generation = Rc::new(Generation { run, run_index });
         GEN_ENTRIES.with(|g| {
             let mut g = g.borrow_mut();
@@ -649,10 +744,17 @@ mod web {
                 g.insert(key, (generation.clone(), i as u32));
             }
         });
-        // The members' standalone modules/instances are now dead weight — drop
-        // them so the browser can reclaim their executable memory, and RECYCLE
-        // their reserved table slots (this keeps total slot usage bounded by
-        // `pending cold methods + generations`, so the pool stays small).
+        // The members are now reached via the generation dispatcher, so drop their
+        // standalone modules/instances (reclaiming executable memory) and RECYCLE their
+        // reserved table slots — keeping total slot usage bounded by `pending cold
+        // methods + generations`.
+        //
+        // Recycling a standalone slot is SOUND because a standalone slot is NEVER cached
+        // in a direct-call cell: `WasmJit::direct_target` caches ONLY a generation
+        // member's dispatcher slot (which is never recycled — a generation is never
+        // uninstalled), so no cell can hold a slot we recycle here. (Caching standalone
+        // slots previously let a stale cell `call_indirect` a recycled-and-reused slot →
+        // wrong method / "Method should exist" corruption.)
         MODULE_CACHE.with(|c| {
             let mut c = c.borrow_mut();
             for key in member_keys {
@@ -685,6 +787,13 @@ mod web {
         Some(())
     }
 
+    /// RUN_IC probe: direct-mapped lookup of `key`'s cached `(dispatcher fn-ptr, member
+    /// index)`. On the hot dispatch path, so left inlinable.
+    fn run_ic_probe(key: usize) -> Option<(usize, u32)> {
+        let ic_slot = (key >> 4) & (RUN_IC_SIZE - 1);
+        RUN_IC.with(|ic| ic.borrow()[ic_slot].filter(|(k, ..)| *k == key).map(|(_, i, m)| (i, m)))
+    }
+
     pub(super) fn run(
         bytes: &[u8],
         regs: &[u64],
@@ -692,14 +801,13 @@ mod web {
         ic_base: u32,
     ) -> Option<u64> {
         let frame_bytes = regs.len() * 8;
-        let depth = DEPTH.with(|d| d.get());
+        let depth = unsafe { DEPTH };
         let state_ptr = depth * STRIDE;
         // Decline (→ interpreter) rather than alias frames or run off the memory: a
         // method with more than STRIDE-worth of locals, or nesting past the memory.
         if frame_bytes > STRIDE || state_ptr + frame_bytes > MEM_BYTES {
             return None;
         }
-        let mem = memory()?;
         let key = bytes.as_ptr() as usize;
 
         // The registers are read by the module's prologue (see below), and the
@@ -716,7 +824,7 @@ mod web {
         type RunFn7 = unsafe extern "C" fn(i32, i32, i32, i32, i32, i32, i32) -> i64;
         let call_dispatcher = |idx: usize, member: u32| -> u64 {
             let run: RunFn7 = unsafe { core::mem::transmute::<usize, RunFn7>(idx) };
-            DEPTH.with(|d| d.set(depth + 1));
+            unsafe { DEPTH = depth + 1 };
             let r = unsafe {
                 run(
                     member as i32,
@@ -734,33 +842,61 @@ mod web {
                     ic_base as i32,
                 )
             } as u64;
-            DEPTH.with(|d| d.set(depth));
+            unsafe { DEPTH = depth };
             r
         };
 
-        // Run-target inline cache: hit → call the cached dispatcher directly,
-        // skipping the `GEN_ENTRIES` lookup + `Rc` clone (the biggest slice of the
-        // remaining per-call dispatch cost).
-        let ic_slot = (key >> 4) & (RUN_IC_SIZE - 1);
-        if let Some((idx, member)) =
-            RUN_IC.with(|ic| ic.borrow()[ic_slot].filter(|(k, ..)| *k == key).map(|(_, i, m)| (i, m)))
-        {
-            return Some(call_dispatcher(idx, member));
+        // A generation member that got its OWN permanent slot (`MEMBER_SLOTS`) is called
+        // as a plain 6-param `run` — skipping the amalgam DISPATCHER's `method_idx`
+        // `call_indirect` indirection (a measured ~11% of the worker, `jit_dispatch`, on
+        // call-dense Lua). Same shape as the standalone slot call below.
+        type RunFn6 = unsafe extern "C" fn(i32, i32, i32, i32, i32, i32) -> i64;
+        let call_member = |idx: usize| -> u64 {
+            let run: RunFn6 = unsafe { core::mem::transmute::<usize, RunFn6>(idx) };
+            unsafe { DEPTH = depth + 1 };
+            let r = unsafe {
+                run(state_ptr as i32, dm_base as i32, dm_len as i32, regs_ptr as i32, regs_len as i32, ic_base as i32)
+            } as u64;
+            unsafe { DEPTH = depth };
+            r
+        };
+        // Dispatch a resolved `(slot, member)`: a member slot (`member == CALL_NO_MEMBER`)
+        // goes 6-param direct; else the 7-param dispatcher with the member index.
+        let dispatch = |idx: usize, member: u32| -> u64 {
+            if member == crate::lower::CALL_NO_MEMBER {
+                call_member(idx)
+            } else {
+                call_dispatcher(idx, member)
+            }
+        };
+
+        // Run-target inline cache: hit → call the cached target directly, skipping the
+        // `GEN_ENTRIES`/`MEMBER_SLOTS` lookup + `Rc` clone (the biggest slice of the
+        // remaining per-call dispatch cost). Probe is `#[inline(never)]` so a profiler
+        // shows its RefCell-borrow + hash cost separately from `run`'s self-time.
+        if let Some((idx, member)) = run_ic_probe(key) {
+            return Some(dispatch(idx, member));
         }
 
-        // GENERATION path: the method lives in an amalgam module — call its
-        // dispatcher with the member index prepended.
+        // GENERATION path: the method lives in an amalgam module. Prefer its member slot
+        // (6-param direct); fall back to the dispatcher (7-param) if it got none.
         if let Some((generation, member)) = GEN_ENTRIES.with(|g| g.borrow().get(&key).cloned()) {
             let result = match generation.run_index {
-                Some(idx) => {
-                    // Cache the direct-call target, then dispatch.
+                Some(dispatcher_idx) => {
+                    // Prefer the member's own slot (no dispatcher indirection).
+                    let (idx, member) = MEMBER_SLOTS
+                        .with(|m| m.borrow().get(&key).copied())
+                        .map(|slot| (slot, crate::lower::CALL_NO_MEMBER))
+                        .unwrap_or((dispatcher_idx, member));
+                    // Cache the resolved target, then dispatch.
+                    let ic_slot = (key >> 4) & (RUN_IC_SIZE - 1);
                     RUN_IC.with(|ic| ic.borrow_mut()[ic_slot] = Some((key, idx, member)));
-                    Some(call_dispatcher(idx, member))
+                    Some(dispatch(idx, member))
                 }
                 None => {
                     // Not cached (the fn-ptr fast path is; this JS-apply fallback
                     // is rare). Manage `DEPTH` around the re-entrant call itself.
-                    DEPTH.with(|d| d.set(depth + 1));
+                    unsafe { DEPTH = depth + 1 };
                     // (`js_sys::Array` has constructors only up to `of5`.)
                     let args = js_sys::Array::of5(
                         &JsValue::from(member),
@@ -778,7 +914,7 @@ mod web {
                         .and_then(|r| r.dyn_into::<js_sys::BigInt>().ok())
                         .and_then(|b| i64::try_from(b).ok())
                         .map(|v| v as u64);
-                    DEPTH.with(|d| d.set(depth));
+                    unsafe { DEPTH = depth };
                     r
                 }
             };
@@ -786,10 +922,15 @@ mod web {
         }
 
         // Get (or build+cache) the method's instance, cloning the `Rc` out so no
-        // `INSTANCES` borrow is held across the call (which re-enters `run`).
+        // `INSTANCES` borrow is held across the call (which re-enters `run`). The shared
+        // frame memory is fetched ONLY here (a build) — never on the hot cached/RUN_IC/
+        // generation paths, which don't touch it. `memory()` clones a JS `WebAssembly.
+        // Memory` handle (a wasm↔JS refcount round-trip); doing it per call showed up as
+        // a large slice of `run`'s self-time on call-heavy CrossBridge content.
         let inst = match INSTANCES.with(|c| c.borrow().get(&key).cloned()) {
             Some(i) => i,
             None => {
+                let mem = memory()?;
                 let built = Rc::new(build(bytes, m, &mem)?);
                 INSTANCES.with(|c| c.borrow_mut().insert(key, built.clone()));
                 built
@@ -804,7 +945,7 @@ mod web {
         //
         // Enter one nesting level, run, leave — a re-entrant run reads the
         // incremented depth → a disjoint frame.
-        DEPTH.with(|d| d.set(depth + 1));
+        unsafe { DEPTH = depth + 1 };
         let result = match inst.run_index {
             // Preferred: call the JIT `run` **wasm→wasm** through its indirect-table
             // slot. On wasm32 a fn-pointer's integer value IS its
@@ -853,7 +994,7 @@ mod web {
                     .map(|v| v as u64)
             }
         };
-        DEPTH.with(|d| d.set(depth));
+        unsafe { DEPTH = depth };
         result
     }
 
@@ -865,11 +1006,20 @@ mod web {
     /// forwards to it). `None` if uncompiled, or the (dispatcher/run) never got a
     /// shared-table slot (JS-apply fallback → not directly callable).
     pub(super) fn run_index_for(bytes_ptr: usize) -> Option<(u32, u32)> {
-        if let Some(idx) =
-            INSTANCES.with(|c| c.borrow().get(&bytes_ptr).and_then(|cached| cached.run_index))
-        {
-            return Some((idx as u32, crate::lower::CALL_NO_MEMBER));
+        // Preferred: the member's OWN permanent slot → a plain 6-param direct call
+        // (`CALL_NO_MEMBER` picks the standalone HIT path in `emit_call_direct`), with no
+        // dispatcher indirection.
+        if let Some(slot) = MEMBER_SLOTS.with(|m| m.borrow().get(&bytes_ptr).copied()) {
+            return Some((slot as u32, crate::lower::CALL_NO_MEMBER));
         }
+        // Fallback: the generation's dispatcher slot + member index (7-param dispatch),
+        // used when the member got no own slot (pool exhausted).
+        //
+        // The standalone `INSTANCES` slot is deliberately NOT returned: it is RECYCLED when
+        // the method joins a generation (`install_generation`), so a direct-call cell that
+        // cached it would `call_indirect` a recycled-and-reused slot → the WRONG method
+        // ("Method should exist" / arg-count corruption). Only permanent slots (member or
+        // dispatcher) are ever handed to `direct_target`.
         GEN_ENTRIES.with(|g| {
             g.borrow()
                 .get(&bytes_ptr)
@@ -901,8 +1051,9 @@ pub fn install_generation(
     gen_bytes: &[u8],
     union: &crate::lower::Manifest,
     member_keys: &[usize],
+    directable: &[bool],
 ) -> bool {
-    web::install_generation(gen_bytes, union, member_keys)
+    web::install_generation(gen_bytes, union, member_keys, directable)
 }
 
 /// In-browser end-to-end test of the web runner: emit a real `run` module and

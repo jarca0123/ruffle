@@ -105,6 +105,16 @@ struct Compiled {
     /// has no locals beyond them (`num_locals == param_count + 1` → no stale
     /// uninitialized temporaries). The refill checks both before caching a target.
     param_count: u32,
+    /// Whether this method is a valid **direct-call target** w.r.t. its parameters: not
+    /// variadic, at most [`lower::MAX_DIRECT_ARGC`] params, and every param a type the
+    /// inline HIT guard can tag-check ([`helpers::param_check_words`] resolves — untyped
+    /// `*`, `int`/`uint`/`Number`/`Boolean`/`String`/`Object`). A direct call writes the
+    /// caller's args into the callee frame **uncoerced**; the guard verifies each already
+    /// matches its param type (`Value::coerces_identically_to`) so that is bit-identical
+    /// to the interpreter's coerced entry (`init_from_method` → `resolve_parameters`),
+    /// else it misses to the coercing helper. A concrete-class or `void` param (needs an
+    /// exact-class compare) keeps the callee on the helper. Checked before caching a target.
+    all_params_directable: bool,
     /// The lowered inputs, kept for GENERATION rebuilds (see
     /// [`lower::compile_generation`]): batches of compiled methods are re-emitted
     /// into one shared "amalgam" module against their union import layout.
@@ -124,6 +134,9 @@ struct GenSource {
     /// Per-local "is numeric on entry" (param types) — seeds check-elision when
     /// this method is re-emitted into a generation amalgam.
     numeric_seed: Rc<[bool]>,
+    /// Resolved `Gc<Multiname>` pointers baked at getproperty sites, re-supplied when
+    /// this method is re-emitted into an amalgam (see [`lower::compile_full`]).
+    mn_list: Rc<[*const ()]>,
 }
 
 impl GenSource {
@@ -137,6 +150,7 @@ impl GenSource {
             exceptions: Rc::from([] as [lower::ExcRange; 0]),
             name: Rc::from(""),
             numeric_seed: Rc::from([] as [bool; 0]),
+            mn_list: Rc::from([] as [*const (); 0]),
         }
     }
 }
@@ -154,12 +168,26 @@ type CacheEntry = Option<Rc<Compiled>>;
 /// each **per method**, which exhausted the browser's page-granular
 /// executable-code arena ("failed to allocate executable memory for module") and
 /// the reserved entry-slot pool on method-heavy content (OpenTTD).
-// Smaller amalgams (was 128): a method becomes a JIT→JIT direct-call target only
-// once it is installed in an amalgam with a shared-table dispatcher slot, so smaller
-// batches install sooner → the call-cache warms up faster. The cost is more
-// dispatchers (one shared-table slot each) + more re-emits; with RESERVED_SLOT_COUNT
-// = 2048 that still covers ~65k methods, well beyond real content.
+// SMALL amalgams: a method becomes a JIT→JIT direct-call target ONLY once it is an
+// installed generation member (`WasmJit::direct_target` caches only a member's permanent
+// dispatcher slot, never a recyclable standalone slot — see the stale-slot note there), so
+// a small batch installs sooner → the direct-call cache warms up faster (measured: a large
+// batch left Starling callees standalone and missing to the coercing helper for far too
+// long → a busy/frame regression). The earlier bump to 256 chased a `WebAssembly.Instance`
+// hotspot that turned out to be an unrelated import-binding bug (`pca` for `has_call_direct`
+// went unbound → per-call re-instantiation), now fixed — so batch size is back to favoring
+// warmup. The re-instantiation cost is gone, so more (smaller) generations is cheap.
 const GEN_BATCH: usize = 32;
+
+/// Decline a method whose emitted module exceeds this many bytes. A JIT module is one
+/// wasm function plus small sections, and the browsers cap a **single function** at
+/// ≈7.65 MB (`kV8MaxWasmFunctionSize` = 7_654_321; SpiderMonkey similar). Past that,
+/// `WebAssembly.Module` rejects the module — and, fatally, rejects any GENERATION amalgam
+/// that function is folded into (skipping the whole batch). Declining oversized methods
+/// to the interpreter keeps amalgams valid and stops the per-call `Module()` retry. The
+/// margin below the hard limit covers the (small) non-function module sections + the
+/// amalgam's shared dispatcher/import overhead.
+const MAX_EMITTED_MODULE_BYTES: usize = 7_000_000;
 
 /// Inline-cache table size (power of two — the mask is `IC_SIZE - 1`). Direct-
 /// mapped method-ptr → `Compiled`, fronting the `cache` HashMap on the hot path.
@@ -306,20 +334,38 @@ impl WasmJit {
 
     /// Resolve a callee (by its `Method` `Gc` pointer) to a JIT→JIT direct-call
     /// target `(table_slot, ic_base, member_idx)` — it must be compiled,
-    /// [`Compiled::directable`], and hold a shared-table slot (its own `run`, or its
-    /// amalgam dispatcher for a generation member). `None` otherwise, so the
-    /// call-cache refill records the sentinel. Called by the `cmi` helper via the
-    /// `RunCtx`'s erased `self` pointer.
+    /// [`Compiled::directable`], have **tag-checkable params**
+    /// ([`Compiled::all_params_directable`] — the HIT guard verifies each arg matches so
+    /// the uncoerced write equals the interpreter), receive EXACTLY its params
+    /// (`argc == param_count`,
+    /// `num_locals == argc + 1`), and be a **generation member** holding its amalgam's
+    /// (never-recycled) dispatcher slot — a standalone `run` slot is recycled when the
+    /// method is amalgamated, so caching it risks a stale-slot misdispatch. `None`
+    /// otherwise, so the call-cache refill records the sentinel and the site keeps taking
+    /// the coercing helper. Called by the `cmi` helper via the `RunCtx`'s erased `self`.
     pub(crate) fn direct_target(&self, callee_ptr: usize, argc: u32) -> Option<(u32, u32, u32)> {
         let cache = self.cache.borrow();
         let compiled = cache.get(&callee_ptr)?.as_deref()?;
-        // Sound only when the caller's direct-call frame — exactly `{this, argc args}`
-        // — matches what the callee reads: every param provided (no defaults to fill)
-        // and no locals beyond them (no stale, uninitialized temporaries). Otherwise
-        // fall to the helper (which builds a full, coerced, default-filled frame).
-        if !compiled.directable || compiled.param_count != argc || compiled.num_locals != argc + 1 {
+        // Sound only when the caller's direct-call frame — exactly `{this, argc args}` —
+        // provides every param (no defaults to fill: `param_count == argc`). Extra locals
+        // ARE allowed now: the callee prologue zeroes them to `undefined` on the direct
+        // path (see `emit_body`), matching `init_from_method`. The frame must still fit one
+        // nesting slice (`num_locals * 8 <= FRAME_STRIDE`); otherwise fall to the helper.
+        if !compiled.directable
+            || !compiled.all_params_directable
+            || compiled.param_count != argc
+            || compiled.num_locals < argc + 1
+            || compiled.num_locals * 8 > lower::FRAME_STRIDE
+        {
             return None;
         }
+        // `run_index_for` returns only PERMANENT slots (a member's own slot, or its
+        // generation dispatcher) — never the recyclable standalone slot — so whatever it
+        // yields is safe to cache in a direct-call cell (no stale-slot misdispatch). A
+        // callee thus becomes direct-callable once it is amalgamated; until then its callers
+        // take the (correct) coercing helper. `member_idx == CALL_NO_MEMBER` here means the
+        // member's own 6-param slot (no dispatcher); any other value is the 7-param
+        // dispatcher fallback (pool exhausted).
         let (slot, member_idx) = runner::run_index_for(compiled.bytes.as_ptr() as usize)?;
         Some((slot, compiled.ic_base, member_idx))
     }
@@ -477,9 +523,10 @@ impl WasmJit {
                 // meaningful where the inline IC is emitted (`has_ic`, wasm32); the
                 // pointer is truncated to 0 elsewhere (nothing reads it).
                 // Shared per-method cache buffer, `[property-IC cells | call-cache
-                // cells]` in memory 1. IC cell = 8 bytes (1 `u64`); call cell = 16
-                // bytes (2 `u64`). `ic_base` (the run param) points at the start; the
-                // call region begins at `ic_sites * IC_CELL_SIZE` (see `emit_body`).
+                // cells]` in memory 1. IC cell = `IC_CELL_SIZE` (8 bytes, 1 `u64`); call
+                // cell = `CALL_CELL_SIZE` (16-byte header + per-arg check-words).
+                // `ic_base` (the run param) points at the start; the call region begins
+                // at `ic_sites * IC_CELL_SIZE` (see `emit_body`).
                 let ic_sites = gen_src
                     .ops
                     .iter()
@@ -490,7 +537,7 @@ impl WasmJit {
                     .iter()
                     .filter(|op| matches!(op, lower::JitOp::CallMethodDirect(..)))
                     .count();
-                let total_u64 = ic_sites + call_sites * 2;
+                let total_u64 = ic_sites + call_sites * (lower::CALL_CELL_SIZE as usize / 8);
                 let ic_cells: Rc<[std::cell::Cell<u64>]> =
                     (0..total_u64).map(|_| std::cell::Cell::new(0u64)).collect();
                 let ic_base = if manifest.has_ic || manifest.has_call_direct {
@@ -538,6 +585,16 @@ impl WasmJit {
                     ic_base,
                     directable,
                     param_count: method.resolved_param_config().len() as u32,
+                    // Direct-call param gate: not variadic, ≤ MAX_DIRECT_ARGC params, and
+                    // every param tag-checkable by the inline HIT guard. Each checkable
+                    // param's uncoerced pass is guarded to be bit-identical to the
+                    // interpreter (see `all_params_directable` / `param_check_words`).
+                    all_params_directable: !method.is_variadic()
+                        && method.resolved_param_config().len() as u32 <= lower::MAX_DIRECT_ARGC
+                        && method
+                            .resolved_param_config()
+                            .iter()
+                            .all(|p| helpers::param_check(p.param_type).is_some()),
                     gen_src,
                 }
             })
@@ -592,7 +649,7 @@ impl WasmJit {
             return;
         }
         let keys = std::mem::take(&mut *self.gen_pending.borrow_mut());
-        let (bytes, union, member_keys) = {
+        let (bytes, union, member_keys, directable) = {
             let cache = self.cache.borrow();
             let compiled: Vec<&Compiled> = keys
                 .iter()
@@ -606,6 +663,7 @@ impl WasmJit {
                     exceptions: &c.gen_src.exceptions,
                     name: &c.gen_src.name,
                     numeric_seed: &c.gen_src.numeric_seed,
+                    mn_list: &c.gen_src.mn_list,
                 })
                 .collect();
             let Some((bytes, union)) = lower::compile_generation(&members) else {
@@ -614,9 +672,16 @@ impl WasmJit {
             // The runner keys methods by their (cached, never-moving) module bytes.
             let member_keys: Vec<usize> =
                 compiled.iter().map(|c| c.bytes.as_ptr() as usize).collect();
-            (bytes, union, member_keys)
+            // Which members are worth their own permanent direct-call slot: the
+            // method-intrinsic direct-call gates (the per-call `argc` gates are checked in
+            // `direct_target`). Parallel to `member_keys`.
+            let directable: Vec<bool> = compiled
+                .iter()
+                .map(|c| c.directable && c.all_params_directable)
+                .collect();
+            (bytes, union, member_keys, directable)
         };
-        if runner::install_generation(&bytes, &union, &member_keys) {
+        if runner::install_generation(&bytes, &union, &member_keys, &directable) {
             // The members' generation sources (per-method `JitOp`/switch/exception
             // copies) exist only to re-emit this batch — dead weight once the
             // generation is live. Drop them; the standing JIT memory then stays
@@ -738,9 +803,30 @@ fn compile_method<'gc>(
                   mn_list: Vec<*const ()>,
                   all_getslots_null_safe: bool|
      -> Option<(Rc<[u8]>, lower::Manifest, Rc<[*const ()]>, GenSource, bool)> {
-        let bytes = Rc::from(
-            lower::compile_full(ops, switches, exceptions, numeric_seed)?.into_boxed_slice(),
+        // Share one `Rc` for the three consumers: `compile_full` (bakes `mn_list[k]` at
+        // getproperty sites), the `GenSource` (re-emitted into an amalgam), and the
+        // returned `mn_table`.
+        let mn_list: Rc<[*const ()]> = mn_list.into();
+        let bytes: Rc<[u8]> = Rc::from(
+            lower::compile_full(ops, switches, exceptions, numeric_seed, &mn_list)?
+                .into_boxed_slice(),
         );
+        // A method that emits a single wasm function larger than the browser's
+        // per-function size limit (V8/SpiderMonkey ≈ 7.65 MB) can't be validated by
+        // `WebAssembly.Module` — and worse, it POISONS any generation amalgam it joins
+        // (the whole batch's install is rejected: "size … > maximum function size …"),
+        // and the per-method path retries `Module()` on every call. A few enormous
+        // CrossBridge C/C++ functions (OpenTTD, Lua's `F_luaV_execute`) hit this. The
+        // module is one function plus small sections, so `bytes.len()` tracks it; decline
+        // (→ interpreter) below the limit with margin, so amalgams stay valid.
+        if bytes.len() > MAX_EMITTED_MODULE_BYTES {
+            tracing::warn!(
+                "AVM2 JIT: method emits {} bytes (> {} per-function limit) — declining to interpreter",
+                bytes.len(),
+                MAX_EMITTED_MODULE_BYTES,
+            );
+            return None;
+        }
         let gen_src = GenSource {
             ops: ops.into(),
             switches: switches.into(),
@@ -748,10 +834,11 @@ fn compile_method<'gc>(
             // Filled in by the caller (which has the `Method` for `method_name`).
             name: Rc::from(""),
             numeric_seed: numeric_seed.into(),
+            mn_list: mn_list.clone(),
         };
         let manifest = lower::manifest(ops);
         let directable = manifest.directable(all_getslots_null_safe);
-        Some((bytes, manifest, mn_list.into(), gen_src, directable))
+        Some((bytes, manifest, mn_list, gen_src, directable))
     };
 
     // Int fast path (raw i32) — only when provably int-sound. Pure register/frame

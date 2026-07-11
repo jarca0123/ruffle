@@ -10,7 +10,10 @@ const contentSecurityPolicy = [
     "default-src 'self'",
     "script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' 'unsafe-inline'",
     "style-src 'self' 'unsafe-inline'",
-    "connect-src *",
+    // `*` matches only network schemes (http/https/ws/wss) — per the CSP spec it does
+    // NOT cover `blob:`/`data:`, so those must be listed explicitly. The worker-player
+    // path fetches worker/wasm bytes from a `blob:` URL (and inlined `data:` resources).
+    "connect-src * blob: data:",
     "media-src *",
     "img-src 'self' data:",
     "worker-src 'self' blob:",

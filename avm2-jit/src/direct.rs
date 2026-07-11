@@ -238,7 +238,11 @@ pub(crate) fn run(ops: &[JitOp], regs: &[u64]) -> Option<u64> {
             }
             JitOp::GetProperty(k) => {
                 let recv = pop!();
-                push!(helpers::get_property(recv, k as i64));
+                // The emitted wasm bakes the multiname POINTER at this site; direct-exec
+                // has only the index, so resolve it through the run context (SAFETY:
+                // direct-exec runs inside `with_run_ctx`, `k` is a populated index).
+                let mn = unsafe { helpers::multiname_ptr(k as usize) };
+                push!(helpers::get_property(recv, mn));
                 perr_bail!();
             }
             JitOp::GetPropertyFast(k, _) => {

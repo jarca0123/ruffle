@@ -176,6 +176,18 @@ pub fn jit_vtable_offset() -> u32 {
     std::mem::offset_of!(ScriptObjectData<'static, Erased>, vtable) as u32
 }
 
+/// AVM2-JIT layout ABI for the direct-call **exact-class arg guard**: the byte offset,
+/// within an object's `ScriptObjectData` prefix (`#[repr(C)]`, shared by every `Object`
+/// variant), of the `instance_class` field. `Class<'gc>` is `#[repr(transparent)]` over a
+/// single `Gc` word, so the word at this offset is the class's raw pointer — identical to
+/// `Class::as_ptr()` and compared by `Class`'s `Gc::ptr_eq`. The JIT→JIT direct call
+/// caches a typed callee's concrete-class param as that pointer and, on the HIT path,
+/// checks a candidate arg with `obj.instance_class == cached` (the runtime form of
+/// `Value::coerces_identically_to` for a class), so an uncoerced pass is exact-class-safe.
+pub fn jit_instance_class_offset() -> u32 {
+    std::mem::offset_of!(ScriptObjectData<'static, Erased>, instance_class) as u32
+}
+
 impl<'gc, K> ScriptObjectData<'gc, K> {
     #[inline(always)]
     pub fn kind(&self) -> ObjectKind {

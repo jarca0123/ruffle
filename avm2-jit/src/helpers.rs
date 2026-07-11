@@ -375,6 +375,37 @@ fn get_push_string(k: i64) -> i64 {
 /// Only call from a helper running inside [`with_run_ctx`], with `k` in range
 /// (the emitter only produces indices it populated); the returned reference must
 /// not escape the call. `'gc` is unchecked — bind it to the current activation's.
+/// A `&Multiname` from a raw pointer BAKED into the emitted code (`get_property`/
+/// `get_property_ic`), instead of an index into `RUN_CTX.multinames`. The pointer is
+/// `mn_list[k]` (a live `Gc<Multiname>` address, stable under the non-moving GC and
+/// alive for the method's lifetime — see `lower::compile_full`'s `mn_list`). This is
+/// what makes `getproperty` a direct-call target: no per-method table read, so a
+/// direct entry (which doesn't build `RUN_CTX.multinames`) resolves correctly.
+///
+/// # Safety
+/// `p` must be a live `Gc<Multiname>` address the emitter baked; the reference must
+/// not escape the call. `'gc` is unchecked — bind it to the current activation's.
+unsafe fn multiname_from_ptr<'gc>(p: i64) -> &'gc Multiname<'gc> {
+    // SAFETY: `p` is a baked live multiname address (delegated to caller).
+    unsafe { &*(p as usize as *const Multiname<'gc>) }
+}
+
+/// The `k`-th multiname pointer (as an i64) from the current run context — for the
+/// direct-exec tier ([`crate::direct`]), which interprets [`JitOp`]s directly and so
+/// has the INDEX `k`, not the pointer the emitted wasm bakes. It resolves through
+/// `RUN_CTX.multinames` (the same table `try_run` installs) and hands the pointer to
+/// `get_property`, matching the baked-pointer contract.
+///
+/// # Safety
+/// Call only inside [`with_run_ctx`] with `k` in range (the caller only produces
+/// indices it populated).
+pub(crate) unsafe fn multiname_ptr(k: usize) -> i64 {
+    let (ptr, len) = unsafe { run_ctx() }.multinames;
+    debug_assert!(k < len, "direct-exec multiname index {k} out of range (len {len})");
+    // SAFETY: `ptr` points at a live `&[*const ()]`; `k` is in range.
+    unsafe { *ptr.add(k) as usize as i64 }
+}
+
 unsafe fn multiname<'gc>(k: usize) -> &'gc Multiname<'gc> {
     let (ptr, len) = unsafe { run_ctx() }.multinames;
     debug_assert!(k < len, "JIT getproperty multiname index {k} out of range (len {len})");
@@ -1136,10 +1167,10 @@ pub(crate) static HELPERS2: &[Helper2Fn] = &[
 /// swallowed to `undefined`, which silently diverged: the bogus `undefined` flowed
 /// on into slots/args and surfaced later as e.g. `#1041` from an interpreted
 /// `istypelate` — while the interpreter would have thrown here.)
-pub(crate) fn get_property(receiver: i64, k: i64) -> i64 {
-    // SAFETY: helpers run only inside `with_run_ctx`.
+pub(crate) fn get_property(receiver: i64, mn_ptr: i64) -> i64 {
+    // SAFETY: helpers run only inside `with_run_ctx`; `mn_ptr` is a baked multiname.
     let activation = unsafe { activation() };
-    let mn = unsafe { multiname(k as usize) };
+    let mn = unsafe { multiname_from_ptr(mn_ptr) };
 
     let result = to_value(receiver)
         .null_check(activation, Some(mn))
@@ -1169,10 +1200,10 @@ pub(crate) fn get_property(receiver: i64, k: i64) -> i64 {
 /// a real pointer, valid only under 32-bit pointers. Native never emits
 /// `GetPropertyIc` (no inline object layout), so the fill is compiled out; the
 /// resolve/return path is identical to [`get_property`] there.
-pub(crate) fn get_property_ic(receiver: i64, k: i64, cell_addr: i32) -> i64 {
-    // SAFETY: helpers run only inside `with_run_ctx`.
+pub(crate) fn get_property_ic(receiver: i64, mn_ptr: i64, cell_addr: i32) -> i64 {
+    // SAFETY: helpers run only inside `with_run_ctx`; `mn_ptr` is a baked multiname.
     let activation = unsafe { activation() };
-    let mn = unsafe { multiname(k as usize) };
+    let mn = unsafe { multiname_from_ptr(mn_ptr) };
 
     let recv = to_value(receiver);
     let result = recv
@@ -1563,12 +1594,63 @@ pub(crate) fn call_method_ic(receiver: i64, disp_id: i64, argc: i64, cell_addr: 
     result
 }
 
-/// Refills the direct-call cache cell `{ vtable: u32, run_index: u32, ic_base: u32 }`
-/// at `cell_addr` (memory 1). Writes the callee's shared-table `run` slot + `ic_base`
-/// when it resolves to a compiled **directable** target; otherwise the
-/// `CALL_SENTINEL` (observed-but-not-directable → the guard's vtable may match but
-/// the site keeps taking this helper). A non-object receiver / unresolved method
-/// leaves the fresh (zero) cell so the next call retries.
+/// How the direct-call HIT guard verifies one arg matches its param type (the runtime
+/// form of [`Value::coerces_identically_to`], so a passing arg needs no coercion and the
+/// raw direct write is bit-identical to the interpreter's coerced entry).
+pub(crate) enum ParamCheck<'gc> {
+    /// Uniform bit test: `((arg & (mask_and_want & !1)) == expected) == (mask_and_want &
+    /// 1)`. Covers untyped `*`, `int`/`uint`/`Number`/`Boolean`/`String`/`Object`.
+    Tag { mask_and_want: u64, expected: u64 },
+    /// Exact-class: `arg == null` OR (arg is an object whose `instance_class == class`).
+    ExactClass(Class<'gc>),
+}
+
+/// The [`ParamCheck`] for a param of type `param_type` (`None` = untyped `*`), or `None`
+/// if the type can't be a direct-call target (`void` / a script trait) — then the callee
+/// stays on the coercing helper. Tag constants mirror `core::avm2::value`'s NaN-boxing
+/// (`BOX_MARK` + 3-bit tag at bit 48); `want` lives in bit 0 of the mask word (every real
+/// mask has bit 0 clear).
+pub(crate) fn param_check(param_type: Option<Class<'_>>) -> Option<ParamCheck<'_>> {
+    use ruffle_core::avm2::BuiltinType;
+    const BOX_MARK: u64 = 0xFFF8_0000_0000_0000;
+    const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
+    const WANT: u64 = 1;
+    // Top-16 pattern of a boxed value with 3-bit `tag` (`BOX_MARK | tag << 48`).
+    const fn tag(t: u64) -> u64 {
+        (0xFFF8 | t) << 48
+    }
+    let mk = |mask_and_want, expected| ParamCheck::Tag { mask_and_want, expected };
+    let Some(class) = param_type else {
+        return Some(mk(WANT, 0)); // untyped `*` → ANY: (arg & 0) == 0 is always true
+    };
+    Some(match class.builtin_type() {
+        // `int`: tag == INT(3). `uint`: tag == INT(3) AND the value's sign bit (payload
+        // bit 31) clear — folded into the mask so it's still one `==`.
+        Some(BuiltinType::Int) => mk(TAG_MASK | WANT, tag(3)),
+        Some(BuiltinType::Uint) => mk(TAG_MASK | (1 << 31) | WANT, tag(3)),
+        // `Number`: `is_f64` == `bits & BOX_MARK != BOX_MARK` → want 0 (match when the
+        // masked bits are NOT the box marker).
+        Some(BuiltinType::Number) => mk(BOX_MARK, BOX_MARK),
+        Some(BuiltinType::Boolean) => mk(TAG_MASK | WANT, tag(2)),
+        Some(BuiltinType::String) => mk(TAG_MASK | WANT, tag(4)),
+        // `Object`: coerces identically unless `undefined` (tag 0) → want 0 (match when
+        // tag != UNDEFINED). null/int/number/object all pass.
+        Some(BuiltinType::Object) => mk(TAG_MASK, tag(0)),
+        // `void` / a script trait can't be a coerced value param → not a direct target.
+        Some(BuiltinType::Void) | Some(BuiltinType::ScriptTraits) => return None,
+        // A concrete (non-builtin) class → exact-class check (`instance_class == class`).
+        None => ParamCheck::ExactClass(class),
+    })
+}
+
+/// Refills the direct-call cache cell (see [`crate::lower::CALL_CELL_SIZE`]): the 16-byte
+/// header `{ vtable: u32, run_index: u32, ic_base: u32, member_idx: u32 }` at `cell_addr`
+/// (memory 1), plus — for a directable target — the per-arg `{mask_and_want, expected}`
+/// check-word pairs the HIT guard reads. Writes the callee's `run` slot when it resolves
+/// to a compiled **directable** target; otherwise the `CALL_SENTINEL` (observed-but-not-
+/// directable → the guard's vtable may match but the site keeps taking the helper). A
+/// non-object receiver / unresolved method leaves the fresh (zero) cell so the next call
+/// retries.
 #[cfg(target_arch = "wasm32")]
 fn refill_call_cell(receiver: i64, disp_id: u32, argc: u32, cell_addr: i32) {
     let recv = to_value(receiver);
@@ -1583,14 +1665,40 @@ fn refill_call_cell(receiver: i64, disp_id: u32, argc: u32, cell_addr: i32) {
         .and_then(|jit| jit.direct_target(callee.as_ptr() as usize, argc))
         .unwrap_or((crate::lower::CALL_SENTINEL, 0, crate::lower::CALL_NO_MEMBER));
     let cell = (cell_addr as u32) as usize as *mut u32;
-    // SAFETY: `cell_addr` is this site's 16-byte cell in the method's JIT-owned cache
-    // buffer (memory 1); single-threaded, no aliasing `&mut`.
-    // Cell = { vtable, table_slot, ic_base, member_idx }.
+    // SAFETY: `cell_addr` is this site's cell in the method's JIT-owned cache buffer
+    // (memory 1); single-threaded, no aliasing `&mut`.
+    // Header = { vtable, table_slot, ic_base, member_idx }.
     unsafe {
         *cell = class_word;
         *cell.add(1) = slot;
         *cell.add(2) = ic_base;
         *cell.add(3) = member_idx;
+    }
+    // A directable target: fill the per-arg check-words the HIT guard reads (at byte 16,
+    // one `{mask_and_want, expected}` u64 pair per arg). `direct_target` guaranteed
+    // `argc == param_count`, `argc <= MAX_DIRECT_ARGC`, and every param tag-checkable, so
+    // `param_check_words` resolves; the `(1, 1)` fallback can never match (defensive).
+    // A SENTINEL cell never reaches the guard, so its arg words stay unused.
+    if slot != crate::lower::CALL_SENTINEL {
+        let params = callee.resolved_param_config();
+        let words = ((cell_addr as u32 as usize) + 16) as *mut u64;
+        for i in 0..argc as usize {
+            // `direct_target` guaranteed every param resolves; `(1, 1)` (never matches) is
+            // a defensive fallback. A concrete class stores the exact-class marker + the
+            // class `Gc` pointer (low 32 bits on wasm32 = the object's `instance_class` word).
+            let (mask_want, expected) = match param_check(params.get(i).and_then(|p| p.param_type)) {
+                Some(ParamCheck::Tag { mask_and_want, expected }) => (mask_and_want, expected),
+                Some(ParamCheck::ExactClass(class)) => {
+                    (crate::lower::CALL_CLASS_MARK, class.as_ptr() as usize as u32 as u64)
+                }
+                None => (1, 1),
+            };
+            // SAFETY: `i < argc <= MAX_DIRECT_ARGC`, so this pair is within the cell.
+            unsafe {
+                *words.add(i * 2) = mask_want;
+                *words.add(i * 2 + 1) = expected;
+            }
+        }
     }
 }
 

@@ -85,7 +85,7 @@ mod vtable;
 pub use crate::avm2::activation::Activation;
 pub use crate::avm2::array::ArrayStorage;
 pub use crate::avm2::call_stack::CallStack;
-pub use crate::avm2::class::Class;
+pub use crate::avm2::class::{BuiltinType, Class};
 #[allow(unused)] // For debug_ui
 pub use crate::avm2::domain::{Domain, DomainPtr};
 pub use crate::avm2::error::Error;
@@ -97,7 +97,7 @@ pub use crate::avm2::function::FunctionArgs;
 pub use crate::avm2::globals::flash::ui::context_menu::make_context_menu_state;
 pub use crate::avm2::multiname::Multiname;
 pub use crate::avm2::namespace::{CommonNamespaces, Namespace};
-pub use crate::avm2::object::{jit_slots_layout, jit_vtable_offset};
+pub use crate::avm2::object::{jit_instance_class_offset, jit_slots_layout, jit_vtable_offset};
 pub use crate::avm2::object::{
     ArrayObject, BitmapDataObject, ClassObject, EventObject, FunctionObject, LoaderInfoObject,
     NamespaceObject, Object, ScriptObject, SharedObjectObject, SoundChannelObject, Stage3DObject,

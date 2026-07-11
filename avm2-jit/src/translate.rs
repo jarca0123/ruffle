@@ -101,18 +101,30 @@ pub fn translate(ops: &[Op]) -> Option<Vec<JitOp>> {
 const JIT_CALLMETHOD: bool = true;
 
 /// Whether `callmethod` is compiled behind the JIT→JIT direct-call cache
-/// ([`crate::lower::emit_call_direct`]). **Currently `false`** — the whole machinery
-/// is built and native-green, but once the cache actually HITS on web (after the
-/// generation-member + getslot-leaf-directable widening) the in-wasm HIT path
-/// corrupts state: an early symptom was `#1034` (default params / stale extra locals
-/// not filled — fixed by the `argc == param_count && num_locals == argc+1` gate in
-/// `WasmJit::direct_target`), then a deeper one — a `Method should exist` panic in a
-/// LATER `callmethod` whose receiver was already corrupted by a prior HIT. That
-/// corruption is a runtime-only (wasm) behaviour not findable by inspection; needs
-/// web-side diagnosis (e.g. `shared_verified` diff mode to catch the first diverging
-/// method) before re-enabling. Args are also passed UNCOERCED (sound only for
-/// well-typed calls). Kept off so the machinery doesn't ship a silent corruptor.
-const JIT_DIRECT_CALL: bool = false;
+/// ([`crate::lower::emit_call_direct`]). **`true`, hardened to a provably-sound
+/// subset.** The two known HIT-path corruptors are now closed by construction:
+///
+/// 1. **Uncoerced args.** The HIT path writes the caller's args into the callee frame
+///    without the coercion `init_from_method`/`resolve_parameters` performs, so an
+///    `int`→`Number` (etc.) mismatch used to hand the callee garbage bits (an early
+///    `#1034`, then a `Method should exist` panic from a receiver a prior HIT had
+///    corrupted). `WasmJit::direct_target` now additionally requires
+///    [`Compiled::all_params_untyped`] — every param `*` (untyped), for which
+///    `resolve_parameters` is a no-op, so the uncoerced write is **bit-identical** to
+///    the interpreter's. Typed-param callees stay on the coercing `cm`/`cmi` helper
+///    (no regression). (The earlier `argc == param_count && num_locals == argc+1`
+///    default/stale-locals gate remains.)
+/// 2. **One-frame overflow.** A direct call writes the callee frame at
+///    `state_ptr + STRIDE` with no bounds check; from the deepest runner-checked
+///    frame that lands one STRIDE past the memory. The runner now commits a one-STRIDE
+///    **guard band** (`runner::web::ALLOC_PAGES`) beyond the depth-decline limit;
+///    directable callees are leaves (≤1 extra frame), so this is exact.
+///
+/// Coverage is deliberately narrow (untyped params only) — widening to typed params
+/// needs an inline per-arg tag guard in the HIT path (miss to the coercing helper on
+/// mismatch) + per-callsite param-signature info; that is the next step, gated by
+/// `shared_verified` diff mode. Flip to `false` to fall every call back to the helper.
+const JIT_DIRECT_CALL: bool = true;
 
 /// Whether `callproperty`/`callpropvoid` (the multiname method-call form — the hot
 /// FlasCC C-call path) JIT. Only **non-lazy** multinames compile (a lazy multiname
