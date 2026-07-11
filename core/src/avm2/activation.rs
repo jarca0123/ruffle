@@ -661,6 +661,27 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         self.avm2().scope_stack.truncate(scope_depth);
     }
 
+    /// JIT direct-call scope entry: a direct-called method reuses the CALLER's
+    /// `Activation`, so its scope ops would read the caller's `scope_frame`. Retarget
+    /// `scope_depth` to the current scope-stack top (the callee's frame base) and return
+    /// the caller's `scope_depth` to restore. Paired with [`Self::jit_scope_leave`] by
+    /// `emit_call_direct` around the `call_indirect`.
+    #[inline]
+    pub fn jit_scope_enter(&mut self) -> usize {
+        let old = self.scope_depth;
+        self.scope_depth = self.context.avm2.scope_stack.len();
+        old
+    }
+
+    /// JIT direct-call scope exit: pop any scopes the callee pushed (truncate to its
+    /// `scope_depth`), then restore the caller's `scope_depth`. See [`Self::jit_scope_enter`].
+    #[inline]
+    pub fn jit_scope_leave(&mut self, old: usize) {
+        let depth = self.scope_depth;
+        self.avm2().scope_stack.truncate(depth);
+        self.scope_depth = old;
+    }
+
     /// Get the superclass of the class that defined the currently-executing
     /// method, if it exists.
     ///

@@ -99,6 +99,15 @@ struct Compiled {
     /// (`Manifest::directable`) — a caller's `emit_call_direct` may `call_indirect`
     /// its `run` without building an `Activation`. Consulted by the call-cache refill.
     directable: bool,
+    /// Number of leading REQUIRED params (those without a default). A direct call is sound
+    /// for any `argc ∈ [required_count, param_count]`: the caller writes the provided args
+    /// and the callee's direct-entry prologue fills the missing optional slots with their
+    /// baked default values (see `emit_body`). `param_count` when the method has no defaults.
+    required_count: u32,
+    /// Whether the method invokes a scope-stack helper ([`lower::Manifest::uses_scope`]):
+    /// a directable such callee needs its caller to `scope_enter`/`scope_leave` around the
+    /// direct call, flagged into the cell's `ic_base` high bit by [`Self::direct_target`].
+    uses_scope: bool,
     /// The method's declared parameter count. A direct call sets up the callee frame
     /// itself (this + the call's args); it is only sound when the call provides
     /// EXACTLY the params (`argc == param_count` → no defaults to fill) and the method
@@ -139,6 +148,10 @@ struct GenSource {
     mn_list: Rc<[*const ()]>,
     /// Resolved `Class` pointers baked at `Coerce` sites, re-supplied on amalgam re-emit.
     coerce_classes: Rc<[*const ()]>,
+    /// Pre-coerced param-default `Value` bits + the first-optional index, re-supplied on
+    /// amalgam re-emit so the direct-call prologue keeps filling optional slots.
+    param_defaults: Rc<[u64]>,
+    required_count: u32,
 }
 
 impl GenSource {
@@ -154,6 +167,8 @@ impl GenSource {
             numeric_seed: Rc::from([] as [bool; 0]),
             mn_list: Rc::from([] as [*const (); 0]),
             coerce_classes: Rc::from([] as [*const (); 0]),
+            param_defaults: Rc::from([] as [u64; 0]),
+            required_count: 0,
         }
     }
 }
@@ -355,17 +370,37 @@ impl WasmJit {
     pub(crate) fn direct_target(&self, callee_ptr: usize, argc: u32) -> Option<(u32, u32, u32)> {
         let cache = self.cache.borrow();
         let compiled = cache.get(&callee_ptr)?.as_deref()?;
-        // Sound only when the caller's direct-call frame — exactly `{this, argc args}` —
-        // provides every param (no defaults to fill: `param_count == argc`). Extra locals
-        // ARE allowed now: the callee prologue zeroes them to `undefined` on the direct
-        // path (see `emit_body`), matching `init_from_method`. The frame must still fit one
-        // nesting slice (`num_locals * 8 <= FRAME_STRIDE`); otherwise fall to the helper.
-        if !compiled.directable
-            || !compiled.all_params_directable
-            || compiled.param_count != argc
-            || compiled.num_locals < argc + 1
-            || compiled.num_locals * 8 > lower::FRAME_STRIDE
-        {
+        // Sound when the caller's direct-call frame — `{this, argc args}` — provides at
+        // least the required params and no more than `param_count` (missing optionals are
+        // filled with their baked defaults by the callee prologue; see `emit_body`). Extra
+        // locals ARE allowed: the callee prologue zeroes them to `undefined` on the direct
+        // path, matching `init_from_method`. The frame must still fit one nesting slice
+        // (`num_locals * 8 <= FRAME_STRIDE`); otherwise fall to the helper.
+        if !compiled.directable {
+            return None; // manifest-non-directable — already recorded at compile time
+        }
+        // A manifest-directable callee can STILL fail a direct-call *frame* gate (default
+        // params → `argc != param_count`, an un-tag-checkable param, or too many locals).
+        // Feature-widening never touches these, so record WHICH gate — this is where the
+        // persistent `exec` callees hide (they're directable but the call can't set up the
+        // frame). Recorded into the direct-call decline histogram with `gate_` keys.
+        let gate = if !compiled.all_params_directable {
+            Some("gate_params_not_tag_checkable")
+        } else if argc < compiled.required_count || argc > compiled.param_count {
+            // Too few args (a required param missing) or too many (varargs spill). Optional
+            // params in `[argc, param_count)` are FINE — the callee prologue fills their
+            // baked defaults (see `emit_body` default-fill). Only exact-required..param_count
+            // is sound.
+            Some("gate_argc_out_of_param_range")
+        } else if compiled.num_locals < compiled.param_count + 1 {
+            Some("gate_num_locals_lt_argc")
+        } else if compiled.num_locals * 8 > lower::FRAME_STRIDE {
+            Some("gate_frame_too_big")
+        } else {
+            None
+        };
+        if let Some(g) = gate {
+            self.record_nondirectable(g);
             return None;
         }
         // `run_index_for` returns only PERMANENT slots (a member's own slot, or its
@@ -376,7 +411,12 @@ impl WasmJit {
         // member's own 6-param slot (no dispatcher); any other value is the 7-param
         // dispatcher fallback (pool exhausted).
         let (slot, member_idx) = runner::run_index_for(compiled.bytes.as_ptr() as usize)?;
-        Some((slot, compiled.ic_base, member_idx))
+        // Flag a scope-using callee in the `ic_base` high bit so the caller's
+        // `emit_call_direct` brackets the `call_indirect` with `scope_enter`/`scope_leave`
+        // (masked off before `ic_base` is passed to the callee). `ic_base` is a small
+        // cache-buffer offset, so bit 31 is free.
+        let ic_base = compiled.ic_base | ((compiled.uses_scope as u32) << 31);
+        Some((slot, ic_base, member_idx))
     }
 
     /// Enables the differential self-check (compare every JIT run against the
@@ -554,6 +594,34 @@ impl WasmJit {
             // (offset by the GcBox header) and would make the helper read a bogus class.
             .map(|c| unsafe { std::mem::transmute::<Class<'gc>, *const ()>(c) } as usize as u64)
             .unwrap_or(0);
+        // Optional-param defaults, coerced to the param type EXACTLY as `resolve_parameters`
+        // does (`arg.coerce_to_type` at call time → we pre-coerce here, so a direct call with
+        // `argc < param_count` fills bit-identical slots). `param_defaults[i]` = the `Value`
+        // bits of param `i`'s coerced default (0 for the leading required params;
+        // `required_count` marks the first optional). AS3 defaults are compile-time constants
+        // whose coercion is a pure/interned result (numbers, bools, null, or an interned
+        // string atom — same stable-`Gc` reasoning as `push_string_table`), so the bits are
+        // bakeable. A default that fails to coerce collapses `required_count` to `param_count`,
+        // disabling the fill (the gate then demands exact `argc == param_count`, the old path).
+        let params = method.resolved_param_config();
+        let mut required_count =
+            params.iter().take_while(|p| p.default_value.is_none()).count() as u32;
+        let mut param_defaults: Vec<u64> = vec![0u64; params.len()];
+        for (i, p) in params.iter().enumerate() {
+            if let Some(dv) = &p.default_value {
+                let coerced = match p.param_type {
+                    Some(pc) => match dv.coerce_to_type(activation, pc) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            required_count = params.len() as u32;
+                            break;
+                        }
+                    },
+                    None => *dv,
+                };
+                param_defaults[i] = value_to_bits(coerced);
+            }
+        }
         let entry: CacheEntry = locals_typed_seed(activation, method)
             .and_then(|(int_seed, double_seed, numeric_seed)| {
                 compile_method(
@@ -564,6 +632,8 @@ impl WasmJit {
                     &script_globals,
                     &push_strings,
                     return_type,
+                    &param_defaults,
+                    required_count,
                 )
             })
             .map(|(bytes, manifest, mn_list, mut gen_src, directable)| {
@@ -649,6 +719,8 @@ impl WasmJit {
                     ic_cells,
                     ic_base,
                     directable,
+                    uses_scope: manifest.uses_scope(),
+                    required_count,
                     param_count: method.resolved_param_config().len() as u32,
                     // Direct-call param gate: not variadic, ≤ MAX_DIRECT_ARGC params, and
                     // every param tag-checkable by the inline HIT guard. Each checkable
@@ -730,6 +802,8 @@ impl WasmJit {
                     numeric_seed: &c.gen_src.numeric_seed,
                     mn_list: &c.gen_src.mn_list,
                     coerce_classes: &c.gen_src.coerce_classes,
+                    param_defaults: &c.gen_src.param_defaults,
+                    required_count: c.gen_src.required_count,
                 })
                 .collect();
             let Some((bytes, union)) = lower::compile_generation(&members) else {
@@ -860,6 +934,12 @@ fn compile_method<'gc>(
     // `ReturnValueCoerced` is rewritten to `ReturnValueCoerceBaked` so a typed-return
     // method becomes directable (bakes the class, drops the `coerce_return` helper).
     return_type: u64,
+    // Pre-coerced default `Value` bits per param + the first-optional index (see the
+    // resolution in `compiled()`). The direct-call prologue fills the missing optional
+    // slots `[required_count, param_count)` with these — letting a callee with default
+    // params be a direct-call target for `argc ∈ [required_count, param_count]`.
+    param_defaults: &[u64],
+    required_count: u32,
 ) -> Option<(Rc<[u8]>, lower::Manifest, Rc<[*const ()]>, GenSource, bool)> {
     method.body()?;
     let core_ops = &method.get_verified_info().parsed_code;
@@ -885,8 +965,17 @@ fn compile_method<'gc>(
         let mn_list: Rc<[*const ()]> = mn_list.into();
         let coerce_classes: Rc<[*const ()]> = coerce_classes.into();
         let bytes: Rc<[u8]> = Rc::from(
-            lower::compile_full(ops, switches, exceptions, numeric_seed, &mn_list, &coerce_classes)?
-                .into_boxed_slice(),
+            lower::compile_full(
+                ops,
+                switches,
+                exceptions,
+                numeric_seed,
+                &mn_list,
+                &coerce_classes,
+                param_defaults,
+                required_count,
+            )?
+            .into_boxed_slice(),
         );
         // A method that emits a single wasm function larger than the browser's
         // per-function size limit (V8/SpiderMonkey ≈ 7.65 MB) can't be validated by
@@ -913,6 +1002,8 @@ fn compile_method<'gc>(
             numeric_seed: numeric_seed.into(),
             mn_list: mn_list.clone(),
             coerce_classes: coerce_classes.clone(),
+            param_defaults: param_defaults.into(),
+            required_count,
         };
         let manifest = lower::manifest(ops);
         let directable = manifest.directable(all_getslots_null_safe);
@@ -997,7 +1088,9 @@ fn compile_method<'gc>(
     // method's lifetime). This drops the `h17`/`h18` helper, so a method whose only
     // "unsafe" helper was one of these becomes a direct-call target. Inlining never
     // splices these ops (see `inline`), so their `k`s still index the caller's tables.
+    #[allow(clippy::never_loop)]
     for op in ops.iter_mut() {
+        if true { let _ = (&script_globals, &push_strings, return_type); break; } // DIAGNOSTIC: bakes off
         match *op {
             lower::JitOp::GetScriptGlobals(k) => {
                 if let Some(&bits) = script_globals.get(k as usize) {

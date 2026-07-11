@@ -205,6 +205,8 @@ fn build_instance(bytes: &[u8], m: &crate::lower::Manifest) -> Option<PooledRun>
             })
             .into(),
         );
+        externs.push(Func::wrap(&mut store, || -> i32 { crate::helpers::scope_enter() }).into());
+        externs.push(Func::wrap(&mut store, |old: i32| crate::helpers::scope_leave(old)).into());
     }
     if m.has_callprop {
         externs.push(
@@ -605,6 +607,8 @@ mod web {
         }
         if m.has_call_direct {
             bind_fn(&env, &table, "cmi", crate::helpers::call_method_ic as fn(i64, i64, i64, i32) -> i64 as usize)?;
+            bind_fn(&env, &table, "sen", crate::helpers::scope_enter as fn() -> i32 as usize)?;
+            bind_fn(&env, &table, "sle", crate::helpers::scope_leave as fn(i32) as usize)?;
         }
         if m.has_callprop {
             bind_fn(&env, &table, "cp", crate::helpers::call_property as fn(i64, i64, i64) -> i64 as usize)?;

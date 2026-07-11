@@ -328,11 +328,42 @@ fn helper_mask(ops: &[JitOp]) -> u32 {
 /// `get_script_globals` (17), `get_push_string` (18), the exception machinery (19–22),
 /// and `hasnext2` (30/31).
 pub(crate) const SAFE_HELPER_MASK: u32 = 0b11_1111        // 0..=5
+    | (1 << PUSH_SCOPE)                                    // 6  \
+    | (1 << GET_SCOPE_OBJECT)                              // 7   > scope stack (see SCOPE_HELPER_MASK)
     | (0b111 << DM_LOAD8)                                  // 8,9,10 (dm_load8/16/32 fallback)
     | (0b1_1111 << 11)                                     // 11..=15
+    | (1 << POP_SCOPE)                                     // 23 /
     | (1 << COERCE_S)                                      // 25
     | (0b11 << DM_LOADF32)                                 // 26,27 (dm_load f32/f64 fallback)
     | (0b11 << INCREMENT_I);                               // 28,29
+
+/// Helpers touching the shared activation's scope stack (`pushscope`/`getscopeobject`/
+/// `popscope`). Safe in a direct entry ONLY when the caller retargets `scope_depth`
+/// around the `call_indirect` (`emit_call_direct`'s `sen`/`sle`, gated on the callee's
+/// scope flag). `getouterscope` (24) is NOT here — it reads the bound outer scope chain,
+/// which is the CALLER's under a direct entry and can't be fixed by `scope_enter`.
+pub(crate) const SCOPE_HELPER_MASK: u32 =
+    (1 << PUSH_SCOPE) | (1 << GET_SCOPE_OBJECT) | (1 << POP_SCOPE);
+
+/// [`JitOp::VCall`] kinds (bit `1 << kind`) that are SAFE under a direct entry: they
+/// read only the shared activation as GC/domain context (valid on a direct call) plus
+/// their own operand/`imm` — never a per-method `RUN_CTX` table, `bound_superclass_object`,
+/// or the scope chain. Their `imm` is `0` or an object-level slot id (`constructslot`),
+/// so NO baking is needed. EXCLUDED (still non-directable): the multiname/native/namespace
+/// table kinds (`constructprop`/`callnative`/`deleteproperty`/`setprop*`/`pushnamespace` —
+/// would need `imm` baked like `getproperty`), the SUPER kinds (`call/get/set_super` read
+/// the running method's `bound_superclass_object`), and the SCOPE-capturing kinds
+/// (`newclass`/`newfunction`/`newactivation` — `create_scopechain` reads the live scope).
+pub(crate) const SAFE_VCALL_MASK: u32 = (1 << vc::CONSTRUCT_SLOT)
+    | (1 << vc::CONSTRUCT)
+    | (1 << vc::APPLY_TYPE)
+    | (1 << vc::NEW_ARRAY)
+    | (1 << vc::NEW_OBJECT)
+    | (1 << vc::NEXT_VALUE)
+    | (1 << vc::IN)
+    | (1 << vc::TYPE_OF)
+    | (1 << vc::COERCE_D)
+    | (1 << vc::CONVERT_S);
 // dm helpers are "safe" for a direct entry: they read the current activation's
 // domainMemory (a GC/domain context, not a per-method table) and coerce the address
 // (a `valueOf` re-entry, frame-safe under the direct-call DEPTH bump). Sound because all
@@ -790,6 +821,10 @@ pub struct Manifest {
     /// Whether the method has any [`JitOp::VCall`] → needs the `vc` import, the
     /// `pca` spill import, and the `perr` import (every kind can throw out of band).
     pub has_vcall: bool,
+    /// Bitmask (`1 << kind`) of the distinct [`JitOp::VCall`] kinds the method uses.
+    /// Directability keys off this: a method whose kinds are ALL in [`SAFE_VCALL_MASK`]
+    /// stays a direct-call target (see [`Manifest::directable`]); `0` ⟺ `!has_vcall`.
+    pub vcall_mask: u32,
     /// Whether the method has an inline `CoerceInt` (`coerce_i`/`coerce_u`) → needs
     /// the `perr` import: an `Object`→primitive coercion whose `valueOf`/`toString`
     /// don't yield a primitive throws `#1050` via `PENDING_ERROR` (the helper's
@@ -838,6 +873,7 @@ impl Manifest {
             has_coerce,
             h2_throws,
             has_vcall,
+            vcall_mask,
             has_coerce_int,
             has_hasnext2,
         } = *m;
@@ -864,6 +900,7 @@ impl Manifest {
         self.has_coerce |= has_coerce;
         self.h2_throws |= h2_throws;
         self.has_vcall |= has_vcall;
+        self.vcall_mask |= vcall_mask;
         self.has_coerce_int |= has_coerce_int;
         self.has_hasnext2 |= has_hasnext2;
     }
@@ -920,6 +957,10 @@ impl Manifest {
     /// null-safe. (`gs` is still IMPORTED for the defensive non-object fallback, but
     /// that arm is dead here — hence `has_getslot` is allowed under the flag.)
     pub(crate) fn directable(&self, getslots_all_null_safe: bool) -> bool {
+        // DIAGNOSTIC (temporary): disable ALL direct callees.
+        if true {
+            return false;
+        }
         // `set_slot_no_coerce` (kind 1) IS allowed: it writes a slot with the GC write
         // barrier and never re-enters AS3 (no coercion → no `valueOf`), so it needs no
         // nested frame — it unblocks field-copy/setter methods as direct-call targets. The
@@ -962,7 +1003,14 @@ impl Manifest {
             && !self.has_callprop
             && !self.has_construct_super
             && !self.has_call_value
-            && !self.has_vcall
+            // `vcall` (the generic variadic-helper family) IS now allowed WHEN every kind
+            // used is context-only (`SAFE_VCALL_MASK`: newarray/newobject/construct/
+            // applytype/nextvalue/in/typeof/coerce_d/convert_s/constructslot). Those read
+            // only the shared activation as GC/domain context (valid under a direct entry)
+            // and their operands — no `RUN_CTX` table, superclass, or scope. The remaining
+            // kinds (multiname/native/namespace table refs, `*_super`, `new{class,function,
+            // activation}`) still block: they need `imm` baking or the callee's own frame.
+            && (self.vcall_mask & !SAFE_VCALL_MASK) == 0
             // `has_coerce` (`Op::Coerce{class}`) IS now allowed: the emitter BAKES the
             // `Class` pointer at each site (`coerce_classes[k]`), so the `coerce` helper
             // reads no per-method `RUN_CTX.coerce_classes` table — it needs only the
@@ -979,6 +1027,13 @@ impl Manifest {
         // single-domain content (see `SAFE_HELPER_MASK`). An OOB `#1506` rides
         // `PENDING_ERROR` to the caller's `perr` bail, and a `valueOf` address coercion is
         // frame-safe under the DEPTH bump.
+    }
+
+    /// Whether the method invokes a scope-stack helper ([`SCOPE_HELPER_MASK`]) — a
+    /// directable such method needs its caller to `scope_enter`/`scope_leave` around the
+    /// direct call (flagged into the cell's `ic_base` high bit; see `emit_call_direct`).
+    pub(crate) fn uses_scope(&self) -> bool {
+        self.helper_mask & SCOPE_HELPER_MASK != 0
     }
 
     /// The FIRST reason this manifest is not a direct-call target, or `None` if it is
@@ -999,7 +1054,7 @@ impl Manifest {
             // exceptions (FUNDAMENTAL — need the callee's own activation) apart from
             // coerced-return / script-globals / push-string (BAKEABLE like `coerce`).
             return Some(match unsafe_helpers.trailing_zeros() {
-                6 | 7 | 23 | 24 => "helper_scope",             // push/get/pop/outer scope
+                24 => "helper_getouterscope",                  // bound outer scope (not fixable)
                 8 | 9 | 10 | 26 | 27 => "helper_dm_load",      // inline dm fallbacks
                 16 => "helper_coerced_return",                 // RUN_CTX.return_type (bakeable)
                 17 => "helper_script_globals",                 // pre-resolved globals (bakeable)
@@ -1027,8 +1082,20 @@ impl Manifest {
         if self.has_call_value {
             return Some("call_value");
         }
-        if self.has_vcall {
-            return Some("vcall");
+        let unsafe_vcall = self.vcall_mask & !SAFE_VCALL_MASK;
+        if unsafe_vcall != 0 {
+            // Name the lowest unsafe kind's category so the histogram separates the
+            // BAKEABLE table kinds (mn/native/namespace `imm`, like `getproperty`) from
+            // the FUNDAMENTAL super/scope kinds (need the callee's own frame).
+            return Some(match unsafe_vcall.trailing_zeros() {
+                k if k == vc::CALL_SUPER || k == vc::GET_SUPER || k == vc::SET_SUPER => {
+                    "vcall_super"
+                }
+                k if k == vc::NEW_CLASS || k == vc::NEW_FUNCTION || k == vc::NEW_ACTIVATION => {
+                    "vcall_scope"
+                }
+                _ => "vcall_table", // constructprop/callnative/deleteproperty/setprop*/pushnamespace
+            });
         }
         if self.h2_throws {
             return Some("astype_istype");
@@ -1086,6 +1153,10 @@ pub(crate) fn manifest(ops: &[JitOp]) -> Manifest {
         has_coerce: has_coerce(ops),
         h2_throws: h2_throws(ops),
         has_vcall: ops.iter().any(|op| matches!(op, JitOp::VCall(..))),
+        vcall_mask: ops.iter().fold(0u32, |m, op| match op {
+            JitOp::VCall(kind, ..) => m | (1u32 << kind),
+            _ => m,
+        }),
         has_coerce_int: ops.iter().any(|op| matches!(op, JitOp::CoerceInt(_))),
         has_hasnext2: ops.iter().any(|op| matches!(op, JitOp::HasNext2(..))),
     }
@@ -1113,6 +1184,9 @@ struct Layout {
     /// `cmi` (call_method + call-cache refill) import (valid only when
     /// `has_call_direct`) — follows `cm`.
     cmi_index: u32,
+    /// `sen`/`sle` (direct-call scope enter/leave) imports (valid only when `has_call_direct`).
+    scope_enter_index: u32,
+    scope_leave_index: u32,
     /// `call_property` import (valid only when `has_callprop`).
     callprop_index: u32,
     /// `construct_super` import (valid only when `has_construct_super`).
@@ -1175,6 +1249,11 @@ fn layout_of(m: &Manifest) -> Layout {
     next += (m.has_call || m.has_call_direct) as u32;
     let cmi_index = next;
     next += m.has_call_direct as u32;
+    // `sen`/`sle` (scope enter/leave) follow `cmi` — imported together under `has_call_direct`.
+    let scope_enter_index = next;
+    next += m.has_call_direct as u32;
+    let scope_leave_index = next;
+    next += m.has_call_direct as u32;
     let callprop_index = next;
     next += m.has_callprop as u32;
     let csup_index = next;
@@ -1201,6 +1280,8 @@ fn layout_of(m: &Manifest) -> Layout {
         set3_index,
         call_index,
         cmi_index,
+        scope_enter_index,
+        scope_leave_index,
         callprop_index,
         csup_index,
         callv_index,
@@ -1861,6 +1942,11 @@ fn emit_getprop_ic(
 /// callee with more args, stays on the coercing helper.
 pub(crate) const MAX_DIRECT_ARGC: u32 = 8;
 
+/// `scope_enter_index` sentinel telling [`emit_call_direct`] to emit NO scope
+/// enter/leave (the isolated codegen tests, whose hand-built modules don't import
+/// `sen`/`sle`). Real modules always pass the real import index.
+pub(crate) const NO_SCOPE_HELPER: u32 = u32::MAX;
+
 /// Size (bytes) of one JIT→JIT call-target inline-cache cell in memory 1. The 16-byte
 /// header `{ cached_vtable: u32 @+0, callee_run_index: u32 @+4, callee_ic_base: u32
 /// @+8, member_idx: u32 @+12 }` is followed by [`MAX_DIRECT_ARGC`] **arg check-word
@@ -1924,9 +2010,12 @@ fn emit_call_direct(
     miss_index: u32,
     cm_index: u32,
     pca_index: u32,
+    scope_enter_index: u32,
+    scope_leave_index: u32,
     scratch_sp: u32,
     scratch_ptr: u32,
     scratch_bits: u32,
+    scratch_scope: u32,
     stride: u32,
     mem_bytes: u32,
     push: bool,
@@ -2093,6 +2182,23 @@ fn emit_call_direct(
     body.instruction(&I32LeU);
     body.instruction(&I32And); // all_match & in_bounds
     body.instruction(&If(BlockType::Result(ValType::I64)));
+    // Scope ENTER (conditional): the callee's `ic_base` high bit (@+8) flags a scope-using
+    // callee. If set, retarget the shared activation's `scope_depth` to the callee's frame
+    // (`sen` → old depth into `scratch_scope`) so its `getscopeobject`/`pushscope` read its
+    // own scopes; `sle` after the call restores. The `ic_base` VALUE is masked (bit 31
+    // cleared) where it's passed to the callee below. `emit_scope` is false only in the
+    // isolated codegen tests (no `sen`/`sle` imports); real modules always emit it.
+    let emit_scope = scope_enter_index != NO_SCOPE_HELPER;
+    if emit_scope {
+        body.instruction(&LocalGet(cell_base_local));
+        body.instruction(&I32Load(mem1(cell + 8, 2)));
+        body.instruction(&I32Const(31));
+        body.instruction(&I32ShrU); // scope flag (0/1)
+        body.instruction(&If(BlockType::Empty));
+        body.instruction(&Call(scope_enter_index));
+        body.instruction(&LocalSet(scratch_scope)); // saved caller scope_depth
+        body.instruction(&End);
+    }
     // Save + bump `DEPTH` (memory 1 @ `dp`) around the call. The callee runs at
     // `callee_sp = state_ptr + stride`; setting `DEPTH = DEPTH + 1` makes it equal the
     // callee's own frame depth, so any re-entrant `run` the callee triggers (a `cm`
@@ -2127,7 +2233,9 @@ fn emit_call_direct(
     body.instruction(&I32Const(0)); // regs_ptr = 0 (direct-call marker)
     body.instruction(&I32Const(((argc + 1) * 8) as i32)); // regs_len = pre-written bytes
     body.instruction(&LocalGet(cell_base_local));
-    body.instruction(&I32Load(mem1(cell + 8, 2))); // callee ic_base
+    body.instruction(&I32Load(mem1(cell + 8, 2)));
+    body.instruction(&I32Const(0x7FFF_FFFF));
+    body.instruction(&I32And); // callee ic_base (clear the scope flag in bit 31)
     body.instruction(&LocalGet(cell_base_local));
     body.instruction(&I32Load(mem1(cell + 4, 2))); // run slot
     body.instruction(&CallIndirect { type_index: run_type_index, table_index: 0 });
@@ -2142,7 +2250,9 @@ fn emit_call_direct(
     body.instruction(&I32Const(0)); // regs_ptr = 0 (direct-call marker)
     body.instruction(&I32Const(((argc + 1) * 8) as i32)); // regs_len = pre-written bytes
     body.instruction(&LocalGet(cell_base_local));
-    body.instruction(&I32Load(mem1(cell + 8, 2))); // callee ic_base
+    body.instruction(&I32Load(mem1(cell + 8, 2)));
+    body.instruction(&I32Const(0x7FFF_FFFF));
+    body.instruction(&I32And); // callee ic_base (clear the scope flag in bit 31)
     body.instruction(&LocalGet(cell_base_local));
     body.instruction(&I32Load(mem1(cell + 4, 2))); // dispatcher slot
     body.instruction(&CallIndirect { type_index: dispatch_type_index, table_index: 0 });
@@ -2152,6 +2262,19 @@ fn emit_call_direct(
     body.instruction(&GlobalGet(DEPTH_PTR_GLOBAL));
     body.instruction(&LocalGet(scratch_ptr));
     body.instruction(&I32Store(mem1(0, 2))); // DEPTH = saved
+    // Scope LEAVE (conditional, same flag as enter): pop the callee's scopes + restore the
+    // caller's `scope_depth`. The call result i64 stays on the stack (the flag/`sle`
+    // operands sit above it).
+    if emit_scope {
+        body.instruction(&LocalGet(cell_base_local));
+        body.instruction(&I32Load(mem1(cell + 8, 2)));
+        body.instruction(&I32Const(31));
+        body.instruction(&I32ShrU);
+        body.instruction(&If(BlockType::Empty));
+        body.instruction(&LocalGet(scratch_scope));
+        body.instruction(&Call(scope_leave_index));
+        body.instruction(&End);
+    }
     body.instruction(&Else);
     emit_miss_plain(body); // arg type mismatch → coercing cm, cell kept for next call
     body.instruction(&End); // close: args match
@@ -3285,9 +3408,12 @@ fn emit_linear(
                 lay.cmi_index,
                 lay.call_index,
                 lay.pca_index,
+                lay.scope_enter_index,
+                lay.scope_leave_index,
                 SCRATCH,
                 SCRATCH2,
                 SCRATCH64,
+                BLOCK,
                 FRAME_STRIDE,
                 FRAME_MEM_BYTES,
                 push,
@@ -3759,13 +3885,13 @@ pub struct ExcRange {
 }
 
 pub fn compile(ops: &[JitOp]) -> Option<Vec<u8>> {
-    compile_full(ops, &[], &[], &[], &[], &[])
+    compile_full(ops, &[], &[], &[], &[], &[], &[], 0)
 }
 
 /// Switch-aware [`compile`]: `switches` supplies the targets for each
 /// [`JitOp::LookupSwitch`] op (see [`SwitchTable`]).
 pub fn compile_with_switches(ops: &[JitOp], switches: &[SwitchTable]) -> Option<Vec<u8>> {
-    compile_full(ops, switches, &[], &[], &[], &[])
+    compile_full(ops, switches, &[], &[], &[], &[], &[], 0)
 }
 
 /// Full [`compile`]: also takes the method's exception handlers. A throw inside a
@@ -3786,6 +3912,10 @@ pub fn compile_full(
     // immediate at each `Coerce` site so the `coerce` helper needs no per-method
     // `RUN_CTX.coerce_classes` table — making a `Coerce{class}` method directable.
     coerce_classes: &[*const ()],
+    // Pre-coerced default `Value` bits per param + the first-optional index (see
+    // `compile_method`); the direct-call prologue fills missing optional slots from these.
+    param_defaults: &[u64],
+    required_count: u32,
 ) -> Option<Vec<u8>> {
     if ops.is_empty() {
         return None;
@@ -3795,7 +3925,17 @@ pub fn compile_full(
     // With handlers, throwable ops dispatch (in the compile loop) rather than emit
     // their own inline `perr` return — so suppress the call arms' inline bail.
     lay.inline_perr = exceptions.is_empty();
-    let body = emit_body(ops, switches, exceptions, &lay, numeric_seed, mn_list, coerce_classes)?;
+    let body = emit_body(
+        ops,
+        switches,
+        exceptions,
+        &lay,
+        numeric_seed,
+        mn_list,
+        coerce_classes,
+        param_defaults,
+        required_count,
+    )?;
 
     // Assemble module.
     let mut module = Module::new();
@@ -3829,6 +3969,10 @@ pub struct GenMember<'a> {
     pub mn_list: &'a [*const ()],
     /// This member's resolved coerce-class pointers (see [`compile_full`]).
     pub coerce_classes: &'a [*const ()],
+    /// This member's pre-coerced param defaults + first-optional index (see
+    /// [`compile_method`]) — the direct-call prologue fills missing optional slots.
+    pub param_defaults: &'a [u64],
+    pub required_count: u32,
 }
 
 /// Compiles MANY methods into ONE module (an "amalgam" generation): every member
@@ -3870,6 +4014,8 @@ pub fn compile_generation(members: &[GenMember<'_>]) -> Option<(Vec<u8>, Manifes
             mem.numeric_seed,
             mem.mn_list,
             mem.coerce_classes,
+            mem.param_defaults,
+            mem.required_count,
         )?);
     }
     // The dispatcher: push the six `run` args (incl. `ic_base`), then the method
@@ -3993,8 +4139,11 @@ fn emit_types() -> TypeSection {
         [ValType::I64, ValType::I64, ValType::I64, ValType::I32],
         [ValType::I64],
     ); // type 9: cmi(receiver, disp, argc, cell_addr)->Value (direct-call miss + refill)
+    types.ty().function([ValType::I32], []); // type 10: scope_leave(old_depth)->()
     types
 }
+/// Type index of `scope_leave(i32)->()`. `scope_enter()->i32` reuses type 5 (`perr`).
+const SCOPE_LEAVE_TYPE: u32 = 10;
 
 /// The import section for manifest `m` — function imports in [`layout_of`]'s
 /// order, then the frame memory (and Ruffle's own memory where required).
@@ -4045,6 +4194,12 @@ fn emit_imports(m: &Manifest) -> ImportSection {
     // = type 9, following `cm`.
     if m.has_call_direct {
         imports.import("env", "cmi", EntityType::Function(9));
+        // `sen`/`sle`: direct-call scope enter/leave (`emit_call_direct` calls them around
+        // a `call_indirect` to a SCOPE-using callee — the cell's `ic_base` high bit — to
+        // retarget/restore the shared activation's `scope_depth`). `sen()->i32` = type 5
+        // (like `perr`); `sle(i32)->()` = type 10.
+        imports.import("env", "sen", EntityType::Function(5));
+        imports.import("env", "sle", EntityType::Function(SCOPE_LEAVE_TYPE));
     }
     if m.has_callprop {
         imports.import("env", "cp", EntityType::Function(3));
@@ -4178,6 +4333,11 @@ fn emit_body(
     mn_list: &[*const ()],
     // Resolved coerce-class pointers baked at `Coerce` sites (see `compile_full`).
     coerce_classes: &[*const ()],
+    // Pre-coerced default `Value` bits per param (see `compile_method`); the direct-call
+    // prologue fills the missing optional slots `[required_count, param_count)` from these.
+    param_defaults: &[u64],
+    // Index of the first optional (defaulted) param — the fill boundary.
+    required_count: u32,
 ) -> Option<Function> {
     let has_handlers = !exceptions.is_empty();
     // Shared cache buffer layout: `[property-IC cells | call-cache cells]`. The call
@@ -4286,6 +4446,30 @@ fn emit_body(
         body.instruction(&Instruction::End); // loop
         body.instruction(&Instruction::End); // block
         body.instruction(&Instruction::End); // if
+    }
+
+    // Optional-param default fill (direct-call frames). On a JIT→JIT direct call the caller
+    // writes only `{this, argc args}`; params in `[argc, param_count)` went unwritten, so the
+    // zero-loop above left them `undefined`. Overwrite each optional param slot the caller did
+    // NOT provide (`slot_byte >= regs_len`) with its baked, pre-coerced default (bit-identical
+    // to `resolve_parameters`). On a NORMAL entry `regs_len` spans the full frame, so every
+    // param slot is `< regs_len` and NOTHING is written (the snapshot/runner already holds the
+    // resolved defaults) — hence it's sound to run unconditionally on BOTH the wasm
+    // copy-prologue path and the native (no-prologue) path. Bounded to `MAX_DIRECT_ARGC`: a
+    // method with more params can't be a direct target (`all_params_directable`), so higher
+    // slots are never provided-short — the extra fills would be dead code.
+    let fill_end = param_defaults.len().min(MAX_DIRECT_ARGC as usize);
+    for i in (required_count as usize)..fill_end {
+        let slot_byte = ((i + 1) * 8) as u64;
+        // slot NOT provided by the caller ⟺ (i+1)*8 >= regs_len.
+        body.instruction(&Instruction::I32Const(slot_byte as i32));
+        body.instruction(&Instruction::LocalGet(REGS_LEN));
+        body.instruction(&Instruction::I32GeU);
+        body.instruction(&Instruction::If(BlockType::Empty));
+        body.instruction(&Instruction::LocalGet(STATE_PTR));
+        body.instruction(&Instruction::I64Const(param_defaults[i] as i64));
+        body.instruction(&Instruction::I64Store(MemArg { offset: slot_byte, align: 3, memory_index: 0 }));
+        body.instruction(&Instruction::End);
     }
 
     // Whether the boxed path is in use (its operand stack is i64, so live values can
@@ -4769,10 +4953,10 @@ mod tests {
         let m3 = [JitOp::VCall(vc::NEW_FUNCTION, 0, 0, true), JitOp::ReturnValueBoxed];
         let m4 = [JitOp::GetLocalValue(1), JitOp::CoerceInt(false), JitOp::ReturnValueBoxed];
         let members = [
-            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[] },
-            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[] },
-            GenMember { ops: &m3, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[] },
-            GenMember { ops: &m4, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[] },
+            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[], param_defaults: &[], required_count: 0 },
+            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[], param_defaults: &[], required_count: 0 },
+            GenMember { ops: &m3, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[], param_defaults: &[], required_count: 0 },
+            GenMember { ops: &m4, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[], param_defaults: &[], required_count: 0 },
         ];
         let (bytes, _union) = compile_generation(&members).expect("generation compiles");
         let engine = Engine::default();
@@ -5680,7 +5864,7 @@ mod tests {
         // `Coerce(0)` bakes `coerce_classes[0]`; a null pointer here bakes `0`, so the
         // mock `coerce` below still sees `k == 0` (it's never dereferenced).
         let bytes =
-            compile_full(&ops, &[], &[], &[], &[], &[std::ptr::null::<()>()]).expect("compiles");
+            compile_full(&ops, &[], &[], &[], &[], &[std::ptr::null::<()>()], &[], 0).expect("compiles");
 
         let go = |err: i32| -> u64 {
             let engine = Engine::default();
@@ -5916,7 +6100,7 @@ mod tests {
         // Handlers present ⇒ imports h0..=h22 (dispatch/new_catch/pop_caught).
         assert_eq!(manifest(&ops).num_helpers, POP_CAUGHT + 1);
 
-        let bytes = compile_full(&ops, &[], &exceptions, &[], &[], &[]).expect("compiles");
+        let bytes = compile_full(&ops, &[], &exceptions, &[], &[], &[], &[], 0).expect("compiles");
         let engine = Engine::default();
         let module = Module::new(&engine, &bytes).expect("valid wasm");
         let mut store = Store::new(&engine, ());
@@ -5959,7 +6143,7 @@ mod tests {
         let exceptions = [ExcRange { from: 1, to: 2, target: 3 }];
         assert_eq!(manifest(&ops).num_helpers, POP_CAUGHT + 1); // h0..=h22
 
-        let bytes = compile_full(&ops, &[], &exceptions, &[], &[], &[]).expect("compiles");
+        let bytes = compile_full(&ops, &[], &exceptions, &[], &[], &[], &[], 0).expect("compiles");
         let go = |err: i32| -> u64 {
             let engine = Engine::default();
             let module = Module::new(&engine, &bytes).expect("valid wasm");
@@ -6420,6 +6604,27 @@ mod tests {
     }
 
     #[test]
+    fn safe_vcall_kinds_are_directable() {
+        // A method whose only "advanced" op is a context-only VCall kind reads no
+        // RUN_CTX table, superclass, or scope → it stays a direct-call target.
+        for kind in [vc::NEW_ARRAY, vc::NEW_OBJECT, vc::CONVERT_S, vc::TYPE_OF, vc::CONSTRUCT] {
+            let m = manifest(&[JitOp::VCall(kind, 0, 0, true), JitOp::ReturnValueBoxed]);
+            assert!(m.directable(true), "context-only vcall kind {kind} → directable");
+            assert!(m.directable_decline_reason(true).is_none());
+        }
+        // The table / super / scope kinds still block, each with a named reason.
+        for (kind, reason) in [
+            (vc::CONSTRUCT_PROP, "vcall_table"),
+            (vc::CALL_SUPER, "vcall_super"),
+            (vc::NEW_FUNCTION, "vcall_scope"),
+        ] {
+            let m = manifest(&[JitOp::VCall(kind, 0, 0, true), JitOp::ReturnValueBoxed]);
+            assert!(!m.directable(true), "kind {kind} must stay non-directable");
+            assert_eq!(m.directable_decline_reason(true), Some(reason));
+        }
+    }
+
+    #[test]
     fn lowers_vcall_kinds() {
         // Three `VCall` shapes in one method:
         //   `setproperty` (static mn): receiver + one spilled value, result dropped;
@@ -6615,7 +6820,9 @@ mod tests {
             &mut caller, /*argc*/ 0, DISP, VTABLE_OFF, /*instance_class_off*/ VTABLE_OFF,
             /*cell_base_local*/ 2, /*cell_offset*/ 0,
             /*state_ptr_local*/ 1, /*dm_base*/ 3, /*dm_len*/ 4, /*run_type*/ 0,
-            /*dispatch_type*/ 4, /*cmi*/ 0, /*cm*/ 1, /*pca*/ 2, /*sp*/ 5, /*ptr*/ 6, /*bits*/ 7,
+            /*dispatch_type*/ 4, /*cmi*/ 0, /*cm*/ 1, /*pca*/ 2,
+            /*sen*/ NO_SCOPE_HELPER, /*sle*/ NO_SCOPE_HELPER,
+            /*sp*/ 5, /*ptr*/ 6, /*bits*/ 7, /*scope*/ 6,
             STRIDE_T, /*mem_bytes*/ 65536, /*push*/ true,
         );
         caller.instruction(&Ins::End);
@@ -6750,7 +6957,9 @@ mod tests {
             &mut caller, /*argc*/ 0, DISP, VTABLE_OFF, /*instance_class_off*/ VTABLE_OFF,
             /*cell_base_local*/ 2, /*cell_offset*/ 0,
             /*state_ptr_local*/ 1, /*dm_base*/ 3, /*dm_len*/ 4, /*run_type*/ 0,
-            /*dispatch_type*/ 4, /*cmi*/ 0, /*cm*/ 1, /*pca*/ 2, /*sp*/ 5, /*ptr*/ 6, /*bits*/ 7,
+            /*dispatch_type*/ 4, /*cmi*/ 0, /*cm*/ 1, /*pca*/ 2,
+            /*sen*/ NO_SCOPE_HELPER, /*sle*/ NO_SCOPE_HELPER,
+            /*sp*/ 5, /*ptr*/ 6, /*bits*/ 7, /*scope*/ 6,
             STRIDE_T, /*mem_bytes*/ 65536, /*push*/ true,
         );
         caller.instruction(&Ins::End);
@@ -6862,7 +7071,9 @@ mod tests {
             &mut caller, /*argc*/ 1, DISP, VTABLE_OFF, /*instance_class_off*/ VTABLE_OFF,
             /*cell_base_local*/ 3, /*cell_offset*/ 0,
             /*state_ptr_local*/ 2, /*dm_base*/ 4, /*dm_len*/ 4, /*run_type*/ 0,
-            /*dispatch_type*/ 4, /*cmi*/ 0, /*cm*/ 1, /*pca*/ 2, /*sp*/ 4, /*ptr*/ 5, /*bits*/ 6,
+            /*dispatch_type*/ 4, /*cmi*/ 0, /*cm*/ 1, /*pca*/ 2,
+            /*sen*/ NO_SCOPE_HELPER, /*sle*/ NO_SCOPE_HELPER,
+            /*sp*/ 4, /*ptr*/ 5, /*bits*/ 6, /*scope*/ 5,
             STRIDE_T, /*mem_bytes*/ 65536, /*push*/ true,
         );
         caller.instruction(&Ins::End);
@@ -6993,7 +7204,9 @@ mod tests {
             &mut caller, /*argc*/ 1, DISP, VTABLE_OFF, /*instance_class_off*/ CLASS_OFF,
             /*cell_base_local*/ 3, /*cell_offset*/ 0,
             /*state_ptr_local*/ 2, /*dm_base*/ 4, /*dm_len*/ 4, /*run_type*/ 0,
-            /*dispatch_type*/ 4, /*cmi*/ 0, /*cm*/ 1, /*pca*/ 2, /*sp*/ 4, /*ptr*/ 5, /*bits*/ 6,
+            /*dispatch_type*/ 4, /*cmi*/ 0, /*cm*/ 1, /*pca*/ 2,
+            /*sen*/ NO_SCOPE_HELPER, /*sle*/ NO_SCOPE_HELPER,
+            /*sp*/ 4, /*ptr*/ 5, /*bits*/ 6, /*scope*/ 5,
             STRIDE_T, /*mem_bytes*/ 65536, /*push*/ true,
         );
         caller.instruction(&Ins::End);
@@ -7110,10 +7323,15 @@ mod tests {
         let inc = [JitOp::GetLocalValue(0), JitOp::CallHelper(0), JitOp::ReturnValueBoxed];
         assert!(manifest(&inc).directable(true), "a context-only arity-1 helper (increment) IS directable");
 
-        // A SCOPE helper reads the current activation's scope stack — a direct entry
-        // leaves the CALLER's scope in place → NOT directable.
+        // A scope-stack helper (`getscopeobject`/`pushscope`/`popscope`) IS directable now:
+        // the caller `scope_enter`/`scope_leave`s the shared activation's `scope_depth`
+        // around the direct call (flagged via the cell's `ic_base` high bit) — see
+        // `uses_scope`. But `getouterscope` (the bound outer chain) stays excluded.
         let scope = [JitOp::GetScopeObject(0), JitOp::ReturnValueBoxed];
-        assert!(!manifest(&scope).directable(true), "getscopeobject reads the caller's scope → not directable");
+        assert!(manifest(&scope).directable(true), "scope-stack op IS directable (caller retargets scope_depth)");
+        assert!(manifest(&scope).uses_scope(), "getscopeobject flags uses_scope for the cell");
+        let outer = [JitOp::GetOuterScope(0), JitOp::ReturnValueBoxed];
+        assert!(!manifest(&outer).directable(true), "getouterscope reads the caller's bound scope → not directable");
         // `Op::Coerce{class}` IS directable now: the emitter bakes the class pointer, so
         // `coerce` reads no per-method table (only the activation as context).
         let coerce = [JitOp::GetLocalValue(0), JitOp::Coerce(0), JitOp::ReturnValueBoxed];
@@ -7251,8 +7469,8 @@ mod tests {
         ];
         let m1 = [JitOp::GetLocalValue(1), JitOp::CallHelper(0), JitOp::ReturnValueBoxed];
         let members = [
-            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[] },
-            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[] },
+            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[], param_defaults: &[], required_count: 0 },
+            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[], param_defaults: &[], required_count: 0 },
         ];
         let (bytes, union) = compile_generation(&members).expect("generation compiles");
         assert_eq!(union.num_helpers, 1); // the union carries m1's h0
@@ -7317,9 +7535,9 @@ mod tests {
         let m2_mn = [1usize as *const ()];
         let m1_cc = [1usize as *const ()];
         let members = [
-            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[] },
-            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &m1_cc },
-            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &m2_mn, coerce_classes: &[] },
+            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[], param_defaults: &[], required_count: 0 },
+            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &m1_cc, param_defaults: &[], required_count: 0 },
+            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &m2_mn, coerce_classes: &[], param_defaults: &[], required_count: 0 },
         ];
         let (bytes, union) = compile_generation(&members).expect("generation compiles");
         assert!(union.has_vcall && union.has_getslot && union.has_call && union.has_coerce);

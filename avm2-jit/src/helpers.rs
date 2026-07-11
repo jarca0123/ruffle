@@ -559,6 +559,22 @@ fn push_scope(v: i64) -> i64 {
     0
 }
 
+/// Direct-call scope ENTER (see [`Activation::jit_scope_enter`]): retargets the shared
+/// activation's `scope_depth` so a direct-entered callee's `getscopeobject`/`pushscope`
+/// read its OWN frame, returning the caller's depth. `emit_call_direct` calls it before a
+/// `call_indirect` to a scope-using callee and passes the result to [`scope_leave`].
+pub(crate) fn scope_enter() -> i32 {
+    // SAFETY: helpers run only inside `with_run_ctx`.
+    unsafe { activation() }.jit_scope_enter() as i32
+}
+
+/// Direct-call scope LEAVE (see [`Activation::jit_scope_leave`]): pops the callee's scopes
+/// and restores the caller's `scope_depth`.
+pub(crate) fn scope_leave(old: i32) {
+    // SAFETY: helpers run only inside `with_run_ctx`.
+    unsafe { activation() }.jit_scope_leave(old as usize);
+}
+
 /// Helper 23 — `pop_scope`: `popscope`. Pops the top of the *real* Activation scope
 /// stack. No operand-stack effect; returns an (ignored) dummy.
 fn pop_scope(_ignored: i64) -> i64 {
