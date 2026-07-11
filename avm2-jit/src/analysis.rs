@@ -220,6 +220,7 @@ fn simulate_block(block: &[JitOp], mut locals: Vec<bool>) -> Option<Vec<bool>> {
             | JitOp::SwapValue
             | JitOp::ReturnValueBoxed
             | JitOp::ReturnValueCoerced
+            | JitOp::ReturnValueCoerceBaked(_)
             | JitOp::ReturnVoidBoxed(_)
             | JitOp::DupValue
             | JitOp::StoreLocalValue(_)
@@ -246,6 +247,7 @@ fn simulate_block(block: &[JitOp], mut locals: Vec<bool>) -> Option<Vec<bool>> {
             | JitOp::HasNext2(_, _)
             | JitOp::CoerceString
             | JitOp::GetScriptGlobals(_)
+            | JitOp::PushBits(_)
             | JitOp::GetLocalDouble(_)
             | JitOp::SetLocalDouble(_)
             | JitOp::StoreLocalDouble(_)

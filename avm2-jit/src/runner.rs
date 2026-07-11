@@ -814,7 +814,13 @@ mod web {
         // dm base/len feed the inline `li*`/`si*` path — shared by both entries.
         let regs_ptr = regs.as_ptr() as u32;
         let regs_len = frame_bytes as u32;
-        let (dm_base, dm_len) = if m.has_dm {
+        // Compute `dm_base` for `has_dm` methods AND any direct-caller (`has_call_direct`):
+        // a directable **dm callee** reached by a direct call uses the caller's `dm_base`
+        // (`emit_call_direct` forwards `DM_BASE`), so the chain root — entered here — must
+        // supply the real base even if it doesn't itself touch dm. Single-domain content
+        // (Starling / CrossBridge — all real domainMemory users) shares one domainMemory,
+        // so the forwarded base is correct for the callee's domain too.
+        let (dm_base, dm_len) = if m.has_dm || m.has_call_direct {
             crate::helpers::dm_base_len()
         } else {
             (0, 0)

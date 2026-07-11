@@ -328,9 +328,16 @@ fn helper_mask(ops: &[JitOp]) -> u32 {
 /// `get_script_globals` (17), `get_push_string` (18), the exception machinery (19–22),
 /// and `hasnext2` (30/31).
 pub(crate) const SAFE_HELPER_MASK: u32 = 0b11_1111        // 0..=5
+    | (0b111 << DM_LOAD8)                                  // 8,9,10 (dm_load8/16/32 fallback)
     | (0b1_1111 << 11)                                     // 11..=15
     | (1 << COERCE_S)                                      // 25
+    | (0b11 << DM_LOADF32)                                 // 26,27 (dm_load f32/f64 fallback)
     | (0b11 << INCREMENT_I);                               // 28,29
+// dm helpers are "safe" for a direct entry: they read the current activation's
+// domainMemory (a GC/domain context, not a per-method table) and coerce the address
+// (a `valueOf` re-entry, frame-safe under the direct-call DEPTH bump). Sound because all
+// real domainMemory content is single-domain (Starling / CrossBridge), so the caller's
+// domainMemory — whose `dm_base` `emit_call_direct` forwards — is the callee's too.
 
 /// Whether a boxed method is **helper-dominated** — its work is mostly
 /// JS-boundary crossings (`getproperty`/`getslot`/`callmethod`/generic helpers) the
@@ -468,7 +475,9 @@ fn has_coerce_s(ops: &[JitOp]) -> bool {
 /// Whether any op is a `coerce <class>` — it needs the `coerce` import, the `perr`
 /// import, and a post-op error bail/dispatch (a failing coercion throws `#1034`).
 fn has_coerce(ops: &[JitOp]) -> bool {
-    ops.iter().any(|op| matches!(op, JitOp::Coerce(_)))
+    // `ReturnValueCoerceBaked` also calls the `coerce` helper (with a baked class ptr).
+    ops.iter()
+        .any(|op| matches!(op, JitOp::Coerce(_) | JitOp::ReturnValueCoerceBaked(_)))
 }
 
 fn has_any_call(ops: &[JitOp]) -> bool {
@@ -916,7 +925,9 @@ impl Manifest {
         // nested frame — it unblocks field-copy/setter methods as direct-call targets. The
         // coercing `set_slot` (0) and `set_slot_coerce_i` (2) can re-enter, dm stores (3–4)
         // are `has_dm`, so only bit 1 is cleared.
-        (self.set3_mask & !(1 << 1)) == 0
+        // `set_slot_no_coerce` (1) and the dm STORES (3,4) are allowed; the coercing
+        // `set_slot` (0) and `set_slot_coerce_i` (2) can re-enter AS3 unsafely.
+        (self.set3_mask & !((1 << 1) | (1 << DM_STORE_KIND) | (1 << DM_STORE_F_KIND))) == 0
             // `has_call`/`has_call_direct` (a `cm` helper call or a nested JIT→JIT direct
             // call) ARE now allowed: [`emit_call_direct`] saves+bumps+restores the Rust-side
             // `DEPTH` frame counter (via the `dp` global, memory 1) around every direct
@@ -952,19 +963,89 @@ impl Manifest {
             && !self.has_construct_super
             && !self.has_call_value
             && !self.has_vcall
-            // `has_coerce` (`Op::Coerce{class}`) reads the per-method resolved
-            // coerce-class table (`RunCtx::coerce_classes`), which a direct entry doesn't
-            // build → excluded. The INLINE numeric coercions (`has_coerce_int` /
-            // `has_coerce_s`) use only the context-only `coerce_i`/`coerce_u`/`coerce_s`
-            // helpers (in `SAFE_HELPER_MASK`), so they're allowed.
-            && !self.has_coerce
+            // `has_coerce` (`Op::Coerce{class}`) IS now allowed: the emitter BAKES the
+            // `Class` pointer at each site (`coerce_classes[k]`), so the `coerce` helper
+            // reads no per-method `RUN_CTX.coerce_classes` table — it needs only the
+            // activation as context (valid under a direct entry). `coerce_to_type` on an
+            // object may re-enter (`valueOf`), which is frame-safe under the DEPTH bump.
             && !self.h2_throws
             && !self.has_hasnext2
             && !self.has_script_globals
             && !self.has_push_strings
             && !self.has_coerced_return
-            && !self.has_dm
-            && !self.dm_throws
+        // `has_dm` / `dm_throws` (inline `li*`/`si*` + the `dm_load` fallback) ARE now
+        // allowed: the dm ops read the current activation's domainMemory (context, not a
+        // per-method table) and the caller-forwarded `dm_base` is the callee's too under
+        // single-domain content (see `SAFE_HELPER_MASK`). An OOB `#1506` rides
+        // `PENDING_ERROR` to the caller's `perr` bail, and a `valueOf` address coercion is
+        // frame-safe under the DEPTH bump.
+    }
+
+    /// The FIRST reason this manifest is not a direct-call target, or `None` if it is
+    /// — the direct-call analogue of the JIT decline histogram (see
+    /// `WasmJit::record_nondirectable`). Checks mirror [`Manifest::directable`]'s order,
+    /// so `directable() == reason.is_none()`; it names which remaining feature keeps a
+    /// JITed method paying the `exec`/Activation call path instead of a direct call.
+    pub(crate) fn directable_decline_reason(
+        &self,
+        getslots_all_null_safe: bool,
+    ) -> Option<&'static str> {
+        if self.set3_mask & !((1 << 1) | (1 << DM_STORE_KIND) | (1 << DM_STORE_F_KIND)) != 0 {
+            return Some("set_slot_coerce");
+        }
+        let unsafe_helpers = self.helper_mask & !SAFE_HELPER_MASK;
+        if unsafe_helpers != 0 {
+            // Name the lowest unsafe helper's category so the histogram tells scope/
+            // exceptions (FUNDAMENTAL — need the callee's own activation) apart from
+            // coerced-return / script-globals / push-string (BAKEABLE like `coerce`).
+            return Some(match unsafe_helpers.trailing_zeros() {
+                6 | 7 | 23 | 24 => "helper_scope",             // push/get/pop/outer scope
+                8 | 9 | 10 | 26 | 27 => "helper_dm_load",      // inline dm fallbacks
+                16 => "helper_coerced_return",                 // RUN_CTX.return_type (bakeable)
+                17 => "helper_script_globals",                 // pre-resolved globals (bakeable)
+                18 => "helper_push_string",                    // pre-resolved strings (bakeable)
+                19 | 20 | 21 | 22 => "helper_exception",       // throw/dispatch/newcatch/popcaught
+                30 | 31 => "helper_hasnext2",
+                _ => "helper_unsafe_other",
+            });
+        }
+        if self.has_getslot && !getslots_all_null_safe {
+            return Some("getslot_not_null_safe");
+        }
+        if self.has_getprop_fast {
+            return Some("getpropfast");
+        }
+        if self.has_findprop {
+            return Some("findprop_scope");
+        }
+        if self.has_callprop {
+            return Some("callprop");
+        }
+        if self.has_construct_super {
+            return Some("construct_super");
+        }
+        if self.has_call_value {
+            return Some("call_value");
+        }
+        if self.has_vcall {
+            return Some("vcall");
+        }
+        if self.h2_throws {
+            return Some("astype_istype");
+        }
+        if self.has_hasnext2 {
+            return Some("hasnext2");
+        }
+        if self.has_script_globals {
+            return Some("script_globals");
+        }
+        if self.has_push_strings {
+            return Some("push_strings");
+        }
+        if self.has_coerced_return {
+            return Some("coerced_return");
+        }
+        None
     }
 }
 
@@ -1253,6 +1334,12 @@ pub enum JitOp {
     /// when `returnvalue` carries a non-`*` `return_type` — the raw value can differ
     /// (e.g. `:uint` of `-10` → `4294967286`, `:Vector.<T>` of a generic vector).
     ReturnValueCoerced,
+    /// Like [`JitOp::ReturnValueCoerced`] but with the return-type `Class` pointer BAKED
+    /// as an immediate (`compile_method` rewrites `ReturnValueCoerced` to this once it
+    /// resolves): coerces the top `Value` to that class via the `coerce` helper (no
+    /// per-method `RUN_CTX.return_type` read), then returns — so a typed-return method is
+    /// a direct-call target. Sets `has_coerce` (imports `coerce`), not `has_coerced_return`.
+    ReturnValueCoerceBaked(u64),
     /// Return the given `Value` bits (`returnvoid` coerced to the method's declared
     /// `return_type`: `undefined`/`0`/`false`/`null`) — ignores the operand stack.
     ReturnVoidBoxed(u64),
@@ -1337,10 +1424,16 @@ pub enum JitOp {
     IfTrueBoxed(usize),
     /// Pop one `Value`; branch to `target` if `ToBoolean(v)` is false.
     IfFalseBoxed(usize),
-    /// `pushstring`: push the `k`-th string constant's `Value` bits (pre-resolved
-    /// per run into a side-table, like [`JitOp::GetScriptGlobals`]) — a string
-    /// `Value` holds a `Gc`, so it can't be baked at compile time. Net +1.
+    /// `pushstring`: push the `k`-th string constant's `Value` bits. Rewritten to
+    /// [`JitOp::PushBits`] in `compile_method` (the string's `Gc` is non-moving and
+    /// alive for the method's lifetime — same as a baked multiname — so its bits ARE
+    /// bakeable). Kept as the pre-rewrite form. Net +1.
     PushString(u32),
+    /// Push a pre-resolved NaN-boxed `Value`'s raw bits as an immediate `i64.const` —
+    /// no helper, no per-method table. `GetScriptGlobals`/`PushString` are rewritten to
+    /// this once their bits resolve at compile time (baked like a multiname pointer);
+    /// making a method that only used those helpers a direct-call target. Net +1.
+    PushBits(u64),
     /// `throw`: pop a `Value`, stash `Error::from_value(v)` as the pending error
     /// (via the `throw_value` helper [`THROW`]), and `Return`. `try_run` propagates
     /// the pending error. A terminator. Sound only when the method has no exception
@@ -2090,6 +2183,8 @@ fn emit_linear(
     call_region_offset: u32,
     // Resolved multiname pointers, indexed by an mn-bearing op's `k` (see `compile_full`).
     mn_list: &[*const ()],
+    // Resolved coerce-class pointers, indexed by a `Coerce` op's `k` (see `compile_full`).
+    coerce_classes: &[*const ()],
 ) -> Option<()> {
     match op {
         JitOp::GetLocal(i) => {
@@ -2628,11 +2723,16 @@ fn emit_linear(
             if *depth < 1 {
                 return None;
             }
-            // Stack: [.., value]. Push the class-table index and call the arity-2
-            // `coerce` import: pops (value, k), pushes `ToType(value, class[k])` — net
-            // 0. A failing coercion (`#1034`) stashes into `PENDING_ERROR`; the compile
-            // loop emits the perr bail/dispatch after (like a call/`coerces`).
-            body.instruction(&Instruction::I64Const(k as i64));
+            // Stack: [.., value]. Push the class POINTER (baked from `coerce_classes[k]`,
+            // not the index) and call the arity-2 `coerce` import: pops (value, class_ptr),
+            // pushes `ToType(value, class)` — net 0. Baking the pointer frees `coerce` from
+            // reading the per-method `RUN_CTX.coerce_classes` table, so a `Coerce{class}`
+            // method can be a direct-call target (a direct entry doesn't build that table).
+            // A failing coercion (`#1034`) stashes into `PENDING_ERROR`; the compile loop
+            // emits the perr bail/dispatch after. `?` declines if the table lacks the entry
+            // (never for a real method; guards the convenience wrappers).
+            let class = *coerce_classes.get(k as usize)?;
+            body.instruction(&Instruction::I64Const(class as usize as i64));
             body.instruction(&Instruction::Call(lay.coerce_index));
         }
         JitOp::IncDecLocalIValue(index, inc) => {
@@ -2697,9 +2797,15 @@ fn emit_linear(
             body.instruction(&Instruction::I64Store(slot(obj_reg)));
             *depth += 1;
         }
+        JitOp::PushBits(bits) => {
+            // A pre-resolved `Value`'s raw bits, baked as an immediate — no helper, no
+            // table. Net +1. (`GetScriptGlobals`/`PushString` are rewritten to this.)
+            body.instruction(&Instruction::I64Const(bits as i64));
+            *depth += 1;
+        }
         JitOp::GetScriptGlobals(k) => {
-            // Push the `k`-th script's global object (pre-resolved bits): pass `k` as
-            // the arity-1 helper's argument. Net +1.
+            // Fallback (un-rewritten): push the `k`-th script's global object via the
+            // arity-1 helper. Net +1. `compile_method` normally rewrites this to `PushBits`.
             body.instruction(&Instruction::I64Const(k as i64));
             body.instruction(&Instruction::Call(GET_SCRIPT_GLOBALS));
             *depth += 1;
@@ -3653,13 +3759,13 @@ pub struct ExcRange {
 }
 
 pub fn compile(ops: &[JitOp]) -> Option<Vec<u8>> {
-    compile_full(ops, &[], &[], &[], &[])
+    compile_full(ops, &[], &[], &[], &[], &[])
 }
 
 /// Switch-aware [`compile`]: `switches` supplies the targets for each
 /// [`JitOp::LookupSwitch`] op (see [`SwitchTable`]).
 pub fn compile_with_switches(ops: &[JitOp], switches: &[SwitchTable]) -> Option<Vec<u8>> {
-    compile_full(ops, switches, &[], &[], &[])
+    compile_full(ops, switches, &[], &[], &[], &[])
 }
 
 /// Full [`compile`]: also takes the method's exception handlers. A throw inside a
@@ -3676,6 +3782,10 @@ pub fn compile_full(
     // helper needs no per-method `RUN_CTX.multinames` table (making it directable).
     // Empty on the switch/int-path convenience wrappers (which never emit `getproperty`).
     mn_list: &[*const ()],
+    // Resolved `Class` pointers per `Coerce` op (see `coerce_class_table`), baked as an
+    // immediate at each `Coerce` site so the `coerce` helper needs no per-method
+    // `RUN_CTX.coerce_classes` table — making a `Coerce{class}` method directable.
+    coerce_classes: &[*const ()],
 ) -> Option<Vec<u8>> {
     if ops.is_empty() {
         return None;
@@ -3685,7 +3795,7 @@ pub fn compile_full(
     // With handlers, throwable ops dispatch (in the compile loop) rather than emit
     // their own inline `perr` return — so suppress the call arms' inline bail.
     lay.inline_perr = exceptions.is_empty();
-    let body = emit_body(ops, switches, exceptions, &lay, numeric_seed, mn_list)?;
+    let body = emit_body(ops, switches, exceptions, &lay, numeric_seed, mn_list, coerce_classes)?;
 
     // Assemble module.
     let mut module = Module::new();
@@ -3717,6 +3827,8 @@ pub struct GenMember<'a> {
     pub numeric_seed: &'a [bool],
     /// This member's resolved multiname pointers (see [`compile_full`]'s `mn_list`).
     pub mn_list: &'a [*const ()],
+    /// This member's resolved coerce-class pointers (see [`compile_full`]).
+    pub coerce_classes: &'a [*const ()],
 }
 
 /// Compiles MANY methods into ONE module (an "amalgam" generation): every member
@@ -3757,6 +3869,7 @@ pub fn compile_generation(members: &[GenMember<'_>]) -> Option<(Vec<u8>, Manifes
             &member_lay,
             mem.numeric_seed,
             mem.mn_list,
+            mem.coerce_classes,
         )?);
     }
     // The dispatcher: push the six `run` args (incl. `ic_base`), then the method
@@ -4063,6 +4176,8 @@ fn emit_body(
     numeric_seed: &[bool],
     // Resolved multiname pointers baked at `getproperty`/IC sites (see `compile_full`).
     mn_list: &[*const ()],
+    // Resolved coerce-class pointers baked at `Coerce` sites (see `compile_full`).
+    coerce_classes: &[*const ()],
 ) -> Option<Function> {
     let has_handlers = !exceptions.is_empty();
     // Shared cache buffer layout: `[property-IC cells | call-cache cells]`. The call
@@ -4330,6 +4445,19 @@ fn emit_body(
                     body.instruction(&Instruction::Return);
                     depth = 0;
                 }
+                JitOp::ReturnValueCoerceBaked(rtype_ptr) => {
+                    if depth < 1 {
+                        return None;
+                    }
+                    // Coerce the top `Value` to the baked return-type `Class` via the
+                    // `coerce` helper (`(value, class_ptr)`), then return — no per-method
+                    // `RUN_CTX.return_type`, so directable. Same `#1034`/`PENDING_ERROR`
+                    // behaviour as `coerce_return` (the caller's `perr` check bails).
+                    body.instruction(&Instruction::I64Const(rtype_ptr as i64));
+                    body.instruction(&Instruction::Call(lay.coerce_index));
+                    body.instruction(&Instruction::Return);
+                    depth = 0;
+                }
                 JitOp::ReturnVoidBoxed(bits) => {
                     // `returnvoid` ignores the operand stack and returns the value its
                     // declared `return_type` coerces to (undefined/0/false/null).
@@ -4541,7 +4669,7 @@ fn emit_body(
                     }
                     depth -= 1;
                 }
-                other => emit_linear(&mut body, other, &mut depth, &lay, call_region_offset, mn_list)?,
+                other => emit_linear(&mut body, other, &mut depth, &lay, call_region_offset, mn_list, coerce_classes)?,
             }
 
             // Phase-2: keep `phys` aligned with the authoritative `depth` after the
@@ -4641,10 +4769,10 @@ mod tests {
         let m3 = [JitOp::VCall(vc::NEW_FUNCTION, 0, 0, true), JitOp::ReturnValueBoxed];
         let m4 = [JitOp::GetLocalValue(1), JitOp::CoerceInt(false), JitOp::ReturnValueBoxed];
         let members = [
-            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[] },
-            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[] },
-            GenMember { ops: &m3, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[] },
-            GenMember { ops: &m4, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[] },
+            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[] },
+            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[] },
+            GenMember { ops: &m3, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[] },
+            GenMember { ops: &m4, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[] },
         ];
         let (bytes, _union) = compile_generation(&members).expect("generation compiles");
         let engine = Engine::default();
@@ -5549,7 +5677,10 @@ mod tests {
         // Layout: perr at 0, coerce at 1, run at 2.
         let lay = layout(&ops);
         assert_eq!((lay.perr_index, lay.coerce_index, lay.run_index), (0, 1, 2));
-        let bytes = compile(&ops).expect("compiles");
+        // `Coerce(0)` bakes `coerce_classes[0]`; a null pointer here bakes `0`, so the
+        // mock `coerce` below still sees `k == 0` (it's never dereferenced).
+        let bytes =
+            compile_full(&ops, &[], &[], &[], &[], &[std::ptr::null::<()>()]).expect("compiles");
 
         let go = |err: i32| -> u64 {
             let engine = Engine::default();
@@ -5785,7 +5916,7 @@ mod tests {
         // Handlers present ⇒ imports h0..=h22 (dispatch/new_catch/pop_caught).
         assert_eq!(manifest(&ops).num_helpers, POP_CAUGHT + 1);
 
-        let bytes = compile_full(&ops, &[], &exceptions, &[], &[]).expect("compiles");
+        let bytes = compile_full(&ops, &[], &exceptions, &[], &[], &[]).expect("compiles");
         let engine = Engine::default();
         let module = Module::new(&engine, &bytes).expect("valid wasm");
         let mut store = Store::new(&engine, ());
@@ -5828,7 +5959,7 @@ mod tests {
         let exceptions = [ExcRange { from: 1, to: 2, target: 3 }];
         assert_eq!(manifest(&ops).num_helpers, POP_CAUGHT + 1); // h0..=h22
 
-        let bytes = compile_full(&ops, &[], &exceptions, &[], &[]).expect("compiles");
+        let bytes = compile_full(&ops, &[], &exceptions, &[], &[], &[]).expect("compiles");
         let go = |err: i32| -> u64 {
             let engine = Engine::default();
             let module = Module::new(&engine, &bytes).expect("valid wasm");
@@ -6950,12 +7081,11 @@ mod tests {
         let pure = [JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::AddI, JitOp::ReturnValue];
         assert!(manifest(&pure).directable(false), "pure numeric leaf is a direct-call target");
 
-        // Inline domainMemory leaf (li8): NOT directable in v1 — the inline path
-        // keeps a `dm_load8` helper fallback that reads `activation()` (domain +
-        // `coerce_to_i32`, which can re-enter via `valueOf`). Widening to dm needs
-        // that helper proven activation-independent + non-re-entrant first.
+        // Inline domainMemory leaf (li8) IS directable now: dm reads the current
+        // activation's domainMemory (context, not a per-method table) and the
+        // caller-forwarded `dm_base` is the callee's under single-domain content.
         let dm = [JitOp::GetLocal(1), JitOp::DmLoad(1), JitOp::ReturnValue];
-        assert!(!manifest(&dm).directable(true), "dm leaf keeps an activation-reading fallback helper");
+        assert!(manifest(&dm).directable(true), "dm leaf IS directable (single-domain)");
 
         // A call IS directable now (the non-leaf case): `emit_call_direct` bumps/restores
         // DEPTH around the direct `call_indirect`, so a callee's own re-entrant `run`s
@@ -6984,9 +7114,10 @@ mod tests {
         // leaves the CALLER's scope in place → NOT directable.
         let scope = [JitOp::GetScopeObject(0), JitOp::ReturnValueBoxed];
         assert!(!manifest(&scope).directable(true), "getscopeobject reads the caller's scope → not directable");
-        // `Op::Coerce{class}` reads the per-method coerce-class table → NOT directable.
+        // `Op::Coerce{class}` IS directable now: the emitter bakes the class pointer, so
+        // `coerce` reads no per-method table (only the activation as context).
         let coerce = [JitOp::GetLocalValue(0), JitOp::Coerce(0), JitOp::ReturnValueBoxed];
-        assert!(!manifest(&coerce).directable(true), "Coerce{{class}} needs the per-method class table → not directable");
+        assert!(manifest(&coerce).directable(true), "baked-class Coerce IS directable");
 
         // A `getproperty` IS directable now: the emitter bakes the multiname pointer, so
         // `gp` reads no per-method table (only the activation as context). (`getpropfast`
@@ -7120,8 +7251,8 @@ mod tests {
         ];
         let m1 = [JitOp::GetLocalValue(1), JitOp::CallHelper(0), JitOp::ReturnValueBoxed];
         let members = [
-            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[] },
-            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[] },
+            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[] },
+            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[] },
         ];
         let (bytes, union) = compile_generation(&members).expect("generation compiles");
         assert_eq!(union.num_helpers, 1); // the union carries m1's h0
@@ -7180,13 +7311,15 @@ mod tests {
             JitOp::GetProperty(0),         // gp
             JitOp::ReturnValueBoxed,
         ];
-        // m2's `GetProperty(0)` bakes `mn_list[0]` — a dummy non-null pointer here (the
-        // module is only VALIDATED, never run, so it's never dereferenced).
+        // m2's `GetProperty(0)` bakes `mn_list[0]`, m1's `Coerce(0)` bakes
+        // `coerce_classes[0]` — dummy non-null pointers here (the module is only
+        // VALIDATED, never run, so they're never dereferenced).
         let m2_mn = [1usize as *const ()];
+        let m1_cc = [1usize as *const ()];
         let members = [
-            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[] },
-            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[] },
-            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &m2_mn },
+            GenMember { ops: &m0, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &[] },
+            GenMember { ops: &m1, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &[], coerce_classes: &m1_cc },
+            GenMember { ops: &m2, switches: &[], exceptions: &[], name: "", numeric_seed: &[], mn_list: &m2_mn, coerce_classes: &[] },
         ];
         let (bytes, union) = compile_generation(&members).expect("generation compiles");
         assert!(union.has_vcall && union.has_getslot && union.has_call && union.has_coerce);

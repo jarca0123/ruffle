@@ -137,6 +137,8 @@ struct GenSource {
     /// Resolved `Gc<Multiname>` pointers baked at getproperty sites, re-supplied when
     /// this method is re-emitted into an amalgam (see [`lower::compile_full`]).
     mn_list: Rc<[*const ()]>,
+    /// Resolved `Class` pointers baked at `Coerce` sites, re-supplied on amalgam re-emit.
+    coerce_classes: Rc<[*const ()]>,
 }
 
 impl GenSource {
@@ -151,6 +153,7 @@ impl GenSource {
             name: Rc::from(""),
             numeric_seed: Rc::from([] as [bool; 0]),
             mn_list: Rc::from([] as [*const (); 0]),
+            coerce_classes: Rc::from([] as [*const (); 0]),
         }
     }
 }
@@ -301,6 +304,11 @@ pub struct WasmJit {
     /// `tracing`. Turns "which ops should we add next" into data. See
     /// [`Self::record_decline`] / [`Self::decline_histogram`].
     declines: RefCell<FnvHashMap<String, u32>>,
+    /// Histogram of *why* a JIT-compiled method is not a **direct-call target** (so its
+    /// callers pay the `exec`/Activation call path instead of a `call_indirect`), keyed
+    /// by [`lower::Manifest::directable_decline_reason`]. Which remaining feature to make
+    /// directable next — turns the `exec` wall into data. See [`Self::record_nondirectable`].
+    nondirectable: RefCell<FnvHashMap<&'static str, u32>>,
 }
 
 impl Default for WasmJit {
@@ -319,6 +327,7 @@ impl Default for WasmJit {
             executed: RefCell::new(FnvHashSet::default()),
             verify_seen: RefCell::new(FnvHashMap::default()),
             declines: RefCell::new(FnvHashMap::default()),
+            nondirectable: RefCell::new(FnvHashMap::default()),
         }
     }
 }
@@ -441,6 +450,26 @@ impl WasmJit {
         }
     }
 
+    /// Records that a JIT-compiled method is NOT a direct-call target because of
+    /// `reason` (see [`lower::Manifest::directable_decline_reason`]), logging the running
+    /// histogram on a new reason or every 200. Names which feature to make directable
+    /// next to shrink the `exec`/Activation wall.
+    fn record_nondirectable(&self, reason: &'static str) {
+        let (total, is_new) = {
+            let mut m = self.nondirectable.borrow_mut();
+            let is_new = !m.contains_key(reason);
+            *m.entry(reason).or_insert(0) += 1;
+            (m.values().sum::<u32>(), is_new)
+        };
+        if is_new || total.is_multiple_of(200) {
+            let mut v: Vec<(&'static str, u32)> =
+                self.nondirectable.borrow().iter().map(|(k, c)| (*k, *c)).collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            let top: Vec<String> = v.iter().take(20).map(|(n, c)| format!("{n}={c}")).collect();
+            tracing::info!("AVM2 direct-call declines ({total} methods): {}", top.join(", "));
+        }
+    }
+
     /// The decline histogram, `(op-name, count)` sorted most-frequent first —
     /// which unsupported ops block the most methods (add these to the JIT next).
     pub fn decline_histogram(&self) -> Vec<(String, u32)> {
@@ -508,14 +537,50 @@ impl WasmJit {
         {
             return None;
         }
+        // Pre-resolve the script-globals / push-string `Value` bits HERE (we have the
+        // `activation`); `compile_method` bakes them into `PushBits` constants. Both are
+        // empty for methods without those ops. Scripts are initialized (the decline check
+        // above guarantees it), so the resolution is a pure read.
+        let script_globals = script_globals_table(activation, method);
+        let push_strings = push_string_table(method);
+        // The declared return-type class pointer (0 = none) — for baking `ReturnValueCoerced`.
+        // Resolve like `try_run` does (idempotent/cached); `0` leaves the `coerce_return` path.
+        let return_type: u64 = method
+            .resolve_info(activation)
+            .ok()
+            .and_then(|_| method.resolved_return_type())
+            // MUST match `coerce_class_table`'s erasure (the `Gc`/`GcBox` pointer the
+            // `coerce` helper reverses) — NOT `Class::as_ptr()`, which is the data pointer
+            // (offset by the GcBox header) and would make the helper read a bogus class.
+            .map(|c| unsafe { std::mem::transmute::<Class<'gc>, *const ()>(c) } as usize as u64)
+            .unwrap_or(0);
         let entry: CacheEntry = locals_typed_seed(activation, method)
             .and_then(|(int_seed, double_seed, numeric_seed)| {
-                compile_method(method, &int_seed, &double_seed, &numeric_seed)
+                compile_method(
+                    method,
+                    &int_seed,
+                    &double_seed,
+                    &numeric_seed,
+                    &script_globals,
+                    &push_strings,
+                    return_type,
+                )
             })
             .map(|(bytes, manifest, mn_list, mut gen_src, directable)| {
                 // Record the method name for the amalgam's wasm name section
                 // (this is the only place with the `Method` in scope).
                 gen_src.name = method.method_name().as_ref().into();
+                // Diagnostic: a compiled-but-not-directable method still pays the
+                // `exec`/Activation path on every call. Record WHY (the first blocker) so
+                // the histogram names the next feature to make directable. `reason(true)`
+                // (assume getslots null-safe) finds the first NON-getslot blocker; if it's
+                // `None` yet the method isn't directable, the block was getslot null-safety.
+                if !directable {
+                    let reason = manifest
+                        .directable_decline_reason(true)
+                        .unwrap_or("getslot_not_null_safe");
+                    self.record_nondirectable(reason);
+                }
                 // Property-IC cache: one zeroed cell per `GetPropertyIc` site. The
                 // cells live in memory 1 (a normal Rust allocation IS in Ruffle's
                 // single linear memory on wasm32), so the slice's data pointer IS
@@ -664,6 +729,7 @@ impl WasmJit {
                     name: &c.gen_src.name,
                     numeric_seed: &c.gen_src.numeric_seed,
                     mn_list: &c.gen_src.mn_list,
+                    coerce_classes: &c.gen_src.coerce_classes,
                 })
                 .collect();
             let Some((bytes, union)) = lower::compile_generation(&members) else {
@@ -785,6 +851,15 @@ fn compile_method<'gc>(
     int_seed: &[bool],
     double_seed: &[bool],
     numeric_seed: &[bool],
+    // Pre-resolved `Value` bits per `GetScriptGlobals` / `PushString` op (built by the
+    // caller, which has the activation). The boxed path rewrites those ops to
+    // `JitOp::PushBits` so they bake to a constant and stop blocking directability.
+    script_globals: &[u64],
+    push_strings: &[u64],
+    // The method's resolved return-type `Class` pointer (0 = none/`*`). Non-zero →
+    // `ReturnValueCoerced` is rewritten to `ReturnValueCoerceBaked` so a typed-return
+    // method becomes directable (bakes the class, drops the `coerce_return` helper).
+    return_type: u64,
 ) -> Option<(Rc<[u8]>, lower::Manifest, Rc<[*const ()]>, GenSource, bool)> {
     method.body()?;
     let core_ops = &method.get_verified_info().parsed_code;
@@ -801,14 +876,16 @@ fn compile_method<'gc>(
                   switches: &[lower::SwitchTable],
                   exceptions: &[lower::ExcRange],
                   mn_list: Vec<*const ()>,
+                  coerce_classes: Vec<*const ()>,
                   all_getslots_null_safe: bool|
      -> Option<(Rc<[u8]>, lower::Manifest, Rc<[*const ()]>, GenSource, bool)> {
         // Share one `Rc` for the three consumers: `compile_full` (bakes `mn_list[k]` at
         // getproperty sites), the `GenSource` (re-emitted into an amalgam), and the
-        // returned `mn_table`.
+        // returned `mn_table`. `coerce_classes` likewise feeds the `Coerce`-site bake.
         let mn_list: Rc<[*const ()]> = mn_list.into();
+        let coerce_classes: Rc<[*const ()]> = coerce_classes.into();
         let bytes: Rc<[u8]> = Rc::from(
-            lower::compile_full(ops, switches, exceptions, numeric_seed, &mn_list)?
+            lower::compile_full(ops, switches, exceptions, numeric_seed, &mn_list, &coerce_classes)?
                 .into_boxed_slice(),
         );
         // A method that emits a single wasm function larger than the browser's
@@ -835,6 +912,7 @@ fn compile_method<'gc>(
             name: Rc::from(""),
             numeric_seed: numeric_seed.into(),
             mn_list: mn_list.clone(),
+            coerce_classes: coerce_classes.clone(),
         };
         let manifest = lower::manifest(ops);
         let directable = manifest.directable(all_getslots_null_safe);
@@ -845,7 +923,7 @@ fn compile_method<'gc>(
     // arithmetic, no helpers → a direct-call target.
     if let Some(ops) = translate::translate(core_ops) {
         if analysis::int_sound(&ops, int_seed) {
-            return finish(&ops, &[], &[], Vec::new(), true);
+            return finish(&ops, &[], &[], Vec::new(), Vec::new(), true);
         }
     }
 
@@ -853,7 +931,7 @@ fn compile_method<'gc>(
     // Also pure numeric → a direct-call target.
     if let Some(ops) = translate::translate_double(core_ops) {
         if analysis::double_sound(&ops, double_seed) {
-            return finish(&ops, &[], &[], Vec::new(), true);
+            return finish(&ops, &[], &[], Vec::new(), Vec::new(), true);
         }
     }
 
@@ -913,6 +991,32 @@ fn compile_method<'gc>(
     // uniqueness. Idempotent for un-inlined methods (translate already numbers them
     // sequentially) and a no-op where no IC is emitted (native).
     renumber_cache_sites(&mut ops);
+    // Bake `GetScriptGlobals`/`PushString` to a constant `PushBits`: their pre-resolved
+    // `Value` bits are known now (the script is initialized — else `compiled` declined —
+    // and string atoms are pool-interned; both are non-moving-GC and alive for the
+    // method's lifetime). This drops the `h17`/`h18` helper, so a method whose only
+    // "unsafe" helper was one of these becomes a direct-call target. Inlining never
+    // splices these ops (see `inline`), so their `k`s still index the caller's tables.
+    for op in ops.iter_mut() {
+        match *op {
+            lower::JitOp::GetScriptGlobals(k) => {
+                if let Some(&bits) = script_globals.get(k as usize) {
+                    *op = lower::JitOp::PushBits(bits);
+                }
+            }
+            lower::JitOp::PushString(k) => {
+                if let Some(&bits) = push_strings.get(k as usize) {
+                    *op = lower::JitOp::PushBits(bits);
+                }
+            }
+            // Typed return: bake the return-type class so `coerce` (already self-contained)
+            // handles it — no `coerce_return`/`RUN_CTX.return_type` → directable.
+            lower::JitOp::ReturnValueCoerced if return_type != 0 => {
+                *op = lower::JitOp::ReturnValueCoerceBaked(return_type);
+            }
+            _ => {}
+        }
+    }
     // Decline helper-dominated methods: when a boxed method is mostly JS-boundary
     // crossings (getproperty/getslot/callmethod/generic helpers) with little inline
     // compute, the interpreter's fast native dispatch beats the JIT's per-call reg
@@ -923,7 +1027,7 @@ fn compile_method<'gc>(
     }
     // Boxed path: not a direct-call target in v1 (its `getslot`/`dm`/coerce helpers
     // are activation-coupled; the null-safe-getslot widening comes later).
-    finish(&ops, &switches, &exceptions, mn_list, all_getslots_null_safe)
+    finish(&ops, &switches, &exceptions, mn_list, coerce_class_table(method), all_getslots_null_safe)
 }
 
 /// Re-assign property-IC and direct-call `site` indices to dense `0..n` sequences

@@ -227,21 +227,16 @@ fn get_script_globals(k: i64) -> i64 {
     }
 }
 
-/// `coerce <class>`: `ToType(value, class[k])` where `class[k]` is the `k`-th entry
-/// of the run context's coerce-class table. A failing coercion (`#1034`) is
-/// stashed in `PENDING_ERROR` and the emitted code bails/dispatches, exactly
-/// like [`coerce_return`]. Only call inside [`with_run_ctx`].
-pub(crate) fn coerce(value: i64, k: i64) -> i64 {
-    let (ptr, len) = unsafe { run_ctx() }.coerce_classes;
-    let k = k as usize;
-    debug_assert!(k < len, "JIT coerce class index {k} out of range (len {len})");
-    if k >= len {
-        return value;
-    }
-    // SAFETY: `ptr` points at a `&[*const ()]` alive for the run; `k` is in range
-    // (the emitter only produces indices it populated). The entry is a live
-    // `Class` address erased for storage; reverse the erasure within the same run.
-    let class = unsafe { std::mem::transmute::<*const (), Class<'_>>(*ptr.add(k)) };
+/// `coerce <class>`: `ToType(value, class)` where `class_ptr` is the `Gc<Class>` address
+/// BAKED into the emitted code at this site (`coerce_classes[k]`, not the index) — so no
+/// per-method `RUN_CTX.coerce_classes` table is read, which makes `Coerce{class}` a
+/// direct-call target. A failing coercion (`#1034`) is stashed in `PENDING_ERROR` and the
+/// emitted code bails/dispatches, exactly like [`coerce_return`]. Only call inside
+/// [`with_run_ctx`].
+pub(crate) fn coerce(value: i64, class_ptr: i64) -> i64 {
+    // SAFETY: `class_ptr` is a baked live `Class` address (a `Gc` handle, stable under the
+    // non-moving GC and alive for the run); reverse the erasure within the same run.
+    let class = unsafe { std::mem::transmute::<*const (), Class<'_>>(class_ptr as usize as *const ()) };
     // SAFETY: helpers run only inside `with_run_ctx`.
     let activation = unsafe { activation() };
     match to_value(value).coerce_to_type(activation, class) {
@@ -255,6 +250,19 @@ pub(crate) fn coerce(value: i64, k: i64) -> i64 {
             from_value(Value::Undefined)
         }
     }
+}
+
+/// The `k`-th coerce-table `Class` pointer (as an i64) from the current run context —
+/// for the direct-exec tier ([`crate::direct`]), which has the INDEX `k` (the emitted
+/// wasm bakes the pointer). Hands the pointer to [`coerce`], matching its baked contract.
+///
+/// # Safety
+/// Call only inside [`with_run_ctx`] with `k` in range.
+pub(crate) unsafe fn coerce_class_ptr(k: usize) -> i64 {
+    let (ptr, len) = unsafe { run_ctx() }.coerce_classes;
+    debug_assert!(k < len, "direct-exec coerce class index {k} out of range (len {len})");
+    // SAFETY: `ptr` points at a live `&[*const ()]`; `k` is in range.
+    unsafe { *ptr.add(k) as usize as i64 }
 }
 
 /// The `k`-th coerce-table `Class` (shared by `coerce`/`newclass`/`newactivation`

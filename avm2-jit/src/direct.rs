@@ -57,6 +57,7 @@ fn effect(op: &JitOp) -> Option<(usize, usize)> {
         | JitOp::PushConst(_)
         | JitOp::PushIntValue(_)
         | JitOp::PushString(_)
+        | JitOp::PushBits(_)
         | JitOp::GetScriptGlobals(_) => (0, 1),
         JitOp::CallHelper(i) if call_helper_supported(*i) => (1, 1),
         JitOp::IncrementIBoxed
@@ -107,7 +108,9 @@ pub(crate) fn eligible(ops: &[JitOp]) -> bool {
     }
     match last {
         JitOp::ReturnVoidBoxed(_) => true,
-        JitOp::ReturnValueBoxed | JitOp::ReturnValueCoerced => depth >= 1,
+        JitOp::ReturnValueBoxed | JitOp::ReturnValueCoerced | JitOp::ReturnValueCoerceBaked(_) => {
+            depth >= 1
+        }
         _ => false,
     }
 }
@@ -163,6 +166,7 @@ pub(crate) fn run(ops: &[JitOp], regs: &[u64]) -> Option<u64> {
             }
             JitOp::GetLocalValue(i) => push!(*regs.get(i as usize)? as i64),
             JitOp::PushConst(bits) => push!(bits as i64),
+            JitOp::PushBits(bits) => push!(bits as i64),
             JitOp::PushIntValue(v) => {
                 push!((crate::lower::VALUE_INT_MARK | (v as u32 as u64)) as i64)
             }
@@ -225,7 +229,10 @@ pub(crate) fn run(ops: &[JitOp], regs: &[u64]) -> Option<u64> {
             }
             JitOp::Coerce(k) => {
                 let a = pop!();
-                push!(helpers::coerce(a, k as i64));
+                // The emitted wasm bakes the class POINTER; direct-exec has the index, so
+                // resolve it through the run context (SAFETY: runs inside `with_run_ctx`).
+                let class = unsafe { helpers::coerce_class_ptr(k as usize) };
+                push!(helpers::coerce(a, class));
                 perr_bail!();
             }
             JitOp::CallHelper3(kind, imm) => {
@@ -281,6 +288,11 @@ pub(crate) fn run(ops: &[JitOp], regs: &[u64]) -> Option<u64> {
                 // A failing `#1034` coercion stashes a pending error and returns
                 // `undefined` — `try_run` propagates it either way.
                 return Some(r as u64);
+            }
+            JitOp::ReturnValueCoerceBaked(rtype_ptr) => {
+                let v = pop!();
+                // Baked class ptr → the `coerce` helper (same `#1034`/pending behaviour).
+                return Some(helpers::coerce(v, rtype_ptr as i64) as u64);
             }
             JitOp::ReturnVoidBoxed(bits) => return Some(bits),
             // Eligibility admits no other op.

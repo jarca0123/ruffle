@@ -1073,6 +1073,7 @@ pub(crate) fn reference_run(ops: &[JitOp], regs: &[u64]) -> u64 {
             | JitOp::SwapValue
             | JitOp::ReturnValueBoxed
             | JitOp::ReturnValueCoerced
+            | JitOp::ReturnValueCoerceBaked(_)
             | JitOp::ReturnVoidBoxed(_)
             | JitOp::DupValue
             | JitOp::StoreLocalValue(_)
@@ -1098,6 +1099,7 @@ pub(crate) fn reference_run(ops: &[JitOp], regs: &[u64]) -> u64 {
             | JitOp::HasNext2(_, _)
             | JitOp::CoerceString
             | JitOp::GetScriptGlobals(_)
+            | JitOp::PushBits(_)
             | JitOp::GetLocalDouble(_)
             | JitOp::SetLocalDouble(_)
             | JitOp::StoreLocalDouble(_)

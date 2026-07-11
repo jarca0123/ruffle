@@ -110,8 +110,8 @@ pub(crate) fn stack_arity(op: &JitOp) -> (u32, u32) {
     match *op {
         // Pushes (no pop).
         GetLocal(_) | GetLocalValue(_) | GetLocalDouble(_) | PushInt(_) | PushIntValue(_)
-        | PushConst(_) | PushDouble(_) | PushString(_) | GetScopeObject(_) | GetOuterScope(_)
-        | GetScriptGlobals(_) | NewCatch(_) => (0, 1),
+        | PushConst(_) | PushDouble(_) | PushString(_) | PushBits(_) | GetScopeObject(_)
+        | GetOuterScope(_) | GetScriptGlobals(_) | NewCatch(_) => (0, 1),
 
         // Pure stack shuffles.
         Dup | DupValue => (1, 2),
@@ -168,7 +168,8 @@ pub(crate) fn stack_arity(op: &JitOp) -> (u32, u32) {
         LookupSwitch(_) => (1, 0),
 
         // Returns / throw are terminators; model their pop for stack tracking.
-        ReturnValue | ReturnValueBoxed | ReturnValueCoerced | ReturnDouble | Throw => (1, 0),
+        ReturnValue | ReturnValueBoxed | ReturnValueCoerced | ReturnValueCoerceBaked(_)
+        | ReturnDouble | Throw => (1, 0),
         ReturnVoidBoxed(_) => (0, 0),
 
         // Calls: pop `argc` spilled args + the receiver; push the result iff `push`.
@@ -313,6 +314,7 @@ fn successors(ops: &[JitOp], leaders: &[usize], bb: usize, bb_of: &impl Fn(usize
     let next = (bb + 1 < leaders.len()).then_some(bb + 1);
     match ops[end - 1] {
         JitOp::ReturnValue | JitOp::ReturnValueBoxed | JitOp::ReturnValueCoerced
+        | JitOp::ReturnValueCoerceBaked(_)
         | JitOp::ReturnDouble | JitOp::ReturnVoidBoxed(_) => vec![],
         JitOp::Jump(t) => bb_of(t).into_iter().collect(),
         JitOp::IfTrue(t) | JitOp::IfFalse(t) | JitOp::IfLt(t) | JitOp::IfGe(t)
