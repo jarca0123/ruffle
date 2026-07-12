@@ -448,19 +448,26 @@ fn build(bytes: &[u8]) -> Option<Compiled> {
                 // Inline domainMemory (`li*`/`si*`) is web-only; native never emits it, but the
                 // table slot must exist so the helper index globals line up (NUM_HELPERS).
                 let dm_desc = Func::wrap(&mut store, || -> i64 { helpers::dm_desc_ptr() });
+                let call_prop_ic = Func::wrap(&mut store, |r: i64, m: i64, o: i64, n: i64, ic: i64| -> i64 {
+                    helpers::call_prop_ic(r, m, o, n, ic)
+                });
+                let call_method_ic = Func::wrap(&mut store, |r: i64, d: i64, o: i64, n: i64, ic: i64| -> i64 {
+                    helpers::call_method_ic(r, d, o, n, ic)
+                });
                 let table = Table::new(
                     &mut store,
-                    TableType::new(RefType::new(true, HeapType::Func), 46, Some(46)),
+                    TableType::new(RefType::new(true, HeapType::Func), 48, Some(48)),
                     Ref::Func(None),
                 )
                 .ok()?;
-                let helpers_tbl: [Func; 46] = [
+                let helpers_tbl: [Func; 48] = [
                     gs, cr, gp, cp, perr, binop, unop, truthy, setprop, setslot, callmethod,
                     newarray, outerscope, scriptglobals, newactivation, pushscope, popscope,
                     getscope, construct, delprop, istype, astype, getsuper, setsuper, callsuper,
                     constructsuper, callnative, getpropfast, setpropfast, op_in, nextvalue,
                     nextname, hasnext, newfunction, applytype, constructslot, constructprop, call,
                     newobject, hasnext2, throw, gschecked, mopload, mopstore, gp_ic, dm_desc,
+                    call_prop_ic, call_method_ic,
                 ];
                 for (i, f) in helpers_tbl.into_iter().enumerate() {
                     table.set(&mut store, i as u64, Ref::Func(Some(f))).ok()?;
@@ -469,7 +476,7 @@ fn build(bytes: &[u8]) -> Option<Compiled> {
                     Global::new(store, GlobalType::new(ValType::I32, Mutability::Const), Val::I32(i))
                 };
                 let mut imports: Vec<wasmtime::Extern> = vec![table.into()];
-                for i in 0..46 {
+                for i in 0..48 {
                     imports.push(idx(&mut store, i).ok()?.into());
                 }
                 let memory =

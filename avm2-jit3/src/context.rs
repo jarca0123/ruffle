@@ -210,6 +210,22 @@ pub(crate) unsafe fn reify<'gc>() -> Activation<'static, 'gc> {
     act
 }
 
+/// The installed run's erased `*mut UpdateContext`, WITHOUT building an `Activation` (unlike
+/// [`reify`]). For the call IC's direct dispatch: the caller casts it back to
+/// `*mut UpdateContext<'gc>` and reborrows LOCALLY, then hands `cx` to `jit.try_enter` — so a
+/// JIT-compiled callee is entered with NO per-call `Activation` (only the declined fallback
+/// reifies). Returning a raw pointer (not `&'gc mut`) keeps the reborrow's lifetime independent
+/// of the `'gc` brand, avoiding a `'static` over-constraint.
+///
+/// # Safety
+/// Call only from a helper running inside [`with_run_ctx`]; the reborrow must not escape the
+/// helper call (it aliases the live `&mut UpdateContext`).
+pub(crate) fn cx_ptr() -> *mut () {
+    let ptr = run_ctx_get();
+    debug_assert!(!ptr.is_null(), "avm2-jit3 helper with no RunCtx installed");
+    unsafe { &*ptr }.cx
+}
+
 /// Stashes a thrown error (erased) for `try_enter` to propagate after the run.
 pub(crate) fn stash_error(e: Error<'_>) {
     // SAFETY: erase `'gc` for storage; taken this same run by `take_error`.

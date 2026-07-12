@@ -327,6 +327,8 @@ fn instantiate(bytes: &[u8], memory: &WebAssembly::Memory) -> Option<js_sys::Fun
     bind_idx(&env, "mopstore_i", helpers::mop_store as fn(i64, i64, i32) -> i64 as usize)?;
     bind_idx(&env, "gp_ic_i", helpers::get_property_ic as fn(i64, i64, i64) -> i64 as usize)?;
     bind_idx(&env, "dmdesc_i", helpers::dm_desc_ptr as fn() -> i64 as usize)?;
+    bind_idx(&env, "callpropic_i", helpers::call_prop_ic as fn(i64, i64, i64, i64, i64) -> i64 as usize)?;
+    bind_idx(&env, "callmethodic_i", helpers::call_method_ic as fn(i64, i64, i64, i64, i64) -> i64 as usize)?;
     Reflect::set(&env, &"memory".into(), memory).ok()?;
     let imports = Object::new();
     Reflect::set(&imports, &"env".into(), &env).ok()?;

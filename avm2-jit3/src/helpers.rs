@@ -17,8 +17,8 @@ use ruffle_core::avm2::object::{ArrayObject, FunctionObject, Object, ScriptObjec
 use ruffle_core::avm2::property::Property;
 use ruffle_core::avm2::script::Script;
 use ruffle_core::avm2::{
-    Activation, ArrayStorage, Class, Error, FunctionArgs, Method, Multiname, NativeMethodImpl,
-    Scope, TObject, Value, ValueEnum,
+    exec, Activation, ArrayStorage, Class, ClassBoundMethod, Error, FunctionArgs, Method,
+    Multiname, NativeMethodImpl, Scope, TObject, Value, ValueEnum,
 };
 
 const SUPER_ON_PRIMITIVE: &str = "Super ops should not appear in primitive functions";
@@ -247,6 +247,24 @@ pub fn ic_cache_base() -> usize {
 /// this, so a huge content can't overflow the cache).
 pub fn ic_cache_capacity() -> usize {
     IC_ENTRIES
+}
+
+/// Per-`CallProperty`-site monomorphic call cache: `CALL_IC_ENTRIES` cells of `[vtable_ptr,
+/// fm_ptr]` (`usize` — pointer-sized). Filled/read by [`call_prop_ic`]; `vtable_ptr == 0` is
+/// empty. Single-thread on web (see [`get_property_ic`]'s note); native uses `thread_local`
+/// callers so this is only touched from the one AVM2 thread there too — actually a plain static
+/// is fine because native never emits the call IC (web-only, memory layout).
+const CALL_IC_ENTRIES: usize = 8192;
+static mut CALL_IC: [usize; CALL_IC_ENTRIES * 2] = [0usize; CALL_IC_ENTRIES * 2];
+
+/// Base address of [`CALL_IC`] — the JIT bakes `base + site * 2 * size_of::<usize>()` per site.
+pub fn call_ic_base() -> usize {
+    core::ptr::addr_of!(CALL_IC) as usize
+}
+
+/// Number of call-IC sites (past this, a `CallProperty` uses the plain `cp` helper).
+pub fn call_ic_capacity() -> usize {
+    CALL_IC_ENTRIES
 }
 
 /// `getproperty` inline-cache MISS handler. Resolves `mn` against the receiver's vtable; if it
@@ -1205,6 +1223,187 @@ pub fn call_property(receiver_bits: i64, mn_ptr: i64, args_off: i64, argc: i64) 
     let arg_bits: &[i64] =
         unsafe { core::slice::from_raw_parts(args_off as usize as *const i64, argc as usize) };
     unsafe { call_property_bits(receiver_bits, mn_ptr, arg_bits) }
+}
+
+/// Dispatches an already-resolved (simple, non-arguments) method DIRECTLY via `exec` — the
+/// callee's execution context (`fm.scope()`/`fm.super_class_obj`) comes straight from the vtable's
+/// `ClassBoundMethod`, so no `call_method_with_args` layer (and no thread-local resolve-IC). This
+/// is the avmplus method-table dispatch: the context is precomputed in the vtable, not rebuilt.
+/// Enters a JIT-compiled callee DIRECTLY via `try_enter` — with NO per-call `Activation` (`cx`
+/// comes straight from the installed RunCtx). `Some(bits)` if the callee ran (or threw →
+/// SENTINEL); `None` if it DECLINED the JIT (the caller then reifies + [`dispatch_via_exec`]).
+#[inline]
+fn try_dispatch_jit<'gc>(
+    fm: &ClassBoundMethod<'gc>,
+    receiver: Value<'gc>,
+    args: &[Value<'gc>],
+) -> Option<i64> {
+    // SAFETY: inside `with_run_ctx`; the reborrow aliases the live context for this call only.
+    let cx: &mut ruffle_core::context::UpdateContext<'gc> =
+        unsafe { &mut *(context::cx_ptr() as *mut ruffle_core::context::UpdateContext<'gc>) };
+    let jit = cx.avm2.jit_backend();
+    jit.try_enter(
+        cx,
+        fm.method,
+        fm.scope(),
+        receiver,
+        fm.super_class_obj,
+        FunctionArgs::from_slice(args),
+    )
+    .map(|r| match r {
+        Ok(v) => to_bits(v) as i64,
+        Err(e) => {
+            context::stash_error(e);
+            SENTINEL_BITS as i64
+        }
+    })
+}
+
+/// Interpreter dispatch for a callee that DECLINED the JIT — needs a caller `Activation` (only
+/// this rare path reifies). Takes `act` (not a raw `'gc`) so it stays free of the `reify`
+/// `'static` over-constraint that a generic-`'gc` fn hits.
+#[inline]
+fn dispatch_via_exec<'gc>(
+    fm: &ClassBoundMethod<'gc>,
+    receiver: Value<'gc>,
+    args: &[Value<'gc>],
+    act: &mut Activation<'_, 'gc>,
+) -> i64 {
+    match exec(
+        fm.method,
+        fm.scope(),
+        receiver,
+        fm.super_class_obj,
+        FunctionArgs::from_slice(args),
+        act,
+        None,
+    ) {
+        Ok(v) => to_bits(v) as i64,
+        Err(e) => {
+            context::stash_error(e);
+            SENTINEL_BITS as i64
+        }
+    }
+}
+
+/// `callproperty` via a per-site MONOMORPHIC call inline cache. `ic_addr` points at a baked
+/// `[vtable_ptr, fm_ptr]` cell. On a vtable hit, the cached method dispatches DIRECTLY (see
+/// [`dispatch_direct`]) — skipping `call_property`'s name resolution AND `call_method_with_args`'s
+/// thread-local resolve-IC (a `RefCell`/hash lookup, plus real wasm TLS on the threaded build).
+/// The cache is filled only for a plain, non-arguments `Method` (getters/slots/arguments-object
+/// methods keep the full [`call_property`] path, which is also the miss/fallback). Reifies.
+pub fn call_prop_ic(receiver_bits: i64, mn_ptr: i64, args_off: i64, argc: i64, ic_addr: i64) -> i64 {
+    let receiver: Value<'_> = unsafe { from_bits(receiver_bits as u64) };
+    let mn: &Multiname<'_> = unsafe { &*(mn_ptr as usize as *const Multiname) };
+    // SAFETY: `args_off` holds `argc` `Value` bits the JIT stored this frame (same memory).
+    let arg_bits: &[i64] =
+        unsafe { core::slice::from_raw_parts(args_off as usize as *const i64, argc as usize) };
+    let args = unsafe { crate::value::bits_as_values(arg_bits) };
+    if let Some(obj) = receiver.as_object() {
+        let vt = obj.vtable();
+        let vt_ptr = vt.as_ptr() as usize;
+        let cell = ic_addr as usize as *mut usize;
+        // SAFETY: `cell` is a live baked `[usize; 2]`. `cell[0] == 0` (init) never matches a
+        // real vtable pointer; on a match, `cell[1]` is a `&ClassBoundMethod` this cache stored,
+        // valid as long as the class (hence the vtable) it belongs to is alive. Resolution needs
+        // no `Activation` — only the fallback below reifies.
+        if unsafe { *cell } == vt_ptr {
+            let fm = unsafe { &*(*cell.add(1) as *const ClassBoundMethod) };
+            if let Some(r) = try_dispatch_jit(fm, receiver, args) {
+                    return r;
+                }
+                // Declined the JIT → interpreter. SAFETY: same run; `act` does not escape.
+                let mut act = unsafe { context::reify() };
+                return dispatch_via_exec(fm, receiver, args, &mut act);
+        }
+        // Miss: resolve. Cache + direct-dispatch only a plain, non-arguments Method (arguments
+        // methods need the bound/arguments-object setup — leave them to `call_property`).
+        if let Some(Property::Method { disp_id }) = vt.get_trait(mn) {
+            if let Some(fm) = vt.get_full_method(disp_id) {
+                if !fm.method.needs_arguments_object() {
+                    unsafe {
+                        *cell = vt_ptr;
+                        *cell.add(1) = fm as *const ClassBoundMethod as usize;
+                    }
+                    if let Some(r) = try_dispatch_jit(fm, receiver, args) {
+                    return r;
+                }
+                // Declined the JIT → interpreter. SAFETY: same run; `act` does not escape.
+                let mut act = unsafe { context::reify() };
+                return dispatch_via_exec(fm, receiver, args, &mut act);
+                }
+            }
+        }
+    }
+    // Fallback: the full path (getter/slot/arguments-object method, or a non-object receiver).
+    // SAFETY: called from JIT wasm inside `with_run_ctx`; `act` does not escape.
+    let mut act = unsafe { context::reify() };
+    match receiver
+        .null_check(&mut act, Some(mn))
+        .and_then(|v| v.call_property(mn, FunctionArgs::from_slice(args), &mut act))
+    {
+        Ok(v) => to_bits(v) as i64,
+        Err(e) => {
+            context::stash_error(e);
+            SENTINEL_BITS as i64
+        }
+    }
+}
+
+/// `callmethod` (by disp-id, already early-bound by the verifier) via the same per-site
+/// monomorphic call IC as [`call_prop_ic`] — but the resolution is a direct
+/// `vtable.get_full_method(disp_id)` (no name lookup). On a vtable hit dispatches directly,
+/// bypassing `call_method_with_args`'s thread-local resolve-IC. Cache filled only for a
+/// non-arguments method; arguments-object methods + non-object receivers → the full
+/// `call_method_with_args`. `disp_id`/`argc` arrive as `i64` (the JIT bakes them). Reifies.
+pub fn call_method_ic(receiver_bits: i64, disp_id: i64, args_off: i64, argc: i64, ic_addr: i64) -> i64 {
+    let receiver: Value<'_> = unsafe { from_bits(receiver_bits as u64) };
+    let arg_bits: &[i64] =
+        unsafe { core::slice::from_raw_parts(args_off as usize as *const i64, argc as usize) };
+    let args = unsafe { crate::value::bits_as_values(arg_bits) };
+    let id = disp_id as usize;
+    if let Some(obj) = receiver.as_object() {
+        let vt = obj.vtable();
+        let vt_ptr = vt.as_ptr() as usize;
+        let cell = ic_addr as usize as *mut usize;
+        // SAFETY: baked `[usize; 2]` cell; see `call_prop_ic`. Resolution needs no `Activation`.
+        if unsafe { *cell } == vt_ptr {
+            let fm = unsafe { &*(*cell.add(1) as *const ClassBoundMethod) };
+            if let Some(r) = try_dispatch_jit(fm, receiver, args) {
+                    return r;
+                }
+                // Declined the JIT → interpreter. SAFETY: same run; `act` does not escape.
+                let mut act = unsafe { context::reify() };
+                return dispatch_via_exec(fm, receiver, args, &mut act);
+        }
+        if let Some(fm) = vt.get_full_method(id) {
+            if !fm.method.needs_arguments_object() {
+                unsafe {
+                    *cell = vt_ptr;
+                    *cell.add(1) = fm as *const ClassBoundMethod as usize;
+                }
+                if let Some(r) = try_dispatch_jit(fm, receiver, args) {
+                    return r;
+                }
+                // Declined the JIT → interpreter. SAFETY: same run; `act` does not escape.
+                let mut act = unsafe { context::reify() };
+                return dispatch_via_exec(fm, receiver, args, &mut act);
+            }
+        }
+    }
+    // Fallback: the full by-disp-id path (arguments-object method / non-object receiver).
+    // SAFETY: called from JIT wasm inside `with_run_ctx`; `act` does not escape.
+    let mut act = unsafe { context::reify() };
+    match receiver
+        .null_check(&mut act, None)
+        .and_then(|r| r.call_method_with_args(id, FunctionArgs::from_slice(args), &mut act))
+    {
+        Ok(v) => to_bits(v) as i64,
+        Err(e) => {
+            context::stash_error(e);
+            SENTINEL_BITS as i64
+        }
+    }
 }
 
 /// `delete_property` (static multiname): `object.delete_property(mn)` after a null-check,

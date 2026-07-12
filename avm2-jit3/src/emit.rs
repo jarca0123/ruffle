@@ -160,8 +160,12 @@ const G_MOPSTORE: u32 = 43;
 const G_GP_IC: u32 = 44;
 /// `dm_desc_ptr() -> i64` — the domainMemory descriptor-cell address for inline `li*`/`si*`.
 const G_DMDESC: u32 = 45;
+/// `call_prop_ic(receiver, mn, args_off, argc, ic_addr) -> value` — monomorphic call IC.
+const G_CALL_IC: u32 = 46;
+/// `call_method_ic(receiver, disp_id, args_off, argc, ic_addr) -> value` — call IC by disp-id.
+const G_CALL_METHOD_IC: u32 = 47;
 /// Number of imported helper table slots / index globals.
-const NUM_HELPERS: u32 = 46;
+const NUM_HELPERS: u32 = 48;
 /// The single defined function (`run`) — index 0 (no imported functions).
 const F_RUN: u32 = 0;
 
@@ -183,6 +187,7 @@ const TY_VOID: u32 = 14; // ()->() — pop_scope
 const TY_HELPER3: u32 = 15; // (i64,i64,i64)->i64 — get_prop_index
 const TY_HASNEXT2: u32 = 16; // (i32,i32,i64)->i64 — has_next_2
 const TY_DMDESC: u32 = 17; // ()->i64 — dm_desc_ptr
+const TY_CALL_IC: u32 = 18; // (i64,i64,i64,i64,i64)->i64 — call_prop_ic
 
 /// Frame slot where a method's outgoing call-arg scratch begins (`i64.store`d args that
 /// `cp` reads). Locals occupy `[0, CALL_SCRATCH_SLOT)`, outgoing args
@@ -634,6 +639,22 @@ fn next_ic_site() -> Option<u64> {
     Some((crate::helpers::ic_cache_base() + site * 8) as u64)
 }
 
+/// Allocates the next monomorphic CALL-cache site and returns the baked address of its
+/// `[vtable_ptr, fm_ptr]` cell (`call_ic_base + site * 2 * size_of::<usize>()`), or `None` once
+/// the fixed cache is full (then that `CallProperty` uses the plain `cp` helper). Unlike the
+/// property IC this is NOT `cfg(wasm32)`: the cell is read/written by the `call_prop_ic` HELPER
+/// (native Rust), and the baked address is a native/wasm pointer the helper dereferences — so it
+/// works on both targets (native → verify-testable).
+fn next_call_ic_site() -> Option<u64> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SITE: AtomicUsize = AtomicUsize::new(0);
+    let site = SITE.fetch_add(1, Ordering::Relaxed);
+    if site >= crate::helpers::call_ic_capacity() {
+        return None;
+    }
+    Some((crate::helpers::call_ic_base() + site * 2 * core::mem::size_of::<usize>()) as u64)
+}
+
 /// Emits the type-0 module for a body with `num_locals` locals. `Some(bytes)` on success;
 /// the module imports the helpers + `env.memory` (shared frame memory) and exports `run`
 /// (the entry) and re-exports `memory` (so the native runner's `Caller` can read the
@@ -673,6 +694,10 @@ pub fn compile(blocks: &[Block], num_locals: usize) -> Option<Vec<u8>> {
     types.ty().function([ValType::I64, ValType::I64, ValType::I64], [ValType::I64]); // get_prop_index
     types.ty().function([ValType::I32, ValType::I32, ValType::I64], [ValType::I64]); // has_next_2
     types.ty().function([], [ValType::I64]); // dm_desc_ptr
+    types.ty().function(
+        [ValType::I64, ValType::I64, ValType::I64, ValType::I64, ValType::I64],
+        [ValType::I64],
+    ); // call_prop_ic
     module.section(&types);
 
     // Imports (in this exact order — the native runner binds them positionally):
@@ -752,6 +777,8 @@ pub fn compile(blocks: &[Block], num_locals: usize) -> Option<Vec<u8>> {
     imports.import("env", "mopstore_i", idx_global);
     imports.import("env", "gp_ic_i", idx_global);
     imports.import("env", "dmdesc_i", idx_global);
+    imports.import("env", "callpropic_i", idx_global);
+    imports.import("env", "callmethodic_i", idx_global);
     imports.import(
         "env",
         "memory",
@@ -965,15 +992,23 @@ fn emit_op(body: &mut Function, op: JitOp) -> Option<()> {
                 body.instruction(&I::LocalGet(SCRATCH64)); // value
                 body.instruction(&I::I64Store(slot(CALL_SCRATCH_SLOT + i)));
             }
-            // `cp(receiver, mn_ptr, args_off, argc)`: reads `argc` args from `args_off`
-            // (= frame base + scratch) in ONE crossing, returns the call result.
+            // Reads `argc` args from `args_off` (= frame base + scratch) in ONE crossing. When a
+            // call-IC site is free, `call_prop_ic(receiver, mn, args_off, argc, ic_addr)` — which
+            // dispatches a cached monomorphic method DIRECTLY, skipping `call_method_with_args`'s
+            // resolve-IC; otherwise the plain `cp` helper.
             body.instruction(&I::I64Const(mn_ptr as i64));
             body.instruction(&I::LocalGet(P_ARGS));
             body.instruction(&I::I64ExtendI32U);
             body.instruction(&I::I64Const((CALL_SCRATCH_SLOT as i64) * 8));
             body.instruction(&I::I64Add);
             body.instruction(&I::I64Const(argc as i64));
-            call_helper(body, G_CP, TY_CP);
+            match next_call_ic_site() {
+                Some(ic_addr) => {
+                    body.instruction(&I::I64Const(ic_addr as i64));
+                    call_helper(body, G_CALL_IC, TY_CALL_IC);
+                }
+                None => call_helper(body, G_CP, TY_CP),
+            }
         }
         JitOp::CallMethod(disp_id, argc) => {
             // Like CallProperty: store args to the outgoing scratch, then call by disp-id.
@@ -983,14 +1018,31 @@ fn emit_op(body: &mut Function, op: JitOp) -> Option<()> {
                 body.instruction(&I::LocalGet(SCRATCH64));
                 body.instruction(&I::I64Store(slot(CALL_SCRATCH_SLOT + i)));
             }
-            // `call_method(receiver, disp_id, args_off, argc)`.
-            body.instruction(&I::I32Const(disp_id as i32));
-            body.instruction(&I::LocalGet(P_ARGS));
-            body.instruction(&I::I64ExtendI32U);
-            body.instruction(&I::I64Const((CALL_SCRATCH_SLOT as i64) * 8));
-            body.instruction(&I::I64Add);
-            body.instruction(&I::I32Const(argc as i32));
-            call_helper(body, G_CALLMETHOD, TY_CALLMETHOD);
+            // Stack: [.., receiver]. With a call-IC site free, `call_method_ic` dispatches a
+            // cached monomorphic method DIRECTLY (skipping `call_method_with_args`'s resolve-IC)
+            // — `disp_id`/`argc` baked as `i64` so it shares the all-i64 `TY_CALL_IC` shape.
+            // Otherwise the plain `call_method` helper.
+            match next_call_ic_site() {
+                Some(ic_addr) => {
+                    body.instruction(&I::I64Const(disp_id as i64));
+                    body.instruction(&I::LocalGet(P_ARGS));
+                    body.instruction(&I::I64ExtendI32U);
+                    body.instruction(&I::I64Const((CALL_SCRATCH_SLOT as i64) * 8));
+                    body.instruction(&I::I64Add);
+                    body.instruction(&I::I64Const(argc as i64));
+                    body.instruction(&I::I64Const(ic_addr as i64));
+                    call_helper(body, G_CALL_METHOD_IC, TY_CALL_IC);
+                }
+                None => {
+                    body.instruction(&I::I32Const(disp_id as i32));
+                    body.instruction(&I::LocalGet(P_ARGS));
+                    body.instruction(&I::I64ExtendI32U);
+                    body.instruction(&I::I64Const((CALL_SCRATCH_SLOT as i64) * 8));
+                    body.instruction(&I::I64Add);
+                    body.instruction(&I::I32Const(argc as i32));
+                    call_helper(body, G_CALLMETHOD, TY_CALLMETHOD);
+                }
+            }
         }
         JitOp::NewArray(argc) => {
             // Store the `argc` elements to the outgoing scratch, then `new_array(off, argc)`.
@@ -1464,6 +1516,47 @@ fn emit_op(body: &mut Function, op: JitOp) -> Option<()> {
                 body.instruction(&I::End); // close the both-f64 `if`
                 return Some(()); // handled; skip the int/bool inline below
             }
+            // URSHIFT on two ints: the UNSIGNED shift yields a `u32` — boxed as `int` when it
+            // fits i32 (high bit clear), else `Number` (like `u32.into()`). Not both int → helper.
+            if code == bc::URSHIFT {
+                body.instruction(&I::LocalSet(SCRATCH64)); // b (count)
+                body.instruction(&I::LocalSet(SCRATCH64_B)); // a
+                for l in [SCRATCH64_B, SCRATCH64] {
+                    body.instruction(&I::LocalGet(l));
+                    body.instruction(&I::I64Const(48));
+                    body.instruction(&I::I64ShrU);
+                    body.instruction(&I::I64Const(0xFFFB));
+                    body.instruction(&I::I64Eq);
+                }
+                body.instruction(&I::I32And);
+                body.instruction(&I::If(BlockType::Result(ValType::I64)));
+                // r_u32 = a >>> (count & 31); wasm `shr_u` already masks the count.
+                body.instruction(&I::LocalGet(SCRATCH64_B));
+                body.instruction(&I::I32WrapI64);
+                body.instruction(&I::LocalGet(SCRATCH64));
+                body.instruction(&I::I32WrapI64);
+                body.instruction(&I::I32ShrU);
+                body.instruction(&I::I64ExtendI32U); // r_u32 as i64 (0..2^32-1)
+                body.instruction(&I::LocalTee(SCRATCH64_B));
+                body.instruction(&I::I64Const(0x8000_0000));
+                body.instruction(&I::I64LtU); // fits i32 (< 2^31)?
+                body.instruction(&I::If(BlockType::Result(ValType::I64)));
+                body.instruction(&I::LocalGet(SCRATCH64_B));
+                body.instruction(&I::I64Const(VALUE_INT_MARK as i64));
+                body.instruction(&I::I64Or); // Integer(r_u32)
+                body.instruction(&I::Else);
+                body.instruction(&I::LocalGet(SCRATCH64_B));
+                body.instruction(&I::F64ConvertI64U);
+                body.instruction(&I::I64ReinterpretF64); // Number(r_u32 as f64)
+                body.instruction(&I::End);
+                body.instruction(&I::Else);
+                body.instruction(&I::LocalGet(SCRATCH64_B));
+                body.instruction(&I::LocalGet(SCRATCH64));
+                body.instruction(&I::I32Const(code));
+                call_helper(body, G_BINOP, TY_BINOP);
+                body.instruction(&I::End);
+                return Some(());
+            }
             // `(instruction, result-is-bool)`; `None` → no inline path, plain helper call.
             let inline: Option<(I, bool)> = match code {
                 bc::BITAND => Some((I::I32And, false)),
@@ -1477,6 +1570,12 @@ fn emit_op(body: &mut Function, op: JitOp) -> Option<()> {
                 bc::ADD_I => Some((I::I32Add, false)),
                 bc::SUBTRACT_I => Some((I::I32Sub, false)),
                 bc::MULTIPLY_I => Some((I::I32Mul, false)),
+                // Shifts on two ints: the i32 result is an exact `int` (wasm `shl`/`shr_s` use
+                // the count mod 32 = AS3's `& 0x1F`). URSHIFT is handled below (uint → maybe
+                // Number). `coerce_to_u32(int_count) & 0x1F == count & 31`, so the count is
+                // correct regardless of the second operand's sign.
+                bc::LSHIFT => Some((I::I32Shl, false)),
+                bc::RSHIFT => Some((I::I32ShrS, false)),
                 _ => None,
             };
             match inline {
@@ -1562,9 +1661,47 @@ fn emit_op(body: &mut Function, op: JitOp) -> Option<()> {
             }
         }
         JitOp::UnOp(code) => {
-            // Stack: [.., a]. Push the op-code and `unop(a, code)`.
-            body.instruction(&I::I32Const(code));
-            call_helper(body, G_UNOP, TY_UNOP);
+            // Stack: [.., a]. Inline `coerce_i`/`coerce_u` when `a` is already an int (the
+            // common redundant-coerce case): `ToInt32(int)` is identity; `ToUint32(int)` is
+            // identity for i >= 0, else `Number(i as u32)`. A double operand needs full
+            // ToInt32/ToUint32 (non-trapping float→int, unavailable on this target) → helper.
+            use crate::helpers::unop_code as uc;
+            if code == uc::COERCE_I || code == uc::COERCE_U {
+                body.instruction(&I::LocalSet(SCRATCH64)); // a
+                body.instruction(&I::LocalGet(SCRATCH64));
+                body.instruction(&I::I64Const(48));
+                body.instruction(&I::I64ShrU);
+                body.instruction(&I::I64Const(0xFFFB));
+                body.instruction(&I::I64Eq); // a is int?
+                body.instruction(&I::If(BlockType::Result(ValType::I64)));
+                if code == uc::COERCE_I {
+                    body.instruction(&I::LocalGet(SCRATCH64)); // ToInt32(int) = the int, unchanged
+                } else {
+                    // ToUint32: i >= 0 → Integer(i) unchanged; i < 0 → Number(i as u32).
+                    body.instruction(&I::LocalGet(SCRATCH64));
+                    body.instruction(&I::I64Const(0xFFFF_FFFF));
+                    body.instruction(&I::I64And); // payload = i as u32 (zero-extended)
+                    body.instruction(&I::LocalTee(SCRATCH64_B));
+                    body.instruction(&I::I64Const(0x8000_0000));
+                    body.instruction(&I::I64LtU); // i >= 0 (fits i32)?
+                    body.instruction(&I::If(BlockType::Result(ValType::I64)));
+                    body.instruction(&I::LocalGet(SCRATCH64)); // Integer(i) unchanged
+                    body.instruction(&I::Else);
+                    body.instruction(&I::LocalGet(SCRATCH64_B));
+                    body.instruction(&I::F64ConvertI64U);
+                    body.instruction(&I::I64ReinterpretF64); // Number(i as u32 as f64)
+                    body.instruction(&I::End);
+                }
+                body.instruction(&I::Else);
+                body.instruction(&I::LocalGet(SCRATCH64));
+                body.instruction(&I::I32Const(code));
+                call_helper(body, G_UNOP, TY_UNOP);
+                body.instruction(&I::End);
+            } else {
+                // Stack: [.., a]. Push the op-code and `unop(a, code)`.
+                body.instruction(&I::I32Const(code));
+                call_helper(body, G_UNOP, TY_UNOP);
+            }
         }
         JitOp::Coerce(class_ptr) => {
             // Stack: [.., value]. `cr(value, class_ptr)` coerces, leaving it on the stack.
@@ -1896,10 +2033,46 @@ mod tests {
             Func::wrap(&mut store, |v: i64, a: i64, c: i32| -> i64 { v.wrapping_add(a).wrapping_add(c as i64) });
         let gp_ic = Func::wrap(&mut store, |r: i64, _m: i64, _c: i64| -> i64 { r });
         let dm_desc = Func::wrap(&mut store, || -> i64 { 0 });
-        // Helper table (46 slots); index globals name each.
+        // Mirrors the `cp` stub (reads args, returns receiver + Σargs) so the CallProperty
+        // memory-round-trip test still validates through the call-IC path; ignores mn + ic_addr.
+        let call_prop_ic = Func::wrap(
+            &mut store,
+            |mut caller: Caller<'_, ()>, r: i64, _mn: i64, off: i64, argc: i64, _ic: i64| -> i64 {
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("re-exported memory");
+                let mut sum = r;
+                for j in 0..argc as usize {
+                    let mut b = [0u8; 8];
+                    mem.read(&caller, off as usize + j * 8, &mut b).expect("read arg");
+                    sum = sum.wrapping_add(i64::from_le_bytes(b));
+                }
+                sum
+            },
+        );
+        // `call_method_ic` stub: receiver + disp_id + Σargs (proves disp_id + the args round-trip
+        // both reach the helper through the call-IC path); ignores ic_addr.
+        let call_method_ic = Func::wrap(
+            &mut store,
+            |mut caller: Caller<'_, ()>, r: i64, d: i64, off: i64, argc: i64, _ic: i64| -> i64 {
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("re-exported memory");
+                let mut sum = r.wrapping_add(d);
+                for j in 0..argc as usize {
+                    let mut b = [0u8; 8];
+                    mem.read(&caller, off as usize + j * 8, &mut b).expect("read arg");
+                    sum = sum.wrapping_add(i64::from_le_bytes(b));
+                }
+                sum
+            },
+        );
+        // Helper table (48 slots); index globals name each.
         let table = Table::new(
             &mut store,
-            TableType::new(RefType::new(true, HeapType::Func), 46, Some(46)),
+            TableType::new(RefType::new(true, HeapType::Func), 48, Some(48)),
             Ref::Func(None),
         )
         .expect("helper table");
@@ -1909,7 +2082,7 @@ mod tests {
             delprop, istype, astype, getsuper, setsuper, callsuper, constructsuper, callnative,
             getpropfast, setpropfast, op_in, nextvalue, nextname, hasnext, newfunction, applytype,
             constructslot, constructprop, call, newobject, hasnext2, throw, gschecked, mopload,
-            mopstore, gp_ic, dm_desc,
+            mopstore, gp_ic, dm_desc, call_prop_ic, call_method_ic,
         ];
         for (i, f) in helpers_tbl.into_iter().enumerate() {
             table.set(&mut store, i as u64, Ref::Func(Some(f))).expect("set helper");
@@ -1918,7 +2091,7 @@ mod tests {
             Global::new(store, GlobalType::new(WtV::I32, Mutability::Const), Val::I32(i))
                 .expect("index global")
         };
-        let g: Vec<_> = (0..46).map(|i| idx(&mut store, i)).collect();
+        let g: Vec<_> = (0..48).map(|i| idx(&mut store, i)).collect();
         let mem = Memory::new(&mut store, MemoryType::new(FRAME_PAGES, Some(FRAME_PAGES)))
             .expect("frame memory");
         let mut imports: Vec<wasmtime::Extern> = vec![table.into()];
@@ -2224,6 +2397,32 @@ mod tests {
         assert_eq!(bin(bc::ADD, i32::MAX, 1), ((i32::MAX as i64 + 1) as f64).to_bits());
         assert_eq!(bin(bc::SUBTRACT, i32::MIN, 1), ((i32::MIN as i64 - 1) as f64).to_bits());
         assert_eq!(bin(bc::MULTIPLY, 100_000, 100_000), ((100_000i64 * 100_000) as f64).to_bits());
+    }
+
+    #[test]
+    fn binop_inlines_int_shifts_and_coerce() {
+        let int = |n: i32| 0xFFFB_0000_0000_0000u64 | (n as u32 as u64);
+        let bin = |code: i32, a: i32, b: i32| {
+            run(
+                &[JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::BinOp(code), JitOp::ReturnValue],
+                &[UNDEFINED_BITS, int(a), int(b)],
+            )
+        };
+        let un = |code: i32, a: u64| {
+            run(&[JitOp::GetLocal(1), JitOp::UnOp(code), JitOp::ReturnValue], &[UNDEFINED_BITS, a])
+        };
+        use crate::helpers::binop_code as bc;
+        use crate::helpers::unop_code as uc;
+        // Shifts (int×int): count masks to `& 31`; `<<`/`>>` → Integer, `>>>` → maybe Number.
+        assert_eq!(bin(bc::LSHIFT, 1, 4), int(16));
+        assert_eq!(bin(bc::LSHIFT, 1, 33), int(2)); // 33 & 31 == 1
+        assert_eq!(bin(bc::RSHIFT, -16, 2), int(-4)); // arithmetic (signed)
+        assert_eq!(bin(bc::URSHIFT, 16, 2), int(4));
+        assert_eq!(bin(bc::URSHIFT, -1, 0), (4_294_967_295u32 as f64).to_bits()); // > i32::MAX → Number
+        // coerce_i / coerce_u on an int operand.
+        assert_eq!(un(uc::COERCE_I, int(7)), int(7)); // ToInt32(int) = identity
+        assert_eq!(un(uc::COERCE_U, int(7)), int(7)); // ToUint32(non-neg int) = identity
+        assert_eq!(un(uc::COERCE_U, int(-1)), (4_294_967_295u32 as f64).to_bits()); // → Number
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::avm2::error::{
     Error1014Type, make_error_1014, make_error_1047, make_error_1107, make_error_2022,
     make_error_2023,
 };
-use crate::avm2::function::exec;
+pub use crate::avm2::function::exec;
 use crate::avm2::globals::{
     SystemClassDefs, SystemClasses, init_builtin_system_class_defs, init_builtin_system_classes,
     init_native_system_classes,
@@ -95,6 +95,9 @@ pub use crate::avm2::method::{Method, NativeMethodImpl};
 pub use crate::avm2::op::Op;
 pub use crate::avm2::flv::FlvValueAvm2Ext;
 pub use crate::avm2::function::FunctionArgs;
+// `pub` (with `exec` above) so avm2-jit3's monomorphic call inline cache can dispatch a resolved
+// method directly via `exec`, bypassing `call_property`/`call_method_with_args` on a cache hit.
+pub use crate::avm2::vtable::ClassBoundMethod;
 pub use crate::avm2::globals::flash::ui::context_menu::make_context_menu_state;
 pub use crate::avm2::multiname::Multiname;
 pub use crate::avm2::namespace::{CommonNamespaces, Namespace};
@@ -731,8 +734,9 @@ impl<'gc> Avm2<'gc> {
     }
 
     /// The active JIT backend, cloned so the caller can invoke it without holding
-    /// a borrow of `self`.
-    pub(crate) fn jit_backend(&self) -> Rc<dyn JitBackend> {
+    /// a borrow of `self`. `pub` so avm2-jit3's call IC can re-enter `try_enter` DIRECTLY on a
+    /// cache hit (a JIT→JIT call with no intervening `Activation`), bypassing `exec`.
+    pub fn jit_backend(&self) -> Rc<dyn JitBackend> {
         self.jit.clone()
     }
 
