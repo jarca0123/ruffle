@@ -661,6 +661,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         self.avm2().scope_stack.truncate(scope_depth);
     }
 
+    /// (AVM2 JIT reification) Retarget `scope_depth` to the reified method's true scope
+    /// base. `from_builtin` defaults it to the live scope-stack top, but a helper reifying
+    /// mid-run needs `scope_frame`/`create_scopechain` (`newfunction`) to see the method's
+    /// own local scope frame `[base..]`, matching `init_from_method`.
+    #[inline]
+    pub fn jit_set_scope_base(&mut self, base: usize) {
+        self.scope_depth = base;
+    }
+
     /// JIT direct-call scope entry: a direct-called method reuses the CALLER's
     /// `Activation`, so its scope ops would read the caller's `scope_frame`. Retarget
     /// `scope_depth` to the current scope-stack top (the callee's frame base) and return
@@ -1703,6 +1712,18 @@ impl<'a, 'gc> Activation<'a, 'gc> {
     /// [`Self::op_get_outer_scope`] but returns the value (checked).
     pub fn jit_outer_scope(&self, index: usize) -> Value<'gc> {
         match self.outer.get(index) {
+            Some(scope) => scope.values(),
+            None => Value::Undefined,
+        }
+    }
+
+    /// The `getscopeobject` value for the AVM2 JIT: the object of the local scope at `index`
+    /// relative to `base` (the JIT method's scope-stack depth at entry) on the shared
+    /// `scope_stack`, or `undefined` if out of range. `base + index` must have been pushed by
+    /// this method's `pushscope`s. Mirrors [`Self::op_get_scope_object`] for the reify model,
+    /// where each helper call has a fresh Activation and so can't rely on `scope_frame()`.
+    pub fn jit_local_scope(&self, base: usize, index: usize) -> Value<'gc> {
+        match self.context.avm2.scope_stack.get(base + index) {
             Some(scope) => scope.values(),
             None => Value::Undefined,
         }

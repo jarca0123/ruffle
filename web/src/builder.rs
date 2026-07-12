@@ -772,7 +772,10 @@ impl RuffleInstanceBuilder {
             // (`shared_verified()` — the differential diagnostic — is unsound for
             // event/timer-driven content: it re-runs call-bearing methods 4x and
             // native side effects multiply. See worker_player.rs.)
+            #[cfg(not(feature = "jit3"))]
             core.set_avm2_jit_backend(ruffle_avm2_jit::WasmJit::shared());
+            #[cfg(feature = "jit3")]
+            core.set_avm2_jit_backend(std::rc::Rc::new(ruffle_avm2_jit3::Jit3::new()));
 
             if matches!(self.device_font_renderer, DeviceFontRenderer::Embedded) {
                 self.setup_fonts(&mut core);

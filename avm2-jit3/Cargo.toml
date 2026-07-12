@@ -1,0 +1,49 @@
+[package]
+name = "ruffle_avm2_jit3"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+# Ground-up AVM2 -> WebAssembly JIT rebuild (see AVM2_JIT_REDESIGN.md and the
+# approved plan). ONE calling convention for every method — AS3 and native
+# builtin alike are funcrefs of a single WASM type reached by one `call_indirect`,
+# with no interpreter `Activation` on the hot path (a per-method `env` carries the
+# callee's scope/super/tables; slow-path ops reify a fresh callee-owned Activation).
+# The older `ruffle_avm2_jit` / `_jit2` crates stay intact as fallback/reference.
+[dependencies]
+ruffle_core = { path = "../core" }
+# The GC `Mutation` type the slot-write (write-barrier) helper needs.
+gc-arena = { workspace = true }
+# Runtime WASM module emission (browser engine on web; wasmtime/cranelift native).
+wasm-encoder = "0.221"
+tracing = { workspace = true }
+# Pointer-keyed method cache; FNV beats SipHash on the small pointer/int keys.
+fnv = { workspace = true }
+
+# Native execution: run the emitted module through wasmtime (cranelift -> native).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# `winch` = the baseline single-pass compiler (no regalloc2), used by the runner to avoid
+# Cranelift's per-method optimizing-compile cost (profiled ~63% of the native thread).
+wasmtime = { version = "46", default-features = false, features = ["cranelift", "runtime", "winch"] }
+
+# Web execution: hand the emitted bytes to the browser's WASM engine via js-sys.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+
+# Not used directly — enables getrandom's `wasm_js` feature so the transitive
+# `ruffle_core` dep builds for wasm32.
+[target.'cfg(target_family = "wasm")'.dependencies.getrandom]
+version = "0.3"
+features = ["wasm_js"]
+
+[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+swf = { path = "../swf" }
+tracing-subscriber = { workspace = true }

@@ -14,7 +14,8 @@ use crate::avm2::globals::{
     init_native_system_classes,
 };
 use crate::avm2::object::WorkerObject;
-use crate::avm2::scope::ScopeChain;
+// `pub` so an out-of-crate `JitBackend` (avm2-jit3) can name it in `try_enter`.
+pub use crate::avm2::scope::ScopeChain;
 use crate::avm2::script::{Script, TranslationUnit};
 use crate::avm2::stack::Stack;
 use crate::character::Character;
@@ -272,6 +273,18 @@ impl<'gc> Avm2<'gc> {
 
     pub fn playerglobals_domain(&self) -> Domain<'gc> {
         self.playerglobals_domain
+    }
+
+    /// The current depth of the shared scope stack — the AVM2 JIT records this at a method's
+    /// entry as the base for its `getscopeobject`/`pushscope`/`popscope`.
+    pub fn scope_stack_len(&self) -> usize {
+        self.scope_stack.len()
+    }
+
+    /// Truncate the shared scope stack back to `len` — the AVM2 JIT calls this after a run to
+    /// drop any scopes the compiled method left (e.g. an early error bail).
+    pub fn truncate_scope_stack(&mut self, len: usize) {
+        self.scope_stack.truncate(len);
     }
 
     /// Return the current set of system classes.

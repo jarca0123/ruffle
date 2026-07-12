@@ -197,6 +197,22 @@ pub fn exec<'gc>(
     activation: &mut Activation<'_, 'gc>,
     callee: Option<FunctionObject<'gc>>,
 ) -> Result<Value<'gc>, Error<'gc>> {
+    // avm2-jit3 seam: try to enter `method` WITHOUT constructing an Activation
+    // (see `AVM2_JIT_REDESIGN.md`). Every backend but `Jit3` inherits the `None`
+    // default, so this is behavior-neutral until `Jit3` is installed. `FunctionArgs`
+    // is `Copy`, so `arguments` survives for the normal-path fallthrough below.
+    let jit = activation.context.avm2.jit_backend();
+    if let Some(result) = jit.try_enter(
+        activation.context,
+        method,
+        scope,
+        receiver,
+        bound_superclass,
+        arguments,
+    ) {
+        return result;
+    }
+
     let mc = activation.gc();
 
     let caller_dxns = activation.default_xml_namespace();

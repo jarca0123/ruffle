@@ -291,6 +291,37 @@ impl<'gc> Multiname<'gc> {
         Ok(multiname)
     }
 
+    /// Like [`Self::fill_with_runtime_params`] but the runtime NAME is supplied directly
+    /// (not popped from the operand stack) — for the AVM2 JIT, whose reified builtin
+    /// Activation has no operand stack. The caller must ensure the multiname has no lazy
+    /// namespace (only a lazy name); the namespace is taken from the template.
+    pub fn fill_with_runtime_name(
+        &self,
+        name_value: crate::avm2::Value<'gc>,
+        activation: &mut Activation<'_, 'gc>,
+    ) -> Result<Self, Error<'gc>> {
+        debug_assert!(!self.has_lazy_ns(), "fill_with_runtime_name requires a static namespace");
+        let name = if self.has_lazy_name() {
+            if let Some(qname_object) = name_value.as_object().and_then(|o| o.as_qname_object()) {
+                let mut name = qname_object.name().clone();
+                if self.is_attribute() {
+                    name.set_is_attribute(true);
+                }
+                return Ok(name);
+            }
+            Some(name_value.coerce_to_string(activation)?)
+        } else {
+            self.name
+        };
+
+        Ok(Self {
+            ns: self.ns,
+            name,
+            param: self.param,
+            flags: self.flags & !(MultinameFlags::HAS_LAZY_NS | MultinameFlags::HAS_LAZY_NAME),
+        })
+    }
+
     pub fn fill_with_runtime_params(
         &self,
         activation: &mut Activation<'_, 'gc>,

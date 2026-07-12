@@ -10,8 +10,12 @@
 //! used until a real backend is installed via
 //! [`Avm2::set_jit_backend`](crate::avm2::Avm2::set_jit_backend).
 
+use crate::avm2::function::FunctionArgs;
 use crate::avm2::method::Method;
+use crate::avm2::object::ClassObject;
+use crate::avm2::scope::ScopeChain;
 use crate::avm2::{Activation, Error, Value};
+use crate::context::UpdateContext;
 
 /// A strategy for executing a verified AVM2 bytecode method faster than the
 /// tree-walking interpreter.
@@ -41,6 +45,33 @@ pub trait JitBackend {
         activation: &mut Activation<'_, 'gc>,
         method: Method<'gc>,
     ) -> Option<Result<Value<'gc>, Error<'gc>>>;
+
+    /// Attempts to enter `method` **before** the interpreter constructs an
+    /// [`Activation`] for it — the avm2-jit3 seam (see `AVM2_JIT_REDESIGN.md`).
+    ///
+    /// Called at the very top of [`exec`](crate::avm2::function::exec), so a backend
+    /// that returns `Some` runs the method with NO `init_from_method` /
+    /// `from_builtin` cost: it writes `[this, args]` into its own frame region and
+    /// enters compiled code directly. `scope`/`bound_super` are the callee's own
+    /// (the material for the per-method `env`); `cx` is the ambient GC/update
+    /// context (not an `Activation` — the callee builds its own lazily only if a
+    /// slow-path op needs one). Returns `None` to fall through to `exec`'s normal
+    /// native/bytecode paths. Unlike [`Self::try_run`] (called from `run_actions`,
+    /// after the Activation is already built), this can actually remove the `exec`
+    /// floor. Default: decline.
+    #[expect(clippy::too_many_arguments)]
+    fn try_enter<'gc>(
+        &self,
+        cx: &mut UpdateContext<'gc>,
+        method: Method<'gc>,
+        scope: ScopeChain<'gc>,
+        receiver: Value<'gc>,
+        bound_super: Option<ClassObject<'gc>>,
+        args: FunctionArgs<'_, 'gc>,
+    ) -> Option<Result<Value<'gc>, Error<'gc>>> {
+        let _ = (cx, method, scope, receiver, bound_super, args);
+        None
+    }
 }
 
 /// The default backend: never compiles anything, so every method is interpreted.

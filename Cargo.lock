@@ -5119,6 +5119,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruffle_avm2_jit3"
+version = "0.3.0"
+dependencies = [
+ "fnv",
+ "gc-arena",
+ "getrandom 0.3.4",
+ "js-sys",
+ "ruffle_core",
+ "swf 0.2.2",
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
+ "wasm-encoder 0.221.3",
+ "wasmtime",
+]
+
+[[package]]
 name = "ruffle_common"
 version = "0.3.0"
 dependencies = [
@@ -5236,6 +5253,7 @@ dependencies = [
  "raw-window-handle",
  "rfd",
  "ruffle_avm2_jit",
+ "ruffle_avm2_jit3",
  "ruffle_core",
  "ruffle_frontend_utils",
  "ruffle_render",
@@ -5479,6 +5497,7 @@ dependencies = [
  "rascal",
  "regex",
  "ruffle_avm2_jit",
+ "ruffle_avm2_jit3",
  "ruffle_core",
  "ruffle_input_format",
  "ruffle_render",
@@ -5562,6 +5581,7 @@ dependencies = [
  "rlsf",
  "ruffle_avm2_jit",
  "ruffle_avm2_jit2",
+ "ruffle_avm2_jit3",
  "ruffle_core",
  "ruffle_render",
  "ruffle_render_canvas",
@@ -7361,6 +7381,7 @@ dependencies = [
  "wasmtime-internal-jit-icache-coherence",
  "wasmtime-internal-unwinder",
  "wasmtime-internal-versioned-export-macros",
+ "wasmtime-internal-winch",
  "windows-sys 0.61.2",
 ]
 
@@ -7498,6 +7519,23 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "wasmtime-internal-winch"
+version = "46.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "792c155d1b3e73abd4e213d323f573952fc1b57bbe75c9a10ecba26d9627903f"
+dependencies = [
+ "cranelift-codegen",
+ "gimli",
+ "log",
+ "object",
+ "target-lexicon",
+ "wasmparser 0.251.0",
+ "wasmtime-environ",
+ "wasmtime-internal-cranelift",
+ "winch-codegen",
 ]
 
 [[package]]
@@ -7852,6 +7890,25 @@ name = "winapi-x86_64-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
+
+[[package]]
+name = "winch-codegen"
+version = "46.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "040894258b8cf36cf26d16c7a64c351e2780b4d4ed331a074ad6a6afdd4ee909"
+dependencies = [
+ "cranelift-assembler-x64",
+ "cranelift-codegen",
+ "gimli",
+ "regalloc2",
+ "smallvec",
+ "target-lexicon",
+ "thiserror 2.0.18",
+ "wasmparser 0.251.0",
+ "wasmtime-environ",
+ "wasmtime-internal-core",
+ "wasmtime-internal-cranelift",
+]
 
 [[package]]
 name = "windows"

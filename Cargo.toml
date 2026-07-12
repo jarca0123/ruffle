@@ -5,6 +5,7 @@ members = [
     "core/build_playerglobal",
     "avm2-jit",
     "avm2-jit2",
+    "avm2-jit3",
     "desktop",
     "swf",
     "flv",

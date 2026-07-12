@@ -594,32 +594,31 @@ impl WasmJit {
             // (offset by the GcBox header) and would make the helper read a bogus class.
             .map(|c| unsafe { std::mem::transmute::<Class<'gc>, *const ()>(c) } as usize as u64)
             .unwrap_or(0);
-        // Optional-param defaults, coerced to the param type EXACTLY as `resolve_parameters`
-        // does (`arg.coerce_to_type` at call time → we pre-coerce here, so a direct call with
-        // `argc < param_count` fills bit-identical slots). `param_defaults[i]` = the `Value`
-        // bits of param `i`'s coerced default (0 for the leading required params;
-        // `required_count` marks the first optional). AS3 defaults are compile-time constants
-        // whose coercion is a pure/interned result (numbers, bools, null, or an interned
-        // string atom — same stable-`Gc` reasoning as `push_string_table`), so the bits are
-        // bakeable. A default that fails to coerce collapses `required_count` to `param_count`,
-        // disabling the fill (the gate then demands exact `argc == param_count`, the old path).
+        // Optional-param defaults, for the direct-call prologue's missing-slot fill. We must
+        // NOT coerce here: `compiled` runs LAZILY inside a live method call, so
+        // `coerce_to_type(activation, …)` would run on the in-flight activation (a class-init
+        // or `valueOf` re-entry mutating its operand stack) and corrupt the running method.
+        // Instead bake a default ONLY when it needs no coercion — `coerces_identically_to`
+        // (a pure type check, no activation) means the raw bits ARE the coerced bits, exactly
+        // what `resolve_parameters` would produce. `param_defaults[i]` = those bits (0 for the
+        // leading required params; `required_count` marks the first optional). A default that
+        // WOULD need coercion collapses `required_count` to `param_count`, disabling the fill
+        // for that method (the gate then demands exact `argc == param_count`, the old path).
         let params = method.resolved_param_config();
         let mut required_count =
             params.iter().take_while(|p| p.default_value.is_none()).count() as u32;
         let mut param_defaults: Vec<u64> = vec![0u64; params.len()];
         for (i, p) in params.iter().enumerate() {
             if let Some(dv) = &p.default_value {
-                let coerced = match p.param_type {
-                    Some(pc) => match dv.coerce_to_type(activation, pc) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            required_count = params.len() as u32;
-                            break;
-                        }
-                    },
-                    None => *dv,
+                let no_coercion = match p.param_type {
+                    Some(pc) => dv.coerces_identically_to(pc),
+                    None => true, // untyped param (`*`) — no coercion
                 };
-                param_defaults[i] = value_to_bits(coerced);
+                if !no_coercion {
+                    required_count = params.len() as u32;
+                    break;
+                }
+                param_defaults[i] = value_to_bits(*dv);
             }
         }
         let entry: CacheEntry = locals_typed_seed(activation, method)
@@ -1088,9 +1087,7 @@ fn compile_method<'gc>(
     // method's lifetime). This drops the `h17`/`h18` helper, so a method whose only
     // "unsafe" helper was one of these becomes a direct-call target. Inlining never
     // splices these ops (see `inline`), so their `k`s still index the caller's tables.
-    #[allow(clippy::never_loop)]
     for op in ops.iter_mut() {
-        if true { let _ = (&script_globals, &push_strings, return_type); break; } // DIAGNOSTIC: bakes off
         match *op {
             lower::JitOp::GetScriptGlobals(k) => {
                 if let Some(&bits) = script_globals.get(k as usize) {

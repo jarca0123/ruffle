@@ -350,8 +350,13 @@ impl ActivePlayer {
         // the test harness's switch: `RUFFLE_JIT=1` drives, `RUFFLE_JIT=verify`
         // runs the differential self-check. Off by default.
         if let Ok(mode) = std::env::var("RUFFLE_JIT") {
-            let jit = if mode == "verify" {
+            let jit: std::rc::Rc<dyn ruffle_core::avm2::JitBackend> = if mode == "verify" {
                 ruffle_avm2_jit::WasmJit::shared_verified()
+            } else if mode == "3" {
+                // avm2-jit3 (the ground-up rebuild) — mirrors the test runner's switch, so
+                // `RUFFLE_JIT=3 samply record ruffle_desktop game.swf` profiles the real
+                // `try_enter` dispatch on real content with full native DWARF.
+                std::rc::Rc::new(ruffle_avm2_jit3::Jit3::new())
             } else {
                 ruffle_avm2_jit::WasmJit::shared()
             };

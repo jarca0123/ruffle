@@ -54,15 +54,17 @@ struct SharedBuf {
     /// under the lock).
     ptr: AtomicUsize,
     cap: AtomicUsize,
-    /// The buffer's stable **descriptor**: `[base, cap]` words at a FIXED heap
-    /// address for the buffer's whole lifetime. The JIT's inline domainMemory
-    /// path loads base+cap from here on EVERY access (two loads from one hot
-    /// cache line) instead of caching them per frame — so a growth reallocation
-    /// just rewrites the cell and even a frame that never exits (FlasCC's
-    /// dispatch loop) observes the move on its next access. No pinning, no
-    /// clamping. On wasm32 `usize` words are the `u32`s the emitted `i32.load`s
-    /// expect (offsets 0 and 4); native never reads it inline.
-    desc: Box<[AtomicUsize; 2]>,
+    /// The buffer's stable **descriptor**: `[base, cap, len]` words at a FIXED
+    /// heap address for the buffer's whole lifetime. The JIT's inline domainMemory
+    /// path loads base+len from here on EVERY access (from one hot cache line)
+    /// instead of caching them per frame — so a growth reallocation just rewrites
+    /// the cell and even a frame that never exits (FlasCC's dispatch loop) observes
+    /// the move on its next access. No pinning, no clamping. `len` (word 2, offset
+    /// 8 on wasm32) is the exact logical length the inline `li*`/`si*` bounds-check
+    /// against (`addr + width <= len`, else bail to the throwing helper) — mirrored
+    /// from `len` on every store below. On wasm32 `usize` words are the `u32`s the
+    /// emitted `i32.load`s expect (offsets 0/4/8); native never reads it inline.
+    desc: Box<[AtomicUsize; 3]>,
     /// Logical length (grows via `sbrk`); always `<= cap`.
     len: AtomicUsize,
     /// Serializes every accessor against growth moves (and a grow's zero-fill
@@ -124,7 +126,11 @@ impl SharedByteBuffer {
         Self(Arc::new(SharedBuf {
             ptr: AtomicUsize::new(ptr as usize),
             cap: AtomicUsize::new(cap),
-            desc: Box::new([AtomicUsize::new(ptr as usize), AtomicUsize::new(cap)]),
+            desc: Box::new([
+                AtomicUsize::new(ptr as usize),
+                AtomicUsize::new(cap),
+                AtomicUsize::new(len),
+            ]),
             len: AtomicUsize::new(len),
             grow: Mutex::new(()),
         }))
@@ -136,7 +142,11 @@ impl SharedByteBuffer {
         Self(Arc::new(SharedBuf {
             ptr: AtomicUsize::new(ptr as usize),
             cap: AtomicUsize::new(cap),
-            desc: Box::new([AtomicUsize::new(ptr as usize), AtomicUsize::new(cap)]),
+            desc: Box::new([
+                AtomicUsize::new(ptr as usize),
+                AtomicUsize::new(cap),
+                AtomicUsize::new(bytes.len()),
+            ]),
             len: AtomicUsize::new(bytes.len()),
             grow: Mutex::new(()),
         }))
@@ -238,6 +248,7 @@ impl SharedByteBuffer {
             unsafe { std::ptr::write_bytes(ptr.add(old), 0, new_len - old) };
         }
         b.len.store(new_len, Ordering::Release);
+        b.desc[2].store(new_len, Ordering::Release); // keep the JIT's inline len in sync
     }
 
     /// `ByteArray.atomicCompareAndSwapLength`: if the length equals `expected`,
@@ -254,6 +265,7 @@ impl SharedByteBuffer {
                 unsafe { std::ptr::write_bytes(ptr.add(old), 0, new - old) };
             }
             b.len.store(new, Ordering::Release);
+            b.desc[2].store(new, Ordering::Release); // keep the JIT's inline len in sync
             tracing::trace!(
                 "ram {:#x}: t{:#x} sbrk {old} -> {new}",
                 self.ptr_id(),

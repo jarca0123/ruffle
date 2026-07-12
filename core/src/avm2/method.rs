@@ -161,6 +161,16 @@ impl<'gc> Method<'gc> {
         Gc::as_ptr(self.0).cast()
     }
 
+    /// Reconstruct a `Method` from an [`as_ptr`](Self::as_ptr) value.
+    ///
+    /// # Safety
+    /// `ptr` must be a pointer previously returned by `as_ptr` for a `Method` that is
+    /// still live in the current GC arena (the JIT bakes it as a `newfunction` operand
+    /// and reconstructs it within the same GC-quiescent run).
+    pub unsafe fn from_ptr(ptr: *const ()) -> Self {
+        Method(unsafe { Gc::from_ptr(ptr.cast()) })
+    }
+
     /// Construct a `Method` from an `AbcFile` and method index.
     pub fn from_method_index(
         txunit: TranslationUnit<'gc>,

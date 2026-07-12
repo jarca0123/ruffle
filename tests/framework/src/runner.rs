@@ -126,8 +126,12 @@ impl TestRunner {
         // Any other value makes the JIT **drive** — a bug then changes the AS3 output
         // and fails the test outright, naming a deterministic repro.
         if let Ok(mode) = std::env::var("RUFFLE_JIT") {
-            let jit = if mode == "verify" {
+            let jit: std::rc::Rc<dyn ruffle_core::avm2::JitBackend> = if mode == "verify" {
                 ruffle_avm2_jit::WasmJit::shared_verified()
+            } else if mode == "3" {
+                // avm2-jit3 (the ground-up rebuild). Phase 0: declines everything, so
+                // this must reproduce the interpreter exactly (the transparency check).
+                std::rc::Rc::new(ruffle_avm2_jit3::Jit3::new())
             } else {
                 ruffle_avm2_jit::WasmJit::shared()
             };

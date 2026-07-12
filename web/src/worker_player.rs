@@ -165,7 +165,12 @@ async fn run(offscreen: OffscreenCanvas, init: WorkerInit) -> Result<(), Box<dyn
     // app spirals into exponential timer storms. Use it only on compute-heavy
     // (FlasCC-style) content.
     if WORKER_PLAYER_JIT {
+        #[cfg(not(feature = "jit3"))]
         ruffle_core::worker_runtime::set_worker_jit_factory(|| ruffle_avm2_jit::WasmJit::shared());
+        #[cfg(feature = "jit3")]
+        ruffle_core::worker_runtime::set_worker_jit_factory(|| {
+            std::rc::Rc::new(ruffle_avm2_jit3::Jit3::new())
+        });
     }
 
     let renderer = create_worker_renderer(&offscreen, init.quality).await?;
@@ -223,10 +228,16 @@ async fn run(offscreen: OffscreenCanvas, init: WorkerInit) -> Result<(), Box<dyn
 
     // Install the JIT, consistent with the main-thread build.
     if WORKER_PLAYER_JIT {
+        #[cfg(not(feature = "jit3"))]
         player
             .lock()
             .expect("worker player poisoned")
             .set_avm2_jit_backend(ruffle_avm2_jit::WasmJit::shared());
+        #[cfg(feature = "jit3")]
+        player
+            .lock()
+            .expect("worker player poisoned")
+            .set_avm2_jit_backend(std::rc::Rc::new(ruffle_avm2_jit3::Jit3::new()));
     }
 
     // Drive preload to completion up front.

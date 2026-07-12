@@ -33,6 +33,9 @@ profiling = []
 # Real Flash workers via wasm threads (Web Workers over a shared memory).
 # Requires a threaded wasm build (`+atomics`) and cross-origin isolation.
 threads = ["dep:wasm_thread"]
+# Use the ground-up avm2-jit3 backend instead of the default `ruffle_avm2_jit`
+# (main thread AND worker). Early/low-coverage — for in-browser testing of the rebuild.
+jit3 = ["dep:ruffle_avm2_jit3"]
 
 [dependencies]
 wasm_thread = { version = "0.3", features = ["es_modules"], optional = true }
@@ -47,6 +50,7 @@ ruffle_render_canvas = { path = "../render/canvas", optional = true }
 ruffle_web_common = { path = "common" }
 ruffle_avm2_jit = { path = "../avm2-jit" }
 ruffle_avm2_jit2 = { path = "../avm2-jit2" }
+ruffle_avm2_jit3 = { path = "../avm2-jit3", optional = true }
 web-time = "1.1"
 ruffle_render = { path = "../render" }
 ruffle_render_webgl = { path = "../render/webgl", optional = true }

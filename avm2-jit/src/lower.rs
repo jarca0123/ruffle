@@ -957,10 +957,6 @@ impl Manifest {
     /// null-safe. (`gs` is still IMPORTED for the defensive non-object fallback, but
     /// that arm is dead here — hence `has_getslot` is allowed under the flag.)
     pub(crate) fn directable(&self, getslots_all_null_safe: bool) -> bool {
-        // DIAGNOSTIC (temporary): disable ALL direct callees.
-        if true {
-            return false;
-        }
         // `set_slot_no_coerce` (kind 1) IS allowed: it writes a slot with the GC write
         // barrier and never re-enters AS3 (no coercion → no `valueOf`), so it needs no
         // nested frame — it unblocks field-copy/setter methods as direct-call targets. The

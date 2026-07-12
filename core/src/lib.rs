@@ -30,7 +30,7 @@ mod frame_lifecycle;
 pub mod fte;
 mod html;
 mod input;
-mod library;
+pub mod library;
 pub mod limits;
 pub mod loader;
 mod local_connection;

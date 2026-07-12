@@ -122,6 +122,22 @@ function buildWasm(
     ];
     const wasmBindgenFlags = [];
     const wasmOptFlags = [];
+    // Profiling build: emit DWARF so Chromium (with the "C/C++ DevTools Support (DWARF)"
+    // extension — no experiment toggle needed in modern Chrome, it's built-in) resolves wasm
+    // samples to Rust `file:line`. Kept OFF by default (DWARF bloats the module, slows the
+    // build). `-C debuginfo=1` = line-tables-only: the line table maps each sample offset to
+    // its ORIGINAL source line INCLUDING inlined code (so `try_enter`'s inlined `run_leaf`
+    // shows as `runner_web.rs:NNN`), at a fraction of `debuginfo=2`'s size — critical here
+    // because the threads build recompiles `std` via build-std, where full debug info
+    // explodes to hundreds of MB. `--keep-debug` stops wasm-bindgen stripping it; the
+    // profiling build also SKIPS wasm-opt (below), which would otherwise mangle the DWARF.
+    if (process.env["BUILD_WASM_DEBUG"]) {
+        // `-C strip=none` is ESSENTIAL: the release-inherited profiles have `debug = 0`, for
+        // which cargo auto-injects `-C strip=debuginfo` — that would strip the DWARF we just
+        // asked for. RUSTFLAGS is appended after cargo's own flags, so `strip=none` wins.
+        rustFlags.push("-C", "debuginfo=1", "-C", "strip=none");
+        wasmBindgenFlags.push("--keep-debug");
+    }
     const flavor = threads ? "threads" : extensions ? "extensions" : "vanilla";
     if (threads) {
         // Shared-memory threaded build for real Flash workers (FlasCC runs the
@@ -155,6 +171,15 @@ function buildWasm(
             "link-arg=--export=__tls_size",
             "-C",
             "link-arg=--export=__tls_align",
+            // Make `__indirect_function_table` growable (adds a maximum) so the AVM2 JIT
+            // (avm2-jit3) can park each compiled method's `run` funcref in it via the JS
+            // `WebAssembly.Table.grow()` API and enter it by fn-pointer — a wasm→wasm
+            // `call_indirect` that keeps the i64 result in-wasm. Without this the table is
+            // fixed-size, every `grow()` fails, and EVERY JIT entry falls back to the slow
+            // JS `call3` path (i64 marshaled through BigInt). MVP-compatible: only sets the
+            // table's max, no reference-types instructions.
+            "-C",
+            "link-arg=--growable-table",
         );
         // wasm-opt must be told about the post-MVP features the shared-memory
         // build uses, or it rejects the atomics / shared memory. With these it can
@@ -202,12 +227,19 @@ function buildWasm(
         dir: "dist",
         flags: wasmBindgenFlags,
     });
-    if (optimise) {
+    // `wasm-opt -O` mangles/strips DWARF (Binaryen's line-info preservation through
+    // optimization is lossy), so the profiling build SKIPS it — the module keeps intact
+    // `.debug_line`/`.debug_info` for Chromium's DWARF extension. rustc's `opt-level=3`
+    // (release profile) is already applied, so intra-`try_enter` line attribution stays
+    // representative; only the extra ~10-20% Binaryen win is missing.
+    if (optimise && !process.env["BUILD_WASM_DEBUG"]) {
         console.log(`Running wasm-opt on ${flavor}...`);
         runWasmOpt({
             path: `dist/${filename}_bg.wasm`,
             flags: wasmOptFlags,
         });
+    } else if (process.env["BUILD_WASM_DEBUG"]) {
+        console.log(`Skipping wasm-opt on ${flavor} (BUILD_WASM_DEBUG: preserving DWARF)`);
     }
 }
 function detectWasmOpt() {
