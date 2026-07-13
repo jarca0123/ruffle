@@ -331,6 +331,16 @@ pub enum JitOp {
     /// Pop two values, push `binop(a, b, code)` — a dynamic binary operator (add/compare/…).
     /// May coerce (`valueOf`) → reification + may throw.
     BinOp(i32),
+    /// Pop two operands PROVEN to be canonical inline `Number`s (by `translate`'s repr
+    /// analysis), push `a OP b` computed as a pure `f64` op (ADD/SUBTRACT/MULTIPLY/DIVIDE).
+    /// No runtime tag guard and no `binop` helper — pure `f64` arithmetic never runs `valueOf`,
+    /// so it cannot throw (no `BailIfError` follows). The unguarded core of `BinOp`'s f64 path.
+    BinOpNum(i32),
+    /// Pop two operands PROVEN to share a numeric repr and push `a CMP b` as a native compare
+    /// (`code` is a comparison binop code). `is_f64 = false` → both are `Int` boxes → signed i32
+    /// compare; `is_f64 = true` → both canonical `Number` → f64 compare (NaN → false). Result is
+    /// a `Bool` box. No runtime tag guard, no helper, no `BailIfError` — the hot `i < n` path.
+    BinOpCmp(i32, bool),
     /// Pop one value, push `unop(a, code)` — a dynamic unary operator (negate/not/…).
     UnOp(i32),
     /// Coerce the top value to the baked return-type class pointer, leaving it on the stack
@@ -350,6 +360,30 @@ pub enum JitOp {
     ReturnValue,
     /// Return `undefined`.
     ReturnVoid,
+}
+
+/// The typed WASM register a promoted local lives in. `IntI32`/`BoolI32` share the same i32
+/// declaration group and `i32.wrap` unbox; they differ only in the box tag `GetLocal` re-applies.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RegKind {
+    /// A canonical `Number` local → an `f64` register.
+    F64,
+    /// A provable `Int` local → an `i32` register (re-boxed with `VALUE_INT_MARK`).
+    IntI32,
+    /// A provable `Bool` local → an `i32` register (re-boxed with `VALUE_BOOL_MARK`).
+    BoolI32,
+}
+
+/// A local promoted out of the memory frame into a typed WASM register (Phase 3/4).
+#[derive(Clone, Copy)]
+pub struct Promotion {
+    /// The AVM2 local index.
+    pub local: u32,
+    /// Which register (and box tag) this local uses.
+    pub kind: RegKind,
+    /// Load the param's frame value at the prologue (a typed param), vs. the WASM-default `0`/
+    /// `0.0` for a dead-on-entry accumulator (its `undefined` initial value is never read).
+    pub init_from_frame: bool,
 }
 
 /// A basic block: a straight-line body plus how it hands off control.
@@ -660,7 +694,12 @@ fn next_call_ic_site() -> Option<u64> {
 /// (the entry) and re-exports `memory` (so the native runner's `Caller` can read the
 /// outgoing call-arg scratch). Declines (`None`) if `num_locals` leaves no room for the
 /// outgoing-arg scratch within one frame stride.
-pub fn compile(blocks: &[Block], num_locals: usize) -> Option<Vec<u8>> {
+pub fn compile(
+    blocks: &[Block],
+    num_locals: usize,
+    promoted: &[Promotion],
+    undefined_init: &[u32],
+) -> Option<Vec<u8>> {
     if num_locals > CALL_SCRATCH_SLOT as usize {
         return None; // locals would overlap the outgoing call-arg scratch
     }
@@ -803,15 +842,69 @@ pub fn compile(blocks: &[Block], num_locals: usize) -> Option<Vec<u8>> {
     exports.export("memory", ExportKind::Memory, 0);
     module.section(&exports);
 
-    // SCRATCH64/_B (2×i64), STATE (i32), P_DM (i64), then `max_spill` SPILL locals (i64).
+    // SCRATCH64/_B (2×i64), STATE (i32), P_DM (i64), then `max_spill` SPILL locals (i64), then the
+    // PROMOTED registers (Phase 3/4: `Number` locals → f64, `Int` locals → i32, lifted out of the
+    // memory frame). The spill i64 run is `1 (P_DM) + max_spill` after STATE, so the f64 group
+    // starts at `SPILL_BASE + max_spill`, and the i32 group right after it.
     let max_spill = blocks.iter().map(|b| b.entry_depth).max().unwrap_or(0) as u32;
-    // P_DM shares the trailing i64 run — `1 (P_DM) + max_spill` i64 locals after STATE.
+    let n_f64 = promoted.iter().filter(|p| p.kind == RegKind::F64).count() as u32;
+    let n_i32 = promoted.iter().filter(|p| p.kind != RegKind::F64).count() as u32;
+    let f64_base = SPILL_BASE + max_spill;
+    let i32_base = f64_base + n_f64;
+    // `promote[local_i] = Some((wasm register index, kind))` for a promoted local, else `None`.
+    // Read by `emit_op`'s `GetLocal`/`SetLocal` to use the register instead of `i64.load`/`store`.
+    // `Int`/`Bool` share the i32 declaration group (indexed after the f64 group).
+    let mut promote: Vec<Option<(u32, RegKind)>> = vec![None; num_locals];
+    let (mut f64_rank, mut i32_rank) = (0u32, 0u32);
+    for p in promoted {
+        let idx = if p.kind == RegKind::F64 {
+            let r = f64_base + f64_rank;
+            f64_rank += 1;
+            r
+        } else {
+            let r = i32_base + i32_rank;
+            i32_rank += 1;
+            r
+        };
+        if let Some(slot) = promote.get_mut(p.local as usize) {
+            *slot = Some((idx, p.kind));
+        }
+    }
     let local_decls = vec![
         (2u32, ValType::I64),
         (1u32, ValType::I32),
         (1u32 + max_spill, ValType::I64),
+        (n_f64, ValType::F64),
+        (n_i32, ValType::I32),
     ];
     let mut body = Function::new(local_decls);
+    // Prologue: a promoted typed PARAM (`init_from_frame`) is loaded from the frame ONCE into its
+    // register — f64 via `f64.reinterpret` (a canonical `Number`'s box bits ARE its f64 bits),
+    // i32 via `i32.wrap` (an `Int`/`Bool` box's low 32 bits ARE the payload). A promoted
+    // accumulator is dead-on-entry, so its `undefined` frame value is never read and the
+    // WASM-default `0`/`0.0` is fine → no init. Thereafter `GetLocal`/`SetLocal` use the register.
+    for p in promoted {
+        if p.init_from_frame {
+            let (idx, kind) = promote[p.local as usize].unwrap();
+            body.instruction(&Instruction::LocalGet(P_ARGS));
+            body.instruction(&Instruction::I64Load(slot(p.local)));
+            if kind == RegKind::F64 {
+                body.instruction(&Instruction::F64ReinterpretI64);
+            } else {
+                body.instruction(&Instruction::I32WrapI64);
+            }
+            body.instruction(&Instruction::LocalSet(idx));
+        }
+    }
+    // Prologue `undefined`-init: the caller (`try_enter`) now writes ONLY `[this, params]` into
+    // the frame — NOT the full-width `undefined` padding. So a NON-promoted local that may be
+    // read before it is written (`undefined_init`, computed by liveness) must be set here, or it
+    // would read stale arena data from a previous run at this depth. Usually empty.
+    for &i in undefined_init {
+        body.instruction(&Instruction::LocalGet(P_ARGS));
+        body.instruction(&Instruction::I64Const(UNDEFINED_BITS as i64));
+        body.instruction(&Instruction::I64Store(slot(i)));
+    }
     // domainMemory inline (`li*`/`si*`) fast path: when the method has any INTEGER MOP op,
     // fetch the current domainMemory descriptor-cell address ONCE at entry into `P_DM` (the
     // inline reads base+len from the cell on each access). Web only — native keeps the helper,
@@ -825,10 +918,10 @@ pub fn compile(blocks: &[Block], num_locals: usize) -> Option<Vec<u8>> {
     // (branches/loops) → a `br_table` dispatch loop over the basic blocks.
     if blocks.len() == 1 && matches!(blocks[0].term, Term::Return) {
         for &op in &blocks[0].ops {
-            emit_op(&mut body, op)?;
+            emit_op(&mut body, op, &promote)?;
         }
     } else {
-        emit_dispatch(&mut body, blocks)?;
+        emit_dispatch(&mut body, blocks, &promote)?;
     }
     // Fallthrough guard: yield `undefined` so the function is always valid and total (for
     // the dispatch loop this is unreachable, but it keeps the function well-typed).
@@ -842,20 +935,56 @@ pub fn compile(blocks: &[Block], num_locals: usize) -> Option<Vec<u8>> {
     Some(module.finish())
 }
 
-fn emit_op(body: &mut Function, op: JitOp) -> Option<()> {
+fn emit_op(body: &mut Function, op: JitOp, promote: &[Option<(u32, RegKind)>]) -> Option<()> {
     use Instruction as I;
     #[cfg(target_arch = "wasm32")]
     use crate::helpers::mop_code as mc;
     match op {
         JitOp::GetLocal(i) => {
-            body.instruction(&I::LocalGet(P_ARGS));
-            body.instruction(&I::I64Load(slot(i)));
+            // Promoted: read the register and RE-BOX. F64 → the canonical `Number`'s box bits ARE
+            // its f64 bits (`i64.reinterpret`). Int/Bool → `i64.extend_i32_u | tag`.
+            match promote.get(i as usize) {
+                Some(&Some((reg, RegKind::F64))) => {
+                    body.instruction(&I::LocalGet(reg));
+                    body.instruction(&I::I64ReinterpretF64);
+                }
+                Some(&Some((reg, kind))) => {
+                    let mark = if kind == RegKind::BoolI32 {
+                        VALUE_BOOL_MARK
+                    } else {
+                        VALUE_INT_MARK
+                    };
+                    body.instruction(&I::LocalGet(reg));
+                    body.instruction(&I::I64ExtendI32U);
+                    body.instruction(&I::I64Const(mark as i64));
+                    body.instruction(&I::I64Or);
+                }
+                _ => {
+                    body.instruction(&I::LocalGet(P_ARGS));
+                    body.instruction(&I::I64Load(slot(i)));
+                }
+            }
         }
         JitOp::SetLocal(i) => {
-            body.instruction(&I::LocalSet(SCRATCH64));
-            body.instruction(&I::LocalGet(P_ARGS));
-            body.instruction(&I::LocalGet(SCRATCH64));
-            body.instruction(&I::I64Store(slot(i)));
+            // Promoted: UNBOX the (proven `Number`/`Int`/`Bool`) i64 to the register — no
+            // `i64.store` to the frame (the slot goes stale but is never read again). F64 →
+            // `f64.reinterpret`; Int/Bool → `i32.wrap` (the box's low 32 bits are the payload).
+            match promote.get(i as usize) {
+                Some(&Some((reg, RegKind::F64))) => {
+                    body.instruction(&I::F64ReinterpretI64);
+                    body.instruction(&I::LocalSet(reg));
+                }
+                Some(&Some((reg, _))) => {
+                    body.instruction(&I::I32WrapI64);
+                    body.instruction(&I::LocalSet(reg));
+                }
+                _ => {
+                    body.instruction(&I::LocalSet(SCRATCH64));
+                    body.instruction(&I::LocalGet(P_ARGS));
+                    body.instruction(&I::LocalGet(SCRATCH64));
+                    body.instruction(&I::I64Store(slot(i)));
+                }
+            }
         }
         JitOp::PushBits(bits) => {
             body.instruction(&I::I64Const(bits as i64));
@@ -1660,6 +1789,77 @@ fn emit_op(body: &mut Function, op: JitOp) -> Option<()> {
                 }
             }
         }
+        JitOp::BinOpNum(code) => {
+            // Stack: [.., a, b] — both PROVEN canonical inline `f64`s (translate's repr
+            // analysis). The unguarded core of `BinOp`'s f64 fast path: reinterpret, compute,
+            // canonicalize a box-colliding NaN result. No guard, no helper, no `BailIfError`.
+            use crate::helpers::binop_code as bc;
+            const BOX_MARK: i64 = 0xFFF8_0000_0000_0000u64 as i64;
+            const CANON_NAN: i64 = 0x7FF8_0000_0000_0000;
+            let fop = match code {
+                bc::ADD => I::F64Add,
+                bc::SUBTRACT => I::F64Sub,
+                bc::MULTIPLY => I::F64Mul,
+                bc::DIVIDE => I::F64Div,
+                _ => return None, // translate emits `BinOpNum` only for these four
+            };
+            body.instruction(&I::LocalSet(SCRATCH64)); // b (top)
+            body.instruction(&I::LocalSet(SCRATCH64_B)); // a
+            body.instruction(&I::LocalGet(SCRATCH64_B));
+            body.instruction(&I::F64ReinterpretI64);
+            body.instruction(&I::LocalGet(SCRATCH64));
+            body.instruction(&I::F64ReinterpretI64);
+            body.instruction(&fop);
+            body.instruction(&I::I64ReinterpretF64);
+            // Canonicalize a NaN result whose bits alias the box space (see `BinOp`).
+            body.instruction(&I::LocalTee(SCRATCH64));
+            body.instruction(&I::I64Const(BOX_MARK));
+            body.instruction(&I::I64And);
+            body.instruction(&I::I64Const(BOX_MARK));
+            body.instruction(&I::I64Eq);
+            body.instruction(&I::If(BlockType::Result(ValType::I64)));
+            body.instruction(&I::I64Const(CANON_NAN));
+            body.instruction(&I::Else);
+            body.instruction(&I::LocalGet(SCRATCH64));
+            body.instruction(&I::End);
+        }
+        JitOp::BinOpCmp(code, is_f64) => {
+            // Stack: [.., a, b] — both PROVEN the same numeric repr. Native same-type compare
+            // (unguarded core of `BinOp`'s comparison fast paths) → a `Bool` box. No `BailIfError`.
+            use crate::helpers::binop_code as bc;
+            const BOOL_MARK: i64 = 0xFFFA_0000_0000_0000u64 as i64;
+            body.instruction(&I::LocalSet(SCRATCH64)); // b (top)
+            body.instruction(&I::LocalSet(SCRATCH64_B)); // a
+            body.instruction(&I::LocalGet(SCRATCH64_B));
+            if is_f64 {
+                body.instruction(&I::F64ReinterpretI64);
+            } else {
+                body.instruction(&I::I32WrapI64); // Int box → i32 payload
+            }
+            body.instruction(&I::LocalGet(SCRATCH64));
+            if is_f64 {
+                body.instruction(&I::F64ReinterpretI64);
+            } else {
+                body.instruction(&I::I32WrapI64);
+            }
+            let cmp = match (code, is_f64) {
+                (bc::EQUALS, false) | (bc::STRICT_EQUALS, false) => I::I32Eq,
+                (bc::LESS_THAN, false) => I::I32LtS,
+                (bc::LESS_EQUALS, false) => I::I32LeS,
+                (bc::GREATER_THAN, false) => I::I32GtS,
+                (bc::GREATER_EQUALS, false) => I::I32GeS,
+                (bc::EQUALS, true) | (bc::STRICT_EQUALS, true) => I::F64Eq,
+                (bc::LESS_THAN, true) => I::F64Lt,
+                (bc::LESS_EQUALS, true) => I::F64Le,
+                (bc::GREATER_THAN, true) => I::F64Gt,
+                (bc::GREATER_EQUALS, true) => I::F64Ge,
+                _ => return None, // translate emits `BinOpCmp` only for the six comparisons
+            };
+            body.instruction(&cmp); // → i32 boolean (0/1)
+            body.instruction(&I::I64ExtendI32U);
+            body.instruction(&I::I64Const(BOOL_MARK));
+            body.instruction(&I::I64Or); // Bool box
+        }
         JitOp::UnOp(code) => {
             // Stack: [.., a]. Inline `coerce_i`/`coerce_u` when `a` is already an int (the
             // common redundant-coerce case): `ToInt32(int)` is identity; `ToUint32(int)` is
@@ -1844,7 +2044,7 @@ fn emit_truthy(body: &mut Function) {
 /// Layout (n blocks): `loop { block B0 { … block B_{n-1} { block Bdef {
 /// br_table[B0..B_{n-1}] Bdef } unreachable } <blk n-1> } … <blk 0> } <guard>`. Blocks are
 /// emitted in REVERSE, so at block `k` the enclosing `loop` sits at branch depth `k`.
-fn emit_dispatch(body: &mut Function, blocks: &[Block]) -> Option<()> {
+fn emit_dispatch(body: &mut Function, blocks: &[Block], promote: &[Option<(u32, RegKind)>]) -> Option<()> {
     use Instruction as I;
     let n = blocks.len();
     if n == 0 {
@@ -1867,7 +2067,7 @@ fn emit_dispatch(body: &mut Function, blocks: &[Block]) -> Option<()> {
             body.instruction(&I::LocalGet(SPILL_BASE + d as u32));
         }
         for &op in &blocks[k].ops {
-            emit_op(body, op)?;
+            emit_op(body, op, promote)?;
         }
         match blocks[k].term {
             Term::Return => {} // the body already emitted a `Return`
@@ -1928,7 +2128,12 @@ mod tests {
 
     /// Like [`run`] but for an explicit block list — exercises the dispatch loop.
     fn run_blocks(blocks: Vec<Block>, frame: &[u64]) -> u64 {
-        let bytes = compile(&blocks, frame.len()).expect("compiles");
+        run_blocks_p(blocks, frame, &[])
+    }
+
+    /// [`run_blocks`] with an explicit promoted-locals set (Phase 3/4).
+    fn run_blocks_p(blocks: Vec<Block>, frame: &[u64], promoted: &[Promotion]) -> u64 {
+        let bytes = compile(&blocks, frame.len(), promoted, &[]).expect("compiles");
         let engine = Engine::default();
         let module = WtModule::new(&engine, &bytes).expect("valid module");
         let mut store = Store::new(&engine, ());
@@ -2197,6 +2402,212 @@ mod tests {
             &[UNDEFINED_BITS],
         );
         assert_eq!(out, 35);
+    }
+
+    #[test]
+    fn binopnum_computes_unguarded_f64() {
+        // The unguarded f64 core: same results as `BinOp`'s guarded f64 path, but no runtime
+        // tag check and no `BailIfError` (translate proves both operands canonical `Number`).
+        let dbl = |x: f64| x.to_bits();
+        let bin = |code: i32, a: f64, b: f64| {
+            f64::from_bits(run(
+                &[JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::BinOpNum(code), JitOp::ReturnValue],
+                &[UNDEFINED_BITS, dbl(a), dbl(b)],
+            ))
+        };
+        use crate::helpers::binop_code as bc;
+        assert_eq!(bin(bc::ADD, 1.5, 2.25), 3.75);
+        assert_eq!(bin(bc::SUBTRACT, 1.5, 2.25), -0.75);
+        assert_eq!(bin(bc::MULTIPLY, 1.5, 2.0), 3.0);
+        assert_eq!(bin(bc::DIVIDE, 3.0, 2.0), 1.5);
+        assert_eq!(bin(bc::DIVIDE, 1.0, 0.0), f64::INFINITY);
+        // A NaN result is canonicalized to a non-box-colliding double.
+        let raw = run(
+            &[JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::BinOpNum(bc::DIVIDE), JitOp::ReturnValue],
+            &[UNDEFINED_BITS, dbl(0.0), dbl(0.0)],
+        );
+        assert!(f64::from_bits(raw).is_nan());
+        assert_ne!(raw & 0xFFF8_0000_0000_0000, 0xFFF8_0000_0000_0000, "must not alias box space");
+        // Chained: (a*b)*c stays a valid `Number` across ops (result feeds the next BinOpNum).
+        let out = f64::from_bits(run(
+            &[
+                JitOp::GetLocal(1),
+                JitOp::GetLocal(2),
+                JitOp::BinOpNum(bc::MULTIPLY),
+                JitOp::GetLocal(3),
+                JitOp::BinOpNum(bc::MULTIPLY),
+                JitOp::ReturnValue,
+            ],
+            &[UNDEFINED_BITS, dbl(2.0), dbl(3.0), dbl(4.0)],
+        ));
+        assert_eq!(out, 24.0);
+    }
+
+    #[test]
+    fn binopcmp_native_unguarded_compare() {
+        use crate::helpers::binop_code as bc;
+        let tru = VALUE_BOOL_MARK | 1;
+        let fal = VALUE_BOOL_MARK;
+        let ib = |v: i32| VALUE_INT_MARK | (v as u32 as u64);
+        // Two `Int`s → signed i32 compare.
+        let icmp = |code: i32, a: i32, b: i32| {
+            run(
+                &[JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::BinOpCmp(code, false), JitOp::ReturnValue],
+                &[UNDEFINED_BITS, ib(a), ib(b)],
+            )
+        };
+        assert_eq!(icmp(bc::LESS_THAN, 3, 5), tru);
+        assert_eq!(icmp(bc::LESS_THAN, 5, 3), fal);
+        assert_eq!(icmp(bc::LESS_THAN, -2, 1), tru, "signed"); // signed: -2 < 1
+        assert_eq!(icmp(bc::GREATER_EQUALS, 4, 4), tru);
+        assert_eq!(icmp(bc::EQUALS, 7, 7), tru);
+        assert_eq!(icmp(bc::EQUALS, 7, 8), fal);
+        // Two canonical `Number`s → f64 compare (NaN → false).
+        let dbl = |x: f64| x.to_bits();
+        let fcmp = |code: i32, a: f64, b: f64| {
+            run(
+                &[JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::BinOpCmp(code, true), JitOp::ReturnValue],
+                &[UNDEFINED_BITS, dbl(a), dbl(b)],
+            )
+        };
+        assert_eq!(fcmp(bc::LESS_THAN, 1.5, 2.5), tru);
+        assert_eq!(fcmp(bc::GREATER_THAN, 3.0, 1.0), tru);
+        assert_eq!(fcmp(bc::EQUALS, 2.0, 2.0), tru);
+        assert_eq!(fcmp(bc::LESS_THAN, f64::NAN, 1.0), fal, "NaN compares false");
+        assert_eq!(fcmp(bc::EQUALS, f64::NAN, f64::NAN), fal);
+    }
+
+    #[test]
+    fn promoted_bool_local_round_trips_through_i32_register() {
+        // Local 1 is a promoted `Bool` local → an i32 register (box tag `VALUE_BOOL_MARK`).
+        let bb = |v: bool| VALUE_BOOL_MARK | (v as u64);
+        // b = true; return b.
+        let out = run_blocks_p(
+            vec![Block {
+                ops: vec![JitOp::PushBits(bb(true)), JitOp::SetLocal(1), JitOp::GetLocal(1), JitOp::ReturnValue],
+                term: Term::Return,
+                entry_depth: 0,
+            }],
+            &[UNDEFINED_BITS, UNDEFINED_BITS],
+            &[Promotion { local: 1, kind: RegKind::BoolI32, init_from_frame: false }],
+        );
+        assert_eq!(out, bb(true));
+        // A `Bool` param read from the frame register.
+        let out = run_blocks_p(
+            vec![Block {
+                ops: vec![JitOp::GetLocal(1), JitOp::ReturnValue],
+                term: Term::Return,
+                entry_depth: 0,
+            }],
+            &[UNDEFINED_BITS, bb(false)],
+            &[Promotion { local: 1, kind: RegKind::BoolI32, init_from_frame: true }],
+        );
+        assert_eq!(out, bb(false));
+    }
+
+    #[test]
+    fn promoted_number_param_reads_from_register() {
+        // Local 1 is a promoted read-only `Number` param: the prologue loads it from the frame
+        // into an f64 WASM local, and `GetLocal(1)` reads that register (no `i64.load`). The
+        // round-trip must be bit-identical to the boxed frame value.
+        let n = 3.5f64.to_bits();
+        let out = run_blocks_p(
+            vec![Block {
+                ops: vec![JitOp::GetLocal(1), JitOp::ReturnValue],
+                term: Term::Return,
+                entry_depth: 0,
+            }],
+            &[UNDEFINED_BITS, n],
+            &[Promotion { local: 1, kind: RegKind::F64, init_from_frame: true }],
+        );
+        assert_eq!(out, n, "promoted param must read back its exact Number bits");
+
+        // Arithmetic on the promoted param: x * x, x a canonical Number → BinOpNum.
+        let out = f64::from_bits(run_blocks_p(
+            vec![Block {
+                ops: vec![
+                    JitOp::GetLocal(1),
+                    JitOp::GetLocal(1),
+                    JitOp::BinOpNum(crate::helpers::binop_code::MULTIPLY),
+                    JitOp::ReturnValue,
+                ],
+                term: Term::Return,
+                entry_depth: 0,
+            }],
+            &[UNDEFINED_BITS, n],
+            &[Promotion { local: 1, kind: RegKind::F64, init_from_frame: true }],
+        ));
+        assert_eq!(out, 3.5 * 3.5);
+    }
+
+    #[test]
+    fn promoted_writable_local_round_trips_through_register() {
+        // Local 1 is a promoted WRITABLE local (init_from_frame = false → the f64 register
+        // starts at the WASM default 0.0). Storing a canonical `Number` and reading it back must
+        // be bit-identical; a `BinOpNum` accumulate must land back in the register.
+        let a = 2.5f64.to_bits();
+        let b = 4.0f64.to_bits();
+        // s = a; s = s + b; return s   →  a + b.
+        let out = f64::from_bits(run_blocks_p(
+            vec![Block {
+                ops: vec![
+                    JitOp::PushBits(a),
+                    JitOp::SetLocal(1),
+                    JitOp::GetLocal(1),
+                    JitOp::PushBits(b),
+                    JitOp::BinOpNum(crate::helpers::binop_code::ADD),
+                    JitOp::SetLocal(1),
+                    JitOp::GetLocal(1),
+                    JitOp::ReturnValue,
+                ],
+                term: Term::Return,
+                entry_depth: 0,
+            }],
+            &[UNDEFINED_BITS, UNDEFINED_BITS],
+            &[Promotion { local: 1, kind: RegKind::F64, init_from_frame: false }],
+        ));
+        assert_eq!(out, 2.5 + 4.0);
+    }
+
+    #[test]
+    fn promoted_int_local_round_trips_through_i32_register() {
+        // Local 1 is a promoted `Int` accumulator → an i32 register (init 0). Storing an `Int`
+        // box and reading it back is bit-identical; an int-int `ADD_I` accumulate lands in the
+        // register. `int` box = `VALUE_INT_MARK | (v as u32)`.
+        let ib = |v: i32| VALUE_INT_MARK | (v as u32 as u64);
+        use crate::helpers::binop_code as bc;
+        // c = 5; c = c + 10; return c   →  15.
+        let out = run_blocks_p(
+            vec![Block {
+                ops: vec![
+                    JitOp::PushBits(ib(5)),
+                    JitOp::SetLocal(1),
+                    JitOp::GetLocal(1),
+                    JitOp::PushBits(ib(10)),
+                    JitOp::BinOp(bc::ADD_I),
+                    JitOp::SetLocal(1),
+                    JitOp::GetLocal(1),
+                    JitOp::ReturnValue,
+                ],
+                term: Term::Return,
+                entry_depth: 0,
+            }],
+            &[UNDEFINED_BITS, UNDEFINED_BITS],
+            &[Promotion { local: 1, kind: RegKind::IntI32, init_from_frame: false }],
+        );
+        assert_eq!(out, ib(15));
+
+        // A promoted `Int` PARAM (init_from_frame): read from the frame register, negate-wrap.
+        let out = run_blocks_p(
+            vec![Block {
+                ops: vec![JitOp::GetLocal(1), JitOp::ReturnValue],
+                term: Term::Return,
+                entry_depth: 0,
+            }],
+            &[UNDEFINED_BITS, ib(-42)],
+            &[Promotion { local: 1, kind: RegKind::IntI32, init_from_frame: true }],
+        );
+        assert_eq!(out, ib(-42), "signed i32 payload round-trips");
     }
 
     #[test]

@@ -31,8 +31,6 @@ type CallerLib<'gc> = Gc<'gc, RefLock<MovieLibrary<'gc>>>;
 /// Lifetimes are erased for thread-local storage and reconstructed within the same
 /// synchronous run (the frame is GC-quiescent, so this is sound).
 pub(crate) struct RunCtx {
-    /// `*mut UpdateContext<'gc>` — the ambient GC/update context (NOT an Activation).
-    cx: *mut (),
     /// The callee's captured scope chain (its `env` scope).
     scope: ScopeChain<'static>,
     /// The callee's bound superclass object (for `super` ops — its own, not the caller's).
@@ -45,9 +43,13 @@ pub(crate) struct RunCtx {
     caller_library: Option<CallerLib<'static>>,
 }
 
+// NB: `cx` (the ambient `*mut UpdateContext`) is deliberately NOT a `RunCtx` field — it is
+// the SAME for a whole synchronous run (one player tick) and lives in the separate `AMBIENT_CX`
+// slot (set once at the top-level entry). This makes `RunCtx` `cx`-free — i.e. per-callee and
+// cacheable (see `JIT3_INWASM_DISPATCH_PLAN.md` §8 phase 1).
+
 impl RunCtx {
     pub(crate) fn new<'gc>(
-        cx: &mut UpdateContext<'gc>,
         scope: ScopeChain<'gc>,
         bound_super: Option<ClassObject<'gc>>,
         scope_base: usize,
@@ -56,7 +58,6 @@ impl RunCtx {
         // SAFETY: erase `'gc` for storage; reconstructed only within this run, where
         // the objects are alive (GC-quiescent frame).
         RunCtx {
-            cx: cx as *mut UpdateContext<'gc> as *mut (),
             scope: unsafe { core::mem::transmute::<ScopeChain<'gc>, ScopeChain<'static>>(scope) },
             bound_super: unsafe {
                 core::mem::transmute::<Option<ClassObject<'gc>>, Option<ClassObject<'static>>>(
@@ -87,6 +88,9 @@ impl RunCtx {
 #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
 thread_local! {
     static RUN_CTX: Cell<*const RunCtx> = const { Cell::new(std::ptr::null()) };
+    /// The ambient `*mut UpdateContext` — set ONCE at the top-level entry, shared by every
+    /// (nested) run this tick. Separate from `RUN_CTX` so the latter is per-callee/cacheable.
+    static AMBIENT_CX: Cell<*mut ()> = const { Cell::new(std::ptr::null_mut()) };
     static PENDING: RefCell<Option<Error<'static>>> = const { RefCell::new(None) };
 }
 
@@ -99,7 +103,48 @@ mod single_thread {
     // SAFETY: only ever accessed from the single AVM2 thread.
     unsafe impl<T> Sync for One<T> {}
     pub static RUN_CTX: One<*const RunCtx> = One(UnsafeCell::new(std::ptr::null()));
+    pub static AMBIENT_CX: One<*mut ()> = One(UnsafeCell::new(std::ptr::null_mut()));
     pub static PENDING: One<Option<Error<'static>>> = One(UnsafeCell::new(None));
+}
+
+#[inline]
+fn ambient_cx_get() -> *mut () {
+    #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+    {
+        AMBIENT_CX.with(|c| c.get())
+    }
+    // SAFETY: single-threaded read (see the module note).
+    #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+    unsafe {
+        *single_thread::AMBIENT_CX.0.get()
+    }
+}
+
+/// Sets `AMBIENT_CX` to `new`, returning the previous value.
+#[inline]
+fn ambient_cx_swap(new: *mut ()) -> *mut () {
+    #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+    {
+        AMBIENT_CX.with(|c| c.replace(new))
+    }
+    // SAFETY: single-threaded swap (see the module note).
+    #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+    unsafe {
+        let p = single_thread::AMBIENT_CX.0.get();
+        let old = *p;
+        *p = new;
+        old
+    }
+}
+
+/// Installs `cx` as the ambient `UpdateContext` for the duration of `f`, restoring the previous
+/// after (LIFO — a nested run passes the SAME `cx`, so this is idempotent for nesting). `cx` is
+/// erased to `*mut ()`; the frame is GC-quiescent, so the pointer stays valid for the run.
+pub(crate) fn with_ambient_cx<'gc, R>(cx: &mut UpdateContext<'gc>, f: impl FnOnce() -> R) -> R {
+    let prev = ambient_cx_swap(cx as *mut UpdateContext<'gc> as *mut ());
+    let r = f();
+    ambient_cx_swap(prev);
+    r
 }
 
 #[inline]
@@ -180,6 +225,20 @@ pub(crate) fn with_run_ctx<R>(ctx: &RunCtx, f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Installs `env` (a `*const RunCtx`) as the current per-callee context, returning the previous
+/// one — the caller-bracket primitive for the §8 in-WASM dispatch: a compiled caller does
+/// `prev = push_ctx(env); …; call_indirect callee.run(…); pop_ctx(prev)` so the callee's helpers
+/// reify from `env` without a Rust `try_enter` bounce. (`with_run_ctx` is the same swap, scoped
+/// by the Rust stack; these expose it to WASM.) `env` must be a live `RunCtx` for the call.
+pub(crate) fn push_ctx(env: *const RunCtx) -> *const RunCtx {
+    run_ctx_swap(env)
+}
+
+/// Restores the context swapped out by [`push_ctx`] (LIFO — `prev` is that call's return).
+pub(crate) fn pop_ctx(prev: *const RunCtx) {
+    run_ctx_swap(prev);
+}
+
 /// This run's base into the shared `avm2.scope_stack` (from the installed [`RunCtx`]).
 pub(crate) fn scope_base() -> usize {
     let ptr = run_ctx_get();
@@ -196,8 +255,9 @@ pub(crate) unsafe fn reify<'gc>() -> Activation<'static, 'gc> {
     let ptr = run_ctx_get();
     debug_assert!(!ptr.is_null(), "avm2-jit3 helper with no RunCtx installed");
     let ctx = unsafe { &*ptr };
-    // SAFETY: reverse of `RunCtx::new`'s erasure, within the same run.
-    let cx: &mut UpdateContext<'gc> = unsafe { &mut *(ctx.cx as *mut UpdateContext<'gc>) };
+    // SAFETY: reverse of `RunCtx::new`'s erasure, within the same run. `cx` comes from the
+    // ambient slot (set at the top-level entry), the rest from the per-callee `RunCtx`.
+    let cx: &mut UpdateContext<'gc> = unsafe { &mut *(ambient_cx_get() as *mut UpdateContext<'gc>) };
     let scope: ScopeChain<'gc> = unsafe { core::mem::transmute(ctx.scope) };
     let bound_super: Option<ClassObject<'gc>> = unsafe { core::mem::transmute(ctx.bound_super) };
     let caller_library: Option<CallerLib<'gc>> = unsafe { core::mem::transmute(ctx.caller_library) };
@@ -221,9 +281,9 @@ pub(crate) unsafe fn reify<'gc>() -> Activation<'static, 'gc> {
 /// Call only from a helper running inside [`with_run_ctx`]; the reborrow must not escape the
 /// helper call (it aliases the live `&mut UpdateContext`).
 pub(crate) fn cx_ptr() -> *mut () {
-    let ptr = run_ctx_get();
-    debug_assert!(!ptr.is_null(), "avm2-jit3 helper with no RunCtx installed");
-    unsafe { &*ptr }.cx
+    let cx = ambient_cx_get();
+    debug_assert!(!cx.is_null(), "avm2-jit3 helper with no ambient cx installed");
+    cx
 }
 
 /// Stashes a thrown error (erased) for `try_enter` to propagate after the run.

@@ -73,7 +73,7 @@ thread_local! {
 /// Builds the method's instance on first use (lazily, into its own `handle`), writes `frame`
 /// at `DEPTH*STRIDE`, calls `run(0, argc, args)`, and returns the result `Value` bits. `None`
 /// on failure. Takes the method's `handle` directly — no per-call key hashing.
-pub fn run_leaf(handle: &Handle, bytes: &[u8], frame: &[u64], argc: u32) -> Option<u64> {
+pub fn run_leaf(handle: &Handle, bytes: &[u8], frame: &[u64], argc: u32, num_locals: usize) -> Option<u64> {
     // The common A→B re-entry borrows a DIFFERENT method's handle. Only DIRECT recursion (this
     // method already running → its handle already borrowed) hits the `Err` arm → run a
     // throwaway instance for that level (rare; churn not correctness).
@@ -83,17 +83,19 @@ pub fn run_leaf(handle: &Handle, bytes: &[u8], frame: &[u64], argc: u32) -> Opti
                 *slot = Some(build(bytes)?); // first call: compile + instantiate
             }
             // SAFETY of unwrap: just ensured `Some`.
-            run_compiled(slot.as_mut().unwrap(), frame, argc)
+            run_compiled(slot.as_mut().unwrap(), frame, argc, num_locals)
         }
-        Err(_) => run_compiled(&mut build(bytes)?, frame, argc),
+        Err(_) => run_compiled(&mut build(bytes)?, frame, argc, num_locals),
     }
 }
 
-/// Writes the frame at `DEPTH*STRIDE`, calls `run`, restores DEPTH. No CACHE borrow held.
-fn run_compiled(c: &mut Compiled, frame: &[u64], argc: u32) -> Option<u64> {
+/// Writes the frame at `DEPTH*STRIDE`, calls `run`, restores DEPTH. No CACHE borrow held. `frame`
+/// is only `[this, params]`; the module `undefined`-inits the rest, but writes up to `num_locals`
+/// slots (plus its call scratch) — the bounds check must reserve that full width, not `frame.len()`.
+fn run_compiled(c: &mut Compiled, frame: &[u64], argc: u32, num_locals: usize) -> Option<u64> {
     let depth = DEPTH.with(|d| d.get());
     let args = depth.checked_mul(FRAME_STRIDE)?;
-    if (args as usize) + frame.len() * 8 > (FRAME_PAGES as usize) * 65536 {
+    if (args as usize) + num_locals * 8 > (FRAME_PAGES as usize) * 65536 {
         return None; // frame nesting overflow → decline (interpreter runs it)
     }
     // The frame `Value`s are already little-endian `u64`s in memory (as is the wasm frame);
@@ -448,12 +450,48 @@ fn build(bytes: &[u8]) -> Option<Compiled> {
                 // Inline domainMemory (`li*`/`si*`) is web-only; native never emits it, but the
                 // table slot must exist so the helper index globals line up (NUM_HELPERS).
                 let dm_desc = Func::wrap(&mut store, || -> i64 { helpers::dm_desc_ptr() });
-                let call_prop_ic = Func::wrap(&mut store, |r: i64, m: i64, o: i64, n: i64, ic: i64| -> i64 {
-                    helpers::call_prop_ic(r, m, o, n, ic)
-                });
-                let call_method_ic = Func::wrap(&mut store, |r: i64, d: i64, o: i64, n: i64, ic: i64| -> i64 {
-                    helpers::call_method_ic(r, d, o, n, ic)
-                });
+                // The call ICs read their `n` outgoing args from the (re-exported, sandboxed)
+                // frame memory via `Caller` — like `cp`/`callmethod` — NOT `args_off as *const`
+                // (a wasm offset is not a host pointer under the wasmtime sandbox). The IC cell
+                // (`ic`) IS a real baked host pointer, so it is passed through unchanged.
+                let call_prop_ic = Func::wrap(
+                    &mut store,
+                    |mut caller: Caller<'_, ()>, r: i64, m: i64, off: i64, n: i64, ic: i64| -> i64 {
+                        let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory())
+                        else {
+                            return UNDEFINED_BITS as i64;
+                        };
+                        let mut bits = Vec::with_capacity(n as usize);
+                        for j in 0..n as usize {
+                            let mut b = [0u8; 8];
+                            if mem.read(&caller, off as usize + j * 8, &mut b).is_err() {
+                                return UNDEFINED_BITS as i64;
+                            }
+                            bits.push(i64::from_le_bytes(b));
+                        }
+                        // SAFETY: `bits` are `Value`s the JIT stored this frame; `m` a live mn.
+                        unsafe { helpers::call_prop_ic_bits(r, m, &bits, ic) }
+                    },
+                );
+                let call_method_ic = Func::wrap(
+                    &mut store,
+                    |mut caller: Caller<'_, ()>, r: i64, d: i64, off: i64, n: i64, ic: i64| -> i64 {
+                        let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory())
+                        else {
+                            return UNDEFINED_BITS as i64;
+                        };
+                        let mut bits = Vec::with_capacity(n as usize);
+                        for j in 0..n as usize {
+                            let mut b = [0u8; 8];
+                            if mem.read(&caller, off as usize + j * 8, &mut b).is_err() {
+                                return UNDEFINED_BITS as i64;
+                            }
+                            bits.push(i64::from_le_bytes(b));
+                        }
+                        // SAFETY: `bits` are `Value`s the JIT stored this frame.
+                        unsafe { helpers::call_method_ic_bits(r, d, &bits, ic) }
+                    },
+                );
                 let table = Table::new(
                     &mut store,
                     TableType::new(RefType::new(true, HeapType::Func), 48, Some(48)),

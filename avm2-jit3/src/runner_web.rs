@@ -150,7 +150,7 @@ fn depth_set(v: u32) {
 
 /// Runs a compiled leaf method: instantiate-or-reuse via the method's own `handle`, write
 /// `frame` at `buf_base + DEPTH*STRIDE`, call `run(0, argc, args)`, return the result bits.
-pub fn run_leaf(handle: &Handle, bytes: &[u8], frame: &[u64], argc: u32) -> Option<u64> {
+pub fn run_leaf(handle: &Handle, bytes: &[u8], frame: &[u64], argc: u32, num_locals: usize) -> Option<u64> {
     // Resolve the entry from the method's OWN handle — no hashmap lookup. Clone the `Callee`
     // out and release the borrow before running (a callee re-enters run_leaf on OTHER handles;
     // and this handle's borrow must not span the call). On first use we instantiate OUTSIDE any
@@ -193,7 +193,9 @@ pub fn run_leaf(handle: &Handle, bytes: &[u8], frame: &[u64], argc: u32) -> Opti
 
     let depth = depth_get();
     let stride_bytes = depth.checked_mul(FRAME_STRIDE)? as usize;
-    if stride_bytes + frame.len() * 8 > FRAME_BUF_BYTES {
+    // `frame` is only `[this, params]`; the module `undefined`-inits the rest but writes up to
+    // `num_locals` slots — reserve that full width in the bounds check, not `frame.len()`.
+    if stride_bytes + num_locals * 8 > FRAME_BUF_BYTES {
         return None; // frame nesting overflow → decline
     }
 

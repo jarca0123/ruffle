@@ -23,6 +23,7 @@ mod context;
 mod emit;
 mod helpers;
 mod translate;
+mod typed;
 mod value;
 
 // The runner is the one platform-specific piece: native = wasmtime/cranelift,
@@ -224,14 +225,16 @@ impl JitBackend for Jit3 {
                 frame[1 + i].write(value::to_bits(v));
             }
         }
-        // Remaining locals past [this, params…] up to `num_locals` are `undefined`.
-        for slot in frame.iter_mut().take(num_locals).skip(1 + sig.len()) {
-            slot.write(emit::UNDEFINED_BITS);
-        }
-        // SAFETY: slots `[0, num_locals)` are all initialized above (receiver + `sig.len()`
-        // params + undefined padding; verification guarantees `1 + sig.len() ≤ num_locals`).
+        // Only `[this, params]` are written/copied — NOT the full-width `undefined` padding. The
+        // compiled prologue `undefined`-inits any non-promoted local that could be read before
+        // written (`translate`'s `undefined_init` set, usually empty), so the caller no longer
+        // pays the O(num_locals) padding write + copy every call. `num_locals` is still passed to
+        // `run_leaf` for the arena bounds check (the module writes up to that slot).
+        let frame_len = 1 + sig.len();
+        // SAFETY: slots `[0, frame_len)` are all initialized above (receiver + `sig.len()`
+        // params); verification guarantees `1 + sig.len() ≤ num_locals ≤ MAX_LOCALS`.
         let frame: &[u64] =
-            unsafe { &*(&frame[..num_locals] as *const [MaybeUninit<u64>] as *const [u64]) };
+            unsafe { &*(&frame[..frame_len] as *const [MaybeUninit<u64>] as *const [u64]) };
 
         // Install the callee's reification context around the run: a slow-path helper
         // (`cr` return-coercion; later getproperty/calls) reifies a FRESH callee-owned
@@ -250,9 +253,13 @@ impl JitBackend for Jit3 {
         // `push_call`, so without this a JIT'd method would be invisible to traces.
         let gc = cx.gc();
         cx.avm2.push_call(gc, method);
-        let run_ctx = context::RunCtx::new(cx, scope, bound_super, scope_base, caller_library);
-        let bits = context::with_run_ctx(&run_ctx, || {
-            runner::run_leaf(&compiled.handle, &compiled.bytes, frame, args.len() as u32)
+        // `cx` (ambient) is installed separately from the per-callee `RunCtx` (scope/super/…):
+        // a nested run reuses the same `cx`, and this decoupling makes `RunCtx` cacheable (§8).
+        let run_ctx = context::RunCtx::new(scope, bound_super, scope_base, caller_library);
+        let bits = context::with_ambient_cx(cx, || {
+            context::with_run_ctx(&run_ctx, || {
+                runner::run_leaf(&compiled.handle, &compiled.bytes, frame, args.len() as u32, num_locals)
+            })
         });
         cx.avm2.pop_call(gc);
         // Only a scope-reading method pushes to the local scope stack, so only it needs the
@@ -308,9 +315,19 @@ fn try_compile(method: Method<'_>) -> Result<CompiledMethod, &'static str> {
             *slot = param.param_type;
         }
     }
-    let blocks = translate::translate(&verified.parsed_code, &verified.null_safe_getslots, &local_types)
-        .ok_or_else(translate::last_decline_reason)?;
-    let bytes = emit::compile(&blocks, num_locals).ok_or("emit_failed")?;
+    // A declared-`Number` param is a guaranteed canonical inline `Number` UNLESS the method is
+    // `unchecked` (a missing param is then `undefined`, not a `Number`) — see `typed::param_repr`.
+    let canonical_params = !method.is_unchecked();
+    let (blocks, promoted, undefined_init) = translate::translate(
+        &verified.parsed_code,
+        &verified.null_safe_getslots,
+        &local_types,
+        canonical_params,
+        sig.len(),
+    )
+    .ok_or_else(translate::last_decline_reason)?;
+    let bytes =
+        emit::compile(&blocks, num_locals, &promoted, &undefined_init).ok_or("emit_failed")?;
     // Cache the metadata the per-call entry needs (avoids re-deriving it every call).
     let needs_scopes = verified
         .parsed_code

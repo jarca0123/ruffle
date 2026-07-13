@@ -1225,6 +1225,27 @@ pub fn call_property(receiver_bits: i64, mn_ptr: i64, args_off: i64, argc: i64) 
     unsafe { call_property_bits(receiver_bits, mn_ptr, arg_bits) }
 }
 
+/// `callpropic` (web funcref): reads the `argc` outgoing args from frame memory at `args_off`
+/// (a valid pointer on wasm32), then delegates to [`call_prop_ic_bits`]. On NATIVE the runner
+/// reads the args via `Caller` and calls `call_prop_ic_bits` directly (the sandboxed frame
+/// memory is not host-addressable, so `args_off` is a wasm offset, not a pointer).
+#[cfg(target_arch = "wasm32")]
+pub fn call_prop_ic(receiver_bits: i64, mn_ptr: i64, args_off: i64, argc: i64, ic_addr: i64) -> i64 {
+    // SAFETY: `args_off` is where the compiled body `i64.store`d `argc` `Value`s this frame.
+    let arg_bits: &[i64] =
+        unsafe { core::slice::from_raw_parts(args_off as usize as *const i64, argc as usize) };
+    unsafe { call_prop_ic_bits(receiver_bits, mn_ptr, arg_bits, ic_addr) }
+}
+
+/// `callmethodic` (web funcref): like [`call_prop_ic`] but by disp-id → [`call_method_ic_bits`].
+#[cfg(target_arch = "wasm32")]
+pub fn call_method_ic(receiver_bits: i64, disp_id: i64, args_off: i64, argc: i64, ic_addr: i64) -> i64 {
+    // SAFETY: `args_off` is where the compiled body `i64.store`d `argc` `Value`s this frame.
+    let arg_bits: &[i64] =
+        unsafe { core::slice::from_raw_parts(args_off as usize as *const i64, argc as usize) };
+    unsafe { call_method_ic_bits(receiver_bits, disp_id, arg_bits, ic_addr) }
+}
+
 /// Dispatches an already-resolved (simple, non-arguments) method DIRECTLY via `exec` — the
 /// callee's execution context (`fm.scope()`/`fm.super_class_obj`) comes straight from the vtable's
 /// `ClassBoundMethod`, so no `call_method_with_args` layer (and no thread-local resolve-IC). This
@@ -1292,12 +1313,11 @@ fn dispatch_via_exec<'gc>(
 /// thread-local resolve-IC (a `RefCell`/hash lookup, plus real wasm TLS on the threaded build).
 /// The cache is filled only for a plain, non-arguments `Method` (getters/slots/arguments-object
 /// methods keep the full [`call_property`] path, which is also the miss/fallback). Reifies.
-pub fn call_prop_ic(receiver_bits: i64, mn_ptr: i64, args_off: i64, argc: i64, ic_addr: i64) -> i64 {
+pub unsafe fn call_prop_ic_bits(receiver_bits: i64, mn_ptr: i64, arg_bits: &[i64], ic_addr: i64) -> i64 {
     let receiver: Value<'_> = unsafe { from_bits(receiver_bits as u64) };
     let mn: &Multiname<'_> = unsafe { &*(mn_ptr as usize as *const Multiname) };
-    // SAFETY: `args_off` holds `argc` `Value` bits the JIT stored this frame (same memory).
-    let arg_bits: &[i64] =
-        unsafe { core::slice::from_raw_parts(args_off as usize as *const i64, argc as usize) };
+    // `arg_bits` are the `Value` bits the JIT stored in this frame's outgoing scratch, read out
+    // of the (sandboxed on native) frame memory by the runner via `Caller` — NOT a host pointer.
     let args = unsafe { crate::value::bits_as_values(arg_bits) };
     if let Some(obj) = receiver.as_object() {
         let vt = obj.vtable();
@@ -1356,10 +1376,10 @@ pub fn call_prop_ic(receiver_bits: i64, mn_ptr: i64, args_off: i64, argc: i64, i
 /// bypassing `call_method_with_args`'s thread-local resolve-IC. Cache filled only for a
 /// non-arguments method; arguments-object methods + non-object receivers → the full
 /// `call_method_with_args`. `disp_id`/`argc` arrive as `i64` (the JIT bakes them). Reifies.
-pub fn call_method_ic(receiver_bits: i64, disp_id: i64, args_off: i64, argc: i64, ic_addr: i64) -> i64 {
+pub unsafe fn call_method_ic_bits(receiver_bits: i64, disp_id: i64, arg_bits: &[i64], ic_addr: i64) -> i64 {
     let receiver: Value<'_> = unsafe { from_bits(receiver_bits as u64) };
-    let arg_bits: &[i64] =
-        unsafe { core::slice::from_raw_parts(args_off as usize as *const i64, argc as usize) };
+    // `arg_bits` are read from the (sandboxed on native) frame memory by the runner via
+    // `Caller` — NOT a host pointer (`args_off as *const` segfaults under the wasmtime sandbox).
     let args = unsafe { crate::value::bits_as_values(arg_bits) };
     let id = disp_id as usize;
     if let Some(obj) = receiver.as_object() {
