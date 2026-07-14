@@ -37,7 +37,12 @@ extern "C" {
 /// Logs a first-sighting declined op to the browser console (see
 /// `translate::record_decline`) — this is where real content reveals which ops to add next.
 pub fn log_decline(name: &str) {
-    console_log(&format!("JIT3 DECLINE (new op): {name}"));
+    // Debug log temporarily silenced (§8 diagnostics + new-op decline tracking). Flip to `true`
+    // to restore the browser-console output.
+    const DEBUG_LOG: bool = false;
+    if DEBUG_LOG {
+        console_log(&format!("JIT3 DECLINE (new op): {name}"));
+    }
 }
 
 /// Total frame arena, in bytes (matches the old shared-memory size: 4 MiB = many strides).
@@ -75,6 +80,17 @@ enum HandleState {
 /// Allocates a fresh (uninstantiated) entry handle for a newly compiled method.
 pub fn new_handle() -> Handle {
     Handle(Rc::new(RefCell::new(HandleState::Uninit)))
+}
+
+/// §8 in-WASM dispatch: the callee `run`'s index in the shared `__indirect_function_table`, if
+/// this method has been instantiated AND parked there (`Callee::Indirect`). `None` if not yet run
+/// (never entered → not in the table) or entered via the JS `call3` fallback (table couldn't
+/// grow). The caller `call_indirect`s this index directly instead of the Rust dispatch bounce.
+pub fn handle_run_idx(handle: &Handle) -> Option<u32> {
+    match &*handle.0.borrow() {
+        HandleState::Ready(Callee::Indirect(idx)) => Some(*idx),
+        _ => None,
+    }
 }
 
 // Global runner state (NOT per-method): the frame arena and nesting depth — one PER AVM2 THREAD.
@@ -133,6 +149,44 @@ fn depth_get() -> u32 {
     unsafe {
         *single_thread::DEPTH.0.get()
     }
+}
+
+/// §8 in-WASM dispatch: the byte offset of the callee's frame (`buf_base + DEPTH*STRIDE`, where
+/// `DEPTH` is the caller-run depth `run_leaf` already bumped to) — what [`helpers::jit_enter`]
+/// hands the caller to write `[this,args]` into and pass as `run`'s `args_off`. Returns `0` (never
+/// a valid arena offset) when a full callee frame (`MAX_LOCALS` slots) would not fit — the same
+/// bounds check `run_leaf` uses to decline, so the caller falls back to the Rust helper. Lazily
+/// allocates the arena on first use (as `run_leaf` does), so a first in-WASM call still works.
+pub(crate) fn callee_frame_base() -> usize {
+    let depth = depth_get();
+    let stride_bytes = match (depth as usize).checked_mul(FRAME_STRIDE as usize) {
+        Some(b) => b,
+        None => return 0,
+    };
+    if stride_bytes + crate::emit::MAX_LOCALS * 8 > FRAME_BUF_BYTES {
+        return 0; // frame nesting overflow → decline (mirror `run_leaf`)
+    }
+    with_frame_buf(|buf| {
+        if buf.is_empty() {
+            *buf = vec![0u64; FRAME_BUF_BYTES / 8];
+        }
+        buf.as_ptr() as usize + stride_bytes
+    })
+}
+
+/// §8 in-WASM dispatch: bump the frame nesting depth for the duration of a caller→callee
+/// `call_indirect` (called by [`helpers::jit_enter`]). Mirrors what [`run_leaf`] does around a
+/// call so a Rust re-entry from inside the callee places its frame at a fresh stride instead of
+/// aliasing the callee's `callee_base = P_ARGS + FRAME_STRIDE`.
+#[inline]
+pub(crate) fn bump_depth() {
+    depth_set(depth_get() + 1);
+}
+
+/// Ends the [`bump_depth`] bracket (called by [`helpers::jit_leave`]).
+#[inline]
+pub(crate) fn drop_depth() {
+    depth_set(depth_get().wrapping_sub(1));
 }
 
 #[inline]
@@ -331,6 +385,8 @@ fn instantiate(bytes: &[u8], memory: &WebAssembly::Memory) -> Option<js_sys::Fun
     bind_idx(&env, "dmdesc_i", helpers::dm_desc_ptr as fn() -> i64 as usize)?;
     bind_idx(&env, "callpropic_i", helpers::call_prop_ic as fn(i64, i64, i64, i64, i64) -> i64 as usize)?;
     bind_idx(&env, "callmethodic_i", helpers::call_method_ic as fn(i64, i64, i64, i64, i64) -> i64 as usize)?;
+    bind_idx(&env, "jitenter_i", helpers::jit_enter as fn(i64, i64, i64, i64) -> i64 as usize)?;
+    bind_idx(&env, "jitleave_i", helpers::jit_leave as fn() as usize)?;
     Reflect::set(&env, &"memory".into(), memory).ok()?;
     let imports = Object::new();
     Reflect::set(&imports, &"env".into(), &env).ok()?;

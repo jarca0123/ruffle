@@ -255,9 +255,12 @@ pub fn ic_cache_capacity() -> usize {
 /// callers so this is only touched from the one AVM2 thread there too — actually a plain static
 /// is fine because native never emits the call IC (web-only, memory layout).
 const CALL_IC_ENTRIES: usize = 8192;
-static mut CALL_IC: [usize; CALL_IC_ENTRIES * 2] = [0usize; CALL_IC_ENTRIES * 2];
+/// Each site owns a 4-`usize` cell `[vtable_ptr, fm_ptr, env_ptr, run_idx]` (was `[vtable, fm]`):
+/// the §8 in-WASM dispatch adds `env_ptr` (leaked [`context::JitEnv`], or `1` = checked-ineligible
+/// sentinel) and `run_idx` (the callee `run`'s shared-table index, `0` = fall back to this helper).
+static mut CALL_IC: [usize; CALL_IC_ENTRIES * 4] = [0usize; CALL_IC_ENTRIES * 4];
 
-/// Base address of [`CALL_IC`] — the JIT bakes `base + site * 2 * size_of::<usize>()` per site.
+/// Base address of [`CALL_IC`] — the JIT bakes `base + site * 4 * size_of::<usize>()` per site.
 pub fn call_ic_base() -> usize {
     core::ptr::addr_of!(CALL_IC) as usize
 }
@@ -280,10 +283,29 @@ pub fn get_property_ic(receiver_bits: i64, mn_ptr: i64, cache_addr: i64) -> i64 
         let vt = obj.vtable();
         if let Some(Property::Slot { slot_id } | Property::ConstSlot { slot_id }) = vt.get_trait(mn)
         {
-            // Cache the monomorphic (vtable → slot) resolution for the inline fast path.
+            // Cache the monomorphic (vtable → slot) resolution for the inline fast path. The
+            // vtable key must be the object's vtable WORD (the `Gc` box-base at `vt_off`) — what
+            // the inline guard reads (`I32Load(obj_ptr + vt_off)`) — NOT `vt.as_ptr()` (box-base +
+            // `GcBoxInner` header = the value pointer). Storing `as_ptr` here meant the guard's word
+            // compare NEVER matched, so this property IC has silently never fired (same latent bug
+            // the §8 call IC hit — see `vtable_word`). Native never emits the inline guard.
             let cell = cache_addr as usize as *mut u32;
+            #[cfg(target_arch = "wasm32")]
             unsafe {
-                *cell = vt.as_ptr() as usize as u32; // wasm32: 32-bit vtable pointer
+                // ISOLATION SWITCH (temporary): `false` stores `as_ptr` again → the inline guard's
+                // word compare never matches → the property IC stays dead (its pre-fix behaviour),
+                // isolating a property-IC divergence from the §8 call-IC one. `true` = IC on.
+                const PROP_IC: bool = true;
+                *cell = if PROP_IC {
+                    vtable_word(receiver_bits) as u32
+                } else {
+                    vt.as_ptr() as usize as u32
+                };
+                *cell.add(1) = slot_id as u32;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            unsafe {
+                *cell = vt.as_ptr() as usize as u32;
                 *cell.add(1) = slot_id as u32;
             }
             return to_bits(obj.get_slot(slot_id)) as i64;
@@ -1246,6 +1268,92 @@ pub fn call_method_ic(receiver_bits: i64, disp_id: i64, args_off: i64, argc: i64
     unsafe { call_method_ic_bits(receiver_bits, disp_id, arg_bits, ic_addr) }
 }
 
+/// §8 in-WASM dispatch bracket (opening half). Validates that the `argc` outgoing args (at
+/// `args_off` in this frame's scratch) ALREADY match the callee's declared param types — the
+/// in-WASM path raw-copies args and cannot coerce, so any arg that would need coercion means the
+/// caller must fall back to the coercing `call_method_ic` helper. This is exactly `try_enter`'s
+/// `all_matched` check (`coerces_identically_to`), moved to call time so TYPED-param callees can
+/// use the fast path too (not just untyped ones). When the args match, reserves the callee's frame
+/// stride and, if the arena has room, installs the callee's cached [`context::JitEnv`] (its cx-free
+/// `RunCtx` + call-stack push) and bumps the frame nesting depth — returning the callee frame's
+/// **byte offset** (which the caller passes to `run(0, argc, base)` and writes `[this,args]` into).
+/// Returns `0` — leaving ALL state untouched, so the caller falls back — on a type mismatch OR a
+/// full arena (deep nesting). The compiled caller does
+/// `base = jit_enter(env, fm, args_off, argc); if base { write frame; r = call_indirect(run_idx)(0, argc, base); jit_leave() }`.
+/// `fm` is the cached `*const ClassBoundMethod` (cell[1]); its `resolved_param_config` gives the
+/// param types. Emitted web-only (native never calls it — it keeps the `call_method_ic` fallback).
+pub fn jit_enter(env: i64, fm: i64, args_off: i64, argc: i64) -> i64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Type-guard: every provided arg must already be its param's type (no coercion). Mirrors
+        // `try_enter`'s `all_matched` / `build_frame` fast path. `argc == nparams` (eligibility),
+        // so `zip` covers all params; an untyped param (`param_type == None`) always passes.
+        // SAFETY: `fm` is the cached live `ClassBoundMethod`; `args_off` is where the compiled body
+        // just `i64.store`d `argc` `Value`s in this frame (a valid main-memory offset on web).
+        let fm_ref = unsafe { &*(fm as usize as *const ClassBoundMethod) };
+        let sig = fm_ref.method.resolved_param_config();
+        let args = unsafe { core::slice::from_raw_parts(args_off as usize as *const i64, argc as usize) };
+        for (bits, p) in args.iter().zip(sig.iter()) {
+            if let Some(c) = p.param_type {
+                let v: Value<'_> = unsafe { from_bits(*bits as u64) };
+                if !v.coerces_identically_to(c) {
+                    return 0; // would need coercion → fall back to the coercing helper
+                }
+            }
+        }
+        // Reserve the callee's stride (no state changed yet): 0 ⇒ arena full ⇒ fall back.
+        let base = crate::runner::callee_frame_base();
+        if base == 0 {
+            return 0;
+        }
+        // Install the CACHED per-callee ctx (the leaked `JitEnv` in cell[2]) — no per-call rebuild
+        // or heap alloc. The cached env's `RunCtx.scope_base` is a stale 0; the LIVE base (below)
+        // supplies the real value so `scope_base`-reading callees (getscopeobject/newfunction) are
+        // sound on the fast path. The guard fired only when `run_idx != 0`, which
+        // `fill_inwasm_dispatch_cell` sets together with a real `env`, so `env` is valid here.
+        let env_ref = unsafe { &*(env as usize as *const context::JitEnv) };
+        context::jit_prev_push(context::push_ctx(env_ref.ctx_ptr()));
+        // Open the scope-base bracket with this call's LIVE base = the shared scope stack's current
+        // length (exactly what `enter_run` bakes into the Rust path's `RunCtx`).
+        // SAFETY: `cx` is the installed ambient context (this runs inside the caller's run).
+        let live_base = {
+            let cx = unsafe { &*(context::cx_ptr() as *const ruffle_core::context::UpdateContext) };
+            cx.avm2.scope_stack_len()
+        };
+        context::jit_push_scope_base(live_base);
+        crate::runner::bump_depth();
+        context::jit_push_call(fm_ref.method.as_ptr());
+        base as i64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (env, fm, args_off, argc); // native never emits the in-WASM path (no shared table)
+        0
+    }
+}
+
+/// §8 in-WASM dispatch bracket (closing half): pops the callee's call-stack entry, drops the
+/// frame depth, and restores the caller's ctx (LIFO). Called only after a `jit_enter` that
+/// returned non-zero.
+pub fn jit_leave() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Truncate the shared scope stack back to this callee's base — cleans any scopes it left
+        // (verifier-balanced on a normal return, so usually a no-op; matters on an exceptional
+        // exit / a `scope_base`-using callee). `scope_base()` is still the callee's LIVE base here
+        // (restored by `jit_pop_scope_base` just below). SAFETY: ambient `cx` is installed.
+        let base = context::scope_base();
+        let cx = unsafe { &mut *(context::cx_ptr() as *mut ruffle_core::context::UpdateContext) };
+        if cx.avm2.scope_stack_len() > base {
+            cx.avm2.truncate_scope_stack(base);
+        }
+        context::jit_pop_scope_base();
+        context::jit_pop_call();
+        crate::runner::drop_depth();
+        context::pop_ctx(context::jit_prev_pop());
+    }
+}
+
 /// Dispatches an already-resolved (simple, non-arguments) method DIRECTLY via `exec` — the
 /// callee's execution context (`fm.scope()`/`fm.super_class_obj`) comes straight from the vtable's
 /// `ClassBoundMethod`, so no `call_method_with_args` layer (and no thread-local resolve-IC). This
@@ -1277,6 +1385,76 @@ fn try_dispatch_jit<'gc>(
             context::stash_error(e);
             SENTINEL_BITS as i64
         }
+    })
+}
+
+/// The object's vtable WORD as the §8 in-WASM guard reads it: `*(obj_ptr + jit_vtable_offset())`.
+/// `obj_ptr` = the low 32 bits of the receiver's NaN-boxed bits (the wasm32 object pointer, what
+/// the guard's `I32WrapI64` yields). This is the `Gc` box-base pointer stored in the object — the
+/// value the cell must hold so `obj.vtable_word == cell.vtable` can ever be true (see the call-IC
+/// helpers). NB `VTable::as_ptr()` is the box-base PLUS the `GcBoxInner` header, so it differs.
+#[cfg(target_arch = "wasm32")]
+fn vtable_word(receiver_bits: i64) -> usize {
+    let obj_base = receiver_bits as u32 as usize;
+    let vt_off = ruffle_core::avm2::jit_vtable_offset() as usize;
+    // SAFETY: `receiver` is a live object this frame (the caller checked `as_object()`); its
+    // `ScriptObjectData` prefix holds the vtable word at `vt_off` (a 32-bit `Gc` on wasm32).
+    unsafe { *((obj_base + vt_off) as *const u32) as usize }
+}
+
+/// §8 in-WASM dispatch: after a compiled callee dispatched through the call IC, resolve whether
+/// the caller may enter it DIRECTLY next time (a `call_indirect`, no Rust bounce) and cache the
+/// result in the cell's extra two slots `[.., env, run_idx]`. Called ONLY on the JIT-ran path
+/// (`try_dispatch_jit` returned `Some`), so the callee is definitely compiled — hence an
+/// ineligible verdict is permanent and safely memoised (sentinel `env = 1`, `run_idx = 0`), while
+/// the not-yet-compiled path never reaches here (so it retries). `run_idx == 0` ⇒ the WASM guard
+/// keeps using this helper. Native's `ic_dispatch_run_idx` is always `None` (no shared table), so
+/// native settles every eligible-looking callee to the ineligible sentinel and always falls back.
+fn fill_inwasm_dispatch_cell(cell: *mut usize, fm: &ClassBoundMethod<'_>, argc: usize) {
+    // Already resolved (env slot non-zero: a real leaked `JitEnv`, or the `1` ineligible sentinel).
+    if unsafe { *cell.add(2) } != 0 {
+        return;
+    }
+    // SAFETY: inside the run; the ambient cx is installed. `jit_backend()` clones an `Rc`, so the
+    // borrow of `cx` is released immediately (no aliasing across the subsequent IC query).
+    let cx = unsafe { &mut *(context::cx_ptr() as *mut ruffle_core::context::UpdateContext) };
+    let jit = cx.avm2.jit_backend();
+    match jit.ic_dispatch_run_idx(fm.method, argc) {
+        Some(run_idx) => {
+            let env = intern_jit_env(fm);
+            unsafe {
+                *cell.add(2) = env as usize;
+                *cell.add(3) = run_idx as usize;
+            }
+        }
+        // Compiled but not eligible for the in-WASM entry (scoped / typed params / argc mismatch,
+        // or native). Memoise so the hot path stops re-querying; `run_idx` stays 0 → fall back.
+        None => unsafe { *cell.add(2) = 1 },
+    }
+}
+
+/// Builds (once, deduped by callee identity) and leaks the callee's cx-free [`context::JitEnv`]
+/// for the in-WASM dispatch bracket. Leaked because it must outlive the call and stay valid as
+/// long as the class (hence the cached `ClassBoundMethod`) is alive — the same class-liveness
+/// invariant the call IC already relies on; the leak is bounded by the number of distinct
+/// JIT-dispatched callees.
+fn intern_jit_env(fm: &ClassBoundMethod<'_>) -> *const context::JitEnv {
+    thread_local! {
+        static JIT_ENV_CACHE: core::cell::RefCell<std::collections::HashMap<usize, usize>> =
+            core::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = fm as *const ClassBoundMethod as usize;
+    JIT_ENV_CACHE.with(|c| {
+        if let Some(&p) = c.borrow().get(&key) {
+            return p as *const context::JitEnv;
+        }
+        // `scope_base` is unused for the no-scopes callees this path targets (eligibility requires
+        // `!needs_scopes`), so 0 is fine. `caller_library` mirrors `try_enter` (`owner_library`).
+        let ctx = context::RunCtx::new(fm.scope(), fm.super_class_obj, 0, fm.method.owner_library());
+        let env = Box::leak(Box::new(context::JitEnv::new(ctx, fm.method.as_ptr())))
+            as *const context::JitEnv;
+        c.borrow_mut().insert(key, env as usize);
+        env
     })
 }
 
@@ -1321,6 +1499,15 @@ pub unsafe fn call_prop_ic_bits(receiver_bits: i64, mn_ptr: i64, arg_bits: &[i64
     let args = unsafe { crate::value::bits_as_values(arg_bits) };
     if let Some(obj) = receiver.as_object() {
         let vt = obj.vtable();
+        // The monomorphic key: the object's vtable WORD (the `Gc` box-base stored at `vt_off`) —
+        // EXACTLY what the §8 in-WASM guard reads (`I32Load(obj_ptr + vt_off)`). NOT `vt.as_ptr()`
+        // (`addr_of!(GcBoxInner.value)` = box-base + the header, i.e. the VALUE pointer), which
+        // differs by the `GcBoxHeader` size — using it would make the guard's word compare NEVER
+        // match, silently disabling the fast path (the bug that hid §8's win). Native has no
+        // in-WASM guard, so `as_ptr` (self-consistent for its own cell check) is fine there.
+        #[cfg(target_arch = "wasm32")]
+        let vt_ptr = vtable_word(receiver_bits);
+        #[cfg(not(target_arch = "wasm32"))]
         let vt_ptr = vt.as_ptr() as usize;
         let cell = ic_addr as usize as *mut usize;
         // SAFETY: `cell` is a live baked `[usize; 2]`. `cell[0] == 0` (init) never matches a
@@ -1330,6 +1517,7 @@ pub unsafe fn call_prop_ic_bits(receiver_bits: i64, mn_ptr: i64, arg_bits: &[i64
         if unsafe { *cell } == vt_ptr {
             let fm = unsafe { &*(*cell.add(1) as *const ClassBoundMethod) };
             if let Some(r) = try_dispatch_jit(fm, receiver, args) {
+                    fill_inwasm_dispatch_cell(cell, fm, args.len());
                     return r;
                 }
                 // Declined the JIT → interpreter. SAFETY: same run; `act` does not escape.
@@ -1344,8 +1532,14 @@ pub unsafe fn call_prop_ic_bits(receiver_bits: i64, mn_ptr: i64, arg_bits: &[i64
                     unsafe {
                         *cell = vt_ptr;
                         *cell.add(1) = fm as *const ClassBoundMethod as usize;
+                        // Reset the §8 in-WASM slots so `fill_inwasm_dispatch_cell` RE-resolves for
+                        // THIS callee (its early-out keys on `cell[2] != 0`); otherwise a site that
+                        // re-caches a different vtable would keep the previous callee's env/run_idx.
+                        *cell.add(2) = 0;
+                        *cell.add(3) = 0;
                     }
                     if let Some(r) = try_dispatch_jit(fm, receiver, args) {
+                    fill_inwasm_dispatch_cell(cell, fm, args.len());
                     return r;
                 }
                 // Declined the JIT → interpreter. SAFETY: same run; `act` does not escape.
@@ -1384,12 +1578,22 @@ pub unsafe fn call_method_ic_bits(receiver_bits: i64, disp_id: i64, arg_bits: &[
     let id = disp_id as usize;
     if let Some(obj) = receiver.as_object() {
         let vt = obj.vtable();
+        // The monomorphic key: the object's vtable WORD (the `Gc` box-base stored at `vt_off`) —
+        // EXACTLY what the §8 in-WASM guard reads (`I32Load(obj_ptr + vt_off)`). NOT `vt.as_ptr()`
+        // (`addr_of!(GcBoxInner.value)` = box-base + the header, i.e. the VALUE pointer), which
+        // differs by the `GcBoxHeader` size — using it would make the guard's word compare NEVER
+        // match, silently disabling the fast path (the bug that hid §8's win). Native has no
+        // in-WASM guard, so `as_ptr` (self-consistent for its own cell check) is fine there.
+        #[cfg(target_arch = "wasm32")]
+        let vt_ptr = vtable_word(receiver_bits);
+        #[cfg(not(target_arch = "wasm32"))]
         let vt_ptr = vt.as_ptr() as usize;
         let cell = ic_addr as usize as *mut usize;
         // SAFETY: baked `[usize; 2]` cell; see `call_prop_ic`. Resolution needs no `Activation`.
         if unsafe { *cell } == vt_ptr {
             let fm = unsafe { &*(*cell.add(1) as *const ClassBoundMethod) };
             if let Some(r) = try_dispatch_jit(fm, receiver, args) {
+                    fill_inwasm_dispatch_cell(cell, fm, args.len());
                     return r;
                 }
                 // Declined the JIT → interpreter. SAFETY: same run; `act` does not escape.
@@ -1401,8 +1605,17 @@ pub unsafe fn call_method_ic_bits(receiver_bits: i64, disp_id: i64, arg_bits: &[
                 unsafe {
                     *cell = vt_ptr;
                     *cell.add(1) = fm as *const ClassBoundMethod as usize;
+                    // Reset the §8 in-WASM slots so `fill_inwasm_dispatch_cell` RE-resolves for
+                    // THIS callee (its early-out keys on `cell[2] != 0`); otherwise a site that
+                    // re-caches a different vtable (polymorphic call, e.g. SubTexture vs
+                    // ConcreteTexture `width`/`height`) keeps the previous callee's env/run_idx,
+                    // and the WASM guard `call_indirect`s the stale table slot → wrong result
+                    // (#1034). Mirrors the reset in `call_prop_ic_bits`.
+                    *cell.add(2) = 0;
+                    *cell.add(3) = 0;
                 }
                 if let Some(r) = try_dispatch_jit(fm, receiver, args) {
+                    fill_inwasm_dispatch_cell(cell, fm, args.len());
                     return r;
                 }
                 // Declined the JIT → interpreter. SAFETY: same run; `act` does not escape.

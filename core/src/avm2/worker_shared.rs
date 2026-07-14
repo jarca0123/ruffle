@@ -152,13 +152,24 @@ impl SharedByteBuffer {
         }))
     }
 
-    /// Moves the allocation to a fresh one of at least `new_cap` bytes,
-    /// preserving contents. Caller must hold `grow` and have verified the
-    /// buffer may move (no live JIT frame on its base).
-    fn realloc(b: &SharedBuf, new_cap: usize) {
+    /// Moves the allocation to a fresh one, preserving contents. Tries `target_cap` (the amortized
+    /// growth size) first; if the allocator can't satisfy it — near the shared-memory ceiling,
+    /// where the geometric HEADROOM is what overflows — falls back to `min_cap`, the smallest size
+    /// that actually fits the request. So a buffer that would fit at its real size doesn't OOM
+    /// merely because the growth slack didn't (the FlasCC/domainMemory `sbrk` failure mode). Only a
+    /// genuine can't-fit-even-minimally allocation aborts. Caller must hold `grow` and have verified
+    /// the buffer may move (no live JIT frame on its base).
+    fn realloc(b: &SharedBuf, target_cap: usize, min_cap: usize) {
         let old_ptr = b.ptr.load(Ordering::Relaxed) as *mut u8;
         let old_cap = b.cap.load(Ordering::Relaxed);
-        let mut v: Vec<u8> = Vec::with_capacity(new_cap);
+        // Fallible: `try_reserve_exact` returns `Err` instead of aborting, so we can retry smaller.
+        let mut v: Vec<u8> = Vec::new();
+        if v.try_reserve_exact(target_cap).is_err() && v.try_reserve_exact(min_cap).is_err() {
+            std::alloc::handle_alloc_error(
+                std::alloc::Layout::array::<u8>(min_cap)
+                    .unwrap_or_else(|_| std::alloc::Layout::new::<u8>()),
+            );
+        }
         let new_ptr = v.as_mut_ptr();
         let new_cap = v.capacity();
         std::mem::forget(v);
@@ -232,7 +243,13 @@ impl SharedByteBuffer {
         if new_len <= cap {
             return (b.ptr.load(Ordering::Relaxed) as *mut u8, new_len);
         }
-        Self::realloc(b, new_len.max(cap.saturating_mul(2)));
+        // Amortized growth at 1.5× (not 2×): still geometric — O(log) reallocs — but bounds the
+        // steady-state over-allocation to ~1.5× the live size and shrinks the transient old+new
+        // peak during the copy (old + 1.5·old vs old + 2·old), both of which matter on wasm where
+        // there is no address-space reservation and every byte is committed. `realloc` falls back
+        // to exactly `new_len` if even 1.5× can't be allocated.
+        let target = new_len.max(cap.saturating_add(cap / 2));
+        Self::realloc(b, target, new_len);
         (b.ptr.load(Ordering::Relaxed) as *mut u8, new_len)
     }
 

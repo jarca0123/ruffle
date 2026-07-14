@@ -102,6 +102,30 @@ pub struct ByteArrayStorage {
     shared: Option<SharedByteBuffer>,
 }
 
+/// Resize `bytes` to `new_len`, zero-filling any growth — but reserving AMORTIZED-WITH-FALLBACK
+/// instead of letting `Vec::resize` use its 2× amortized reserve. On wasm (no address-space
+/// overcommit, every byte committed) that doubling both wastes memory (up to 2× the live size) and
+/// ABORTS near the ~4 GiB shared-memory ceiling when the growth HEADROOM overflows even though the
+/// real size would fit. Here: grow capacity to ~1.5×, and if that can't be allocated fall back to
+/// exactly `new_len`, so only a genuine can't-fit-at-all request aborts. Takes `&mut Vec<u8>` (not
+/// `&mut self`) so it can be called inside a `match &self.shared { … }` (a disjoint field borrow).
+fn grow_and_zero(bytes: &mut Vec<u8>, new_len: usize) {
+    let cap = bytes.capacity();
+    if new_len > cap {
+        let len = bytes.len();
+        let target = new_len.max(cap.saturating_add(cap / 2));
+        if bytes.try_reserve_exact(target - len).is_err()
+            && bytes.try_reserve_exact(new_len - len).is_err()
+        {
+            std::alloc::handle_alloc_error(
+                std::alloc::Layout::array::<u8>(new_len)
+                    .unwrap_or_else(|_| std::alloc::Layout::new::<u8>()),
+            );
+        }
+    }
+    bytes.resize(new_len, 0);
+}
+
 impl ByteArrayStorage {
     /// Create a new ByteArrayStorage
     pub fn new(context: &mut UpdateContext<'_>) -> ByteArrayStorage {
@@ -146,11 +170,32 @@ impl ByteArrayStorage {
     fn materialize(&mut self) -> &[u8] {
         if let Some(s) = &self.shared {
             let slen = s.len();
-            if self.bytes.len() != slen {
-                self.bytes.resize(slen, 0);
+            // Size the scratch to exactly the shared length. On GROWTH, skip the zero-fill that
+            // `grow_and_zero`/`Vec::resize` would do: `s.read` below overwrites ALL of [0, slen),
+            // so pre-zeroing the freshly-grown tail is a wasted full-buffer memset every time a
+            // large domainMemory scratch grows. Reserve fallibly (like `grow_and_zero`), then
+            // `set_len` the uninitialized tail — `s.read` initializes it before we return.
+            match slen.cmp(&self.bytes.len()) {
+                std::cmp::Ordering::Greater => {
+                    let add = slen - self.bytes.len();
+                    if self.bytes.try_reserve_exact(add).is_err() {
+                        std::alloc::handle_alloc_error(
+                            std::alloc::Layout::array::<u8>(slen)
+                                .unwrap_or_else(|_| std::alloc::Layout::new::<u8>()),
+                        );
+                    }
+                    // SAFETY: capacity >= slen after the reserve; every byte of [0, slen) is
+                    // written by the `s.read` below (or the defensive fill) before the returned
+                    // slice can be read.
+                    unsafe { self.bytes.set_len(slen) };
+                }
+                std::cmp::Ordering::Less => self.bytes.truncate(slen),
+                std::cmp::Ordering::Equal => {}
             }
-            if slen > 0 {
-                s.read(0, &mut self.bytes[..slen]);
+            if slen > 0 && !s.read(0, &mut self.bytes[..slen]) {
+                // `slen == s.len()`, so the read is always in bounds; fill defensively so a future
+                // change can never expose the uninitialized tail via the returned slice.
+                self.bytes[..slen].fill(0);
             }
         }
         &self.bytes
@@ -344,7 +389,7 @@ impl ByteArrayStorage {
         // Refresh the region from the shared buffer (see `read_at`).
         if self.shared.is_some() {
             if end > self.bytes.len() {
-                self.bytes.resize(end, 0);
+                grow_and_zero(&mut self.bytes, end);
             }
             let shared = self.shared.clone().unwrap();
             if amnt > 0 && !shared.read(pos, &mut self.bytes[pos..end]) {
@@ -386,7 +431,7 @@ impl ByteArrayStorage {
                 .checked_add(amnt)
                 .ok_or(ByteArrayError::EndOfFile)?;
             if end > self.bytes.len() {
-                self.bytes.resize(end, 0);
+                grow_and_zero(&mut self.bytes, end);
             }
             let shared = self.shared.clone().unwrap();
             if amnt > 0 && !shared.read(offset, &mut self.bytes[offset..end]) {
@@ -436,7 +481,7 @@ impl ByteArrayStorage {
             }
             None => {
                 if self.bytes.len() < new_len {
-                    self.bytes.resize(new_len, 0);
+                    grow_and_zero(&mut self.bytes, new_len);
                 }
                 self.bytes
                     .get_mut(offset..new_len)
@@ -502,7 +547,7 @@ impl ByteArrayStorage {
             }
             None => {
                 if self.bytes.len() < new_len {
-                    self.bytes.resize(new_len, 0);
+                    grow_and_zero(&mut self.bytes, new_len);
                 }
                 self.bytes.copy_within(start..end, offset);
             }
@@ -623,7 +668,7 @@ impl ByteArrayStorage {
             // Don't grow the scratch — it's materialized on read.
             self.position.set(self.position().min(new_len));
         } else {
-            self.bytes.resize(new_len, 0);
+            grow_and_zero(&mut self.bytes, new_len);
             self.position.set(self.position().min(new_len));
         }
     }

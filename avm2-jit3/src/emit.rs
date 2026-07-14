@@ -164,8 +164,13 @@ const G_DMDESC: u32 = 45;
 const G_CALL_IC: u32 = 46;
 /// `call_method_ic(receiver, disp_id, args_off, argc, ic_addr) -> value` — call IC by disp-id.
 const G_CALL_METHOD_IC: u32 = 47;
+/// `jit_enter(env) -> prev` — §8 in-WASM dispatch bracket: install the callee's cached ctx +
+/// bump frame depth. `TY_PTR1` shape. Web-only emit (native binds a stub, never called).
+const G_JIT_ENTER: u32 = 48;
+/// `jit_leave(prev)` — end the [`G_JIT_ENTER`] bracket (drop depth + restore ctx). `TY_I64_VOID`.
+const G_JIT_LEAVE: u32 = 49;
 /// Number of imported helper table slots / index globals.
-const NUM_HELPERS: u32 = 48;
+const NUM_HELPERS: u32 = 50;
 /// The single defined function (`run`) — index 0 (no imported functions).
 const F_RUN: u32 = 0;
 
@@ -413,8 +418,9 @@ fn slot(i: u32) -> MemArg {
 }
 
 /// A `MemArg` for an arbitrary byte `offset` and `align` (log2 alignment) into the frame/main
-/// memory — used by the inline `getslot` fast path's object-pointer + slot loads.
-#[cfg(target_arch = "wasm32")]
+/// memory — used by the inline `getslot` fast path's object-pointer + slot loads (and the §8
+/// in-WASM call-IC guard/frame writes, which native tests validate — hence `test` too).
+#[cfg(any(target_arch = "wasm32", test))]
 fn mem_arg(offset: u64, align: u32) -> MemArg {
     MemArg { offset, align, memory_index: 0 }
 }
@@ -674,11 +680,12 @@ fn next_ic_site() -> Option<u64> {
 }
 
 /// Allocates the next monomorphic CALL-cache site and returns the baked address of its
-/// `[vtable_ptr, fm_ptr]` cell (`call_ic_base + site * 2 * size_of::<usize>()`), or `None` once
-/// the fixed cache is full (then that `CallProperty` uses the plain `cp` helper). Unlike the
-/// property IC this is NOT `cfg(wasm32)`: the cell is read/written by the `call_prop_ic` HELPER
-/// (native Rust), and the baked address is a native/wasm pointer the helper dereferences — so it
-/// works on both targets (native → verify-testable).
+/// `[vtable_ptr, fm_ptr, env_ptr, run_idx]` cell (`call_ic_base + site * 4 * size_of::<usize>()`),
+/// or `None` once the fixed cache is full (then that `CallProperty` uses the plain `cp` helper).
+/// Unlike the property IC this is NOT `cfg(wasm32)`: the cell is read/written by the `call_prop_ic`
+/// HELPER (native Rust), and the baked address is a native/wasm pointer the helper dereferences —
+/// so it works on both targets (native → verify-testable). The extra two slots (`env_ptr`,
+/// `run_idx`) drive the §8 in-WASM direct dispatch, read only by the web caller emit.
 fn next_call_ic_site() -> Option<u64> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static SITE: AtomicUsize = AtomicUsize::new(0);
@@ -686,7 +693,157 @@ fn next_call_ic_site() -> Option<u64> {
     if site >= crate::helpers::call_ic_capacity() {
         return None;
     }
-    Some((crate::helpers::call_ic_base() + site * 2 * core::mem::size_of::<usize>()) as u64)
+    Some((crate::helpers::call_ic_base() + site * 4 * core::mem::size_of::<usize>()) as u64)
+}
+
+/// §8 in-WASM direct dispatch for a `callproperty`/`callmethod` site (WEB ONLY). Precondition:
+/// the `argc` outgoing args are already `i64.store`d in this frame's scratch
+/// (`[CALL_SCRATCH_SLOT, +argc)`) and the receiver is on top of the operand stack. Emits the
+/// guarded fast path — receiver is an object whose vtable matches the cached one AND the cached
+/// callee has a resolved in-WASM `run_idx` — then reserves the callee frame (`jit_enter(env)`,
+/// which returns its byte offset or `0` on arena overflow), copies `[this, args]` in, and
+/// `call_indirect`s the callee's `run(0, argc, base)` directly (no Rust bounce), closing with
+/// `jit_leave()`. Every miss / overflow / non-object receiver falls back to the Rust call-IC
+/// helper (`fallback_global`), which reads the args still in scratch — byte-identical to the
+/// non-fast path. Leaves the call's i64 result on the stack (may be SENTINEL; a `BailIfError`
+/// follows). `key` is the baked `mn_ptr` (callproperty) or `disp_id` (callmethod). `vt_off` is
+/// the object-`vtable` word offset (`vtable_offset()` on web; a fixed value in native tests, which
+/// only exercise the non-object fallback branch). Compiled on web (always) and in native tests
+/// (so `WtModule::new` validates the exact bytes the browser runs — every branch's stack shape).
+#[cfg(any(target_arch = "wasm32", test))]
+fn emit_inwasm_call_ic(
+    body: &mut Function,
+    ic_addr: u64,
+    key: i64,
+    fallback_global: u32,
+    argc: u32,
+    vt_off: u64,
+) {
+    use Instruction as I;
+    let ic32 = ic_addr as i32;
+    let us = core::mem::size_of::<usize>() as u64; // cell slot stride (4 on wasm32)
+
+    // Rust call-IC fallback: `helper(receiver, key, args_off = scratch, argc, ic_addr)` — reads
+    // the args still in this frame's outgoing scratch (identical to the plain call-IC path).
+    let emit_fallback = |body: &mut Function| {
+        body.instruction(&I::LocalGet(SCRATCH64)); // receiver
+        body.instruction(&I::I64Const(key));
+        body.instruction(&I::LocalGet(P_ARGS));
+        body.instruction(&I::I64ExtendI32U);
+        body.instruction(&I::I64Const((CALL_SCRATCH_SLOT as i64) * 8));
+        body.instruction(&I::I64Add);
+        body.instruction(&I::I64Const(argc as i64));
+        body.instruction(&I::I64Const(ic_addr as i64));
+        call_helper(body, fallback_global, TY_CALL_IC);
+    };
+
+    // Save receiver; is it an object? (tag == 0xFFFD in the top 16 bits.)
+    body.instruction(&I::LocalTee(SCRATCH64));
+    body.instruction(&I::I64Const(48));
+    body.instruction(&I::I64ShrU);
+    body.instruction(&I::I64Const(0xFFFD));
+    body.instruction(&I::I64Eq);
+    body.instruction(&I::If(BlockType::Result(ValType::I64)));
+    // Object: (receiver.vtable == cell.vtable) && (cell.run_idx != 0)?
+    body.instruction(&I::LocalGet(SCRATCH64));
+    body.instruction(&I::I32WrapI64);
+    body.instruction(&I::I32Load(mem_arg(vt_off, 2))); // receiver.vtable
+    body.instruction(&I::I32Const(ic32));
+    body.instruction(&I::I32Load(mem_arg(0, 2))); // cell.vtable
+    body.instruction(&I::I32Eq);
+    body.instruction(&I::I32Const(ic32));
+    body.instruction(&I::I32Load(mem_arg(3 * us, 2))); // cell.run_idx
+    body.instruction(&I::I32Const(0));
+    body.instruction(&I::I32Ne);
+    body.instruction(&I::I32And);
+    body.instruction(&I::If(BlockType::Result(ValType::I64)));
+    // Eligible: `jit_enter(env, fm, args_off, argc) -> base` — validates the args already match the
+    // callee's param types (else 0 → fall back), reserves the callee frame (0 on arena overflow),
+    // and installs the ctx/depth/call-stack. `args_off` = this frame's outgoing scratch.
+    body.instruction(&I::I32Const(ic32));
+    body.instruction(&I::I32Load(mem_arg(2 * us, 2))); // cell.env
+    body.instruction(&I::I64ExtendI32U);
+    body.instruction(&I::I32Const(ic32));
+    body.instruction(&I::I32Load(mem_arg(us, 2))); // cell.fm  (cell[1])
+    body.instruction(&I::I64ExtendI32U);
+    body.instruction(&I::LocalGet(P_ARGS)); // args_off = P_ARGS + CALL_SCRATCH_SLOT*8
+    body.instruction(&I::I64ExtendI32U);
+    body.instruction(&I::I64Const((CALL_SCRATCH_SLOT as i64) * 8));
+    body.instruction(&I::I64Add);
+    body.instruction(&I::I64Const(argc as i64));
+    call_helper(body, G_JIT_ENTER, TY_CP);
+    body.instruction(&I::LocalTee(SCRATCH64_B)); // save base
+    body.instruction(&I::I64Eqz);
+    body.instruction(&I::If(BlockType::Result(ValType::I64)));
+    // Arena overflow: jit_enter changed nothing → fall back to the helper.
+    emit_fallback(body);
+    body.instruction(&I::Else);
+    // Copy args (scratch -> callee frame base+8+k*8), then receiver -> base+0.
+    for k in 0..argc {
+        body.instruction(&I::LocalGet(SCRATCH64_B));
+        body.instruction(&I::I32WrapI64); // base addr
+        body.instruction(&I::LocalGet(P_ARGS));
+        body.instruction(&I::I64Load(slot(CALL_SCRATCH_SLOT + k))); // arg k from scratch
+        body.instruction(&I::I64Store(mem_arg(8 + (k as u64) * 8, 3)));
+    }
+    body.instruction(&I::LocalGet(SCRATCH64_B));
+    body.instruction(&I::I32WrapI64);
+    body.instruction(&I::LocalGet(SCRATCH64)); // receiver = callee's `this`
+    body.instruction(&I::I64Store(mem_arg(0, 3)));
+    // call_indirect callee.run(0, argc, base) through the main table (holds run + helpers).
+    body.instruction(&I::I32Const(0)); // env arg (unused by `run`)
+    body.instruction(&I::I32Const(argc as i32));
+    body.instruction(&I::LocalGet(SCRATCH64_B));
+    body.instruction(&I::I32WrapI64); // args_off = base
+    body.instruction(&I::I32Const(ic32));
+    body.instruction(&I::I32Load(mem_arg(3 * us, 2))); // run_idx (the table index)
+    body.instruction(&I::CallIndirect { type_index: 0, table_index: T_HELPERS });
+    // Close the bracket (pop call, drop depth, restore ctx); the i64 result stays on the stack.
+    call_helper(body, G_JIT_LEAVE, TY_VOID);
+    body.instruction(&I::End); // end base-overflow If
+    body.instruction(&I::Else);
+    emit_fallback(body); // object, but vtable / run_idx miss
+    body.instruction(&I::End); // end vtable&run_idx If
+    body.instruction(&I::Else);
+    emit_fallback(body); // non-object receiver
+    body.instruction(&I::End); // end is-object If
+}
+
+/// Native call-IC emission for `callproperty`/`callmethod`: the Rust `call_prop_ic`/
+/// `call_method_ic` helper (`key` = `mn_ptr`/`disp_id`), reading args from this frame's scratch.
+/// Native has no shared table to `call_indirect` a callee through (each method is its own wasmtime
+/// instance), so it never takes the in-WASM path — EXCEPT under a unit-test flag, which forces the
+/// web `emit_inwasm_call_ic` shape so `WtModule::new` validates the exact bytes the browser runs
+/// (the fast path's every branch) and the non-object fallback executes.
+#[cfg(not(target_arch = "wasm32"))]
+fn emit_call_ic_native(body: &mut Function, key: i64, global: u32, argc: u32, ic_addr: u64) {
+    use Instruction as I;
+    #[cfg(test)]
+    if test_force_inwasm_call_ic() {
+        // vt_off is irrelevant here: tests drive a non-object receiver, so the vtable word is
+        // never loaded (the outer `is-object` guard short-circuits to the fallback).
+        emit_inwasm_call_ic(body, ic_addr, key, global, argc, 0);
+        return;
+    }
+    body.instruction(&I::I64Const(key));
+    body.instruction(&I::LocalGet(P_ARGS));
+    body.instruction(&I::I64ExtendI32U);
+    body.instruction(&I::I64Const((CALL_SCRATCH_SLOT as i64) * 8));
+    body.instruction(&I::I64Add);
+    body.instruction(&I::I64Const(argc as i64));
+    body.instruction(&I::I64Const(ic_addr as i64));
+    call_helper(body, global, TY_CALL_IC);
+}
+
+/// Unit-test toggle: force the native call-IC emission to use the web in-WASM shape (see
+/// [`emit_call_ic_native`]). Off by default; a test sets it around a `compile()` call.
+#[cfg(all(not(target_arch = "wasm32"), test))]
+thread_local! {
+    static FORCE_INWASM_CALL_IC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(all(not(target_arch = "wasm32"), test))]
+fn test_force_inwasm_call_ic() -> bool {
+    FORCE_INWASM_CALL_IC.with(|c| c.get())
 }
 
 /// Emits the type-0 module for a body with `num_locals` locals. `Some(bytes)` on success;
@@ -818,6 +975,8 @@ pub fn compile(
     imports.import("env", "dmdesc_i", idx_global);
     imports.import("env", "callpropic_i", idx_global);
     imports.import("env", "callmethodic_i", idx_global);
+    imports.import("env", "jitenter_i", idx_global);
+    imports.import("env", "jitleave_i", idx_global);
     imports.import(
         "env",
         "memory",
@@ -1125,18 +1284,25 @@ fn emit_op(body: &mut Function, op: JitOp, promote: &[Option<(u32, RegKind)>]) -
             // call-IC site is free, `call_prop_ic(receiver, mn, args_off, argc, ic_addr)` — which
             // dispatches a cached monomorphic method DIRECTLY, skipping `call_method_with_args`'s
             // resolve-IC; otherwise the plain `cp` helper.
-            body.instruction(&I::I64Const(mn_ptr as i64));
-            body.instruction(&I::LocalGet(P_ARGS));
-            body.instruction(&I::I64ExtendI32U);
-            body.instruction(&I::I64Const((CALL_SCRATCH_SLOT as i64) * 8));
-            body.instruction(&I::I64Add);
-            body.instruction(&I::I64Const(argc as i64));
             match next_call_ic_site() {
+                // Web: a guarded IN-WASM `call_indirect` into the cached callee (no Rust bounce),
+                // falling back to `call_prop_ic` on a miss. Native: the helper only (no shared
+                // table to `call_indirect` through — see §8). Receiver is on the stack top.
+                #[cfg(target_arch = "wasm32")]
                 Some(ic_addr) => {
-                    body.instruction(&I::I64Const(ic_addr as i64));
-                    call_helper(body, G_CALL_IC, TY_CALL_IC);
+                    emit_inwasm_call_ic(body, ic_addr, mn_ptr as i64, G_CALL_IC, argc, vtable_offset() as u64)
                 }
-                None => call_helper(body, G_CP, TY_CP),
+                #[cfg(not(target_arch = "wasm32"))]
+                Some(ic_addr) => emit_call_ic_native(body, mn_ptr as i64, G_CALL_IC, argc, ic_addr),
+                None => {
+                    body.instruction(&I::I64Const(mn_ptr as i64));
+                    body.instruction(&I::LocalGet(P_ARGS));
+                    body.instruction(&I::I64ExtendI32U);
+                    body.instruction(&I::I64Const((CALL_SCRATCH_SLOT as i64) * 8));
+                    body.instruction(&I::I64Add);
+                    body.instruction(&I::I64Const(argc as i64));
+                    call_helper(body, G_CP, TY_CP);
+                }
             }
         }
         JitOp::CallMethod(disp_id, argc) => {
@@ -1152,15 +1318,20 @@ fn emit_op(body: &mut Function, op: JitOp, promote: &[Option<(u32, RegKind)>]) -
             // — `disp_id`/`argc` baked as `i64` so it shares the all-i64 `TY_CALL_IC` shape.
             // Otherwise the plain `call_method` helper.
             match next_call_ic_site() {
+                // Web: guarded IN-WASM direct dispatch (see `emit_inwasm_call_ic`); native: the
+                // by-disp-id call-IC helper only. Receiver is on the stack top.
+                #[cfg(target_arch = "wasm32")]
+                Some(ic_addr) => emit_inwasm_call_ic(
+                    body,
+                    ic_addr,
+                    disp_id as i64,
+                    G_CALL_METHOD_IC,
+                    argc,
+                    vtable_offset() as u64,
+                ),
+                #[cfg(not(target_arch = "wasm32"))]
                 Some(ic_addr) => {
-                    body.instruction(&I::I64Const(disp_id as i64));
-                    body.instruction(&I::LocalGet(P_ARGS));
-                    body.instruction(&I::I64ExtendI32U);
-                    body.instruction(&I::I64Const((CALL_SCRATCH_SLOT as i64) * 8));
-                    body.instruction(&I::I64Add);
-                    body.instruction(&I::I64Const(argc as i64));
-                    body.instruction(&I::I64Const(ic_addr as i64));
-                    call_helper(body, G_CALL_METHOD_IC, TY_CALL_IC);
+                    emit_call_ic_native(body, disp_id as i64, G_CALL_METHOD_IC, argc, ic_addr)
                 }
                 None => {
                     body.instruction(&I::I32Const(disp_id as i32));
@@ -2274,10 +2445,16 @@ mod tests {
                 sum
             },
         );
-        // Helper table (48 slots); index globals name each.
+        // §8 in-WASM dispatch bracket stubs: `jit_enter` echoes `env` back as `prev`, `jit_leave`
+        // is a no-op (these unit tests never emit the in-WASM call path, but the slots must exist
+        // so the helper index globals line up with `NUM_HELPERS`).
+        let jit_enter =
+            Func::wrap(&mut store, |_env: i64, _fm: i64, _off: i64, _argc: i64| -> i64 { 0 });
+        let jit_leave = Func::wrap(&mut store, || {});
+        // Helper table (50 slots); index globals name each.
         let table = Table::new(
             &mut store,
-            TableType::new(RefType::new(true, HeapType::Func), 48, Some(48)),
+            TableType::new(RefType::new(true, HeapType::Func), 50, Some(50)),
             Ref::Func(None),
         )
         .expect("helper table");
@@ -2287,7 +2464,7 @@ mod tests {
             delprop, istype, astype, getsuper, setsuper, callsuper, constructsuper, callnative,
             getpropfast, setpropfast, op_in, nextvalue, nextname, hasnext, newfunction, applytype,
             constructslot, constructprop, call, newobject, hasnext2, throw, gschecked, mopload,
-            mopstore, gp_ic, dm_desc, call_prop_ic, call_method_ic,
+            mopstore, gp_ic, dm_desc, call_prop_ic, call_method_ic, jit_enter, jit_leave,
         ];
         for (i, f) in helpers_tbl.into_iter().enumerate() {
             table.set(&mut store, i as u64, Ref::Func(Some(f))).expect("set helper");
@@ -2296,7 +2473,7 @@ mod tests {
             Global::new(store, GlobalType::new(WtV::I32, Mutability::Const), Val::I32(i))
                 .expect("index global")
         };
-        let g: Vec<_> = (0..48).map(|i| idx(&mut store, i)).collect();
+        let g: Vec<_> = (0..50).map(|i| idx(&mut store, i)).collect();
         let mem = Memory::new(&mut store, MemoryType::new(FRAME_PAGES, Some(FRAME_PAGES)))
             .expect("frame memory");
         let mut imports: Vec<wasmtime::Extern> = vec![table.into()];
@@ -2386,6 +2563,62 @@ mod tests {
             &[UNDEFINED_BITS, 100],
         );
         assert_eq!(out, 133);
+    }
+
+    #[test]
+    fn dump_inwasm_wat() {
+        // Throwaway: emit a module whose body does a `callmethod` via the in-WASM IC shape and
+        // write the bytes so `wasm-tools print` can show the exact guard. (Debug aid.)
+        FORCE_INWASM_CALL_IC.with(|c| c.set(true));
+        let blocks = vec![Block {
+            ops: vec![
+                JitOp::GetLocal(1),
+                JitOp::PushBits(5),
+                JitOp::CallMethod(3, 1),
+                JitOp::BailIfError,
+                JitOp::ReturnValue,
+            ],
+            term: Term::Return,
+            entry_depth: 0,
+        }];
+        let bytes = compile(&blocks, 2, &[], &[]).expect("compiles");
+        FORCE_INWASM_CALL_IC.with(|c| c.set(false));
+        std::fs::write("/tmp/claude-1000/-home-jaroslavb-rufflepostatnicich-jestedalsiruffle-jitruffle/9fc2f868-b600-4693-b922-7a4947cd13f8/scratchpad/inwasm.wasm", &bytes).unwrap();
+    }
+
+    #[test]
+    fn inwasm_call_ic_module_validates_and_falls_back() {
+        // §8: force the WEB in-WASM call-IC shape on native so `WtModule::new` VALIDATES the exact
+        // bytes the browser runs — the guard, the `jit_enter`/`jit_leave` bracket, the arg copy,
+        // and the `call_indirect` (every branch's stack/type shape). A NON-object receiver (100)
+        // takes the fallback branch, so `call_prop_ic`/`call_method_ic` (stubs = recv[+disp]+Σargs)
+        // execute and prove the fallback path round-trips too. (The in-WASM HIT branch is validated
+        // structurally here; its runtime behaviour is covered by the web `shared_verified` gate.)
+        FORCE_INWASM_CALL_IC.with(|c| c.set(true));
+        let prop = run(
+            &[
+                JitOp::GetLocal(1),
+                JitOp::PushBits(11),
+                JitOp::PushBits(22),
+                JitOp::CallProperty(7, 2),
+                JitOp::BailIfError,
+                JitOp::ReturnValue,
+            ],
+            &[UNDEFINED_BITS, 100],
+        );
+        let meth = run(
+            &[
+                JitOp::GetLocal(1),
+                JitOp::PushBits(5),
+                JitOp::CallMethod(3, 1),
+                JitOp::BailIfError,
+                JitOp::ReturnValue,
+            ],
+            &[UNDEFINED_BITS, 100],
+        );
+        FORCE_INWASM_CALL_IC.with(|c| c.set(false));
+        assert_eq!(prop, 133); // 100 + 11 + 22 via call_prop_ic fallback
+        assert_eq!(meth, 108); // 100 + 3 (disp_id) + 5 via call_method_ic fallback
     }
 
     #[test]

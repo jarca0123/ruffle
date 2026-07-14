@@ -19,6 +19,9 @@ use std::cell::{Cell, RefCell};
 use gc_arena::lock::RefLock;
 use gc_arena::Gc;
 use ruffle_core::avm2::{Activation, ClassObject, Error, ScopeChain};
+// Used only in the web-only in-WASM dispatch (`jit_push_call` / the leaked-`JitEnv` cache).
+#[cfg(target_arch = "wasm32")]
+use ruffle_core::avm2::Method;
 use ruffle_core::context::UpdateContext;
 use ruffle_core::library::MovieLibrary;
 
@@ -74,6 +77,31 @@ impl RunCtx {
     }
 }
 
+/// A cached, cx-free per-callee dispatch env for the §8 in-WASM call IC: the callee's
+/// [`RunCtx`] plus its `Method` identity (for the AVM2 call-stack push that keeps
+/// `Error.getStackTrace()` faithful — mirrors `try_enter`'s `push_call`). Built once per
+/// callee on a call-IC miss and leaked (class-lifetime-stable, exactly the invariant the
+/// cached `ClassBoundMethod` pointer in the IC already relies on). [`jit_enter`] installs it,
+/// [`jit_leave`] tears it down.
+pub(crate) struct JitEnv {
+    ctx: RunCtx,
+    method_ptr: *const (),
+}
+
+impl JitEnv {
+    pub(crate) fn new(ctx: RunCtx, method_ptr: *const ()) -> Self {
+        Self { ctx, method_ptr }
+    }
+    /// The callee's per-run context (`&self.ctx` — stable while the leaked env lives).
+    pub(crate) fn ctx_ptr(&self) -> *const RunCtx {
+        &self.ctx
+    }
+    /// The callee `Method`'s stable identity (`Method::as_ptr`), for the call-stack push.
+    pub(crate) fn method_ptr(&self) -> *const () {
+        self.method_ptr
+    }
+}
+
 // Per-run JIT state: the installed [`RunCtx`] and a stashed thrown error.
 //
 // On **native** these are `thread_local!` — the test harness runs methods on many threads in
@@ -92,6 +120,12 @@ thread_local! {
     /// (nested) run this tick. Separate from `RUN_CTX` so the latter is per-callee/cacheable.
     static AMBIENT_CX: Cell<*mut ()> = const { Cell::new(std::ptr::null_mut()) };
     static PENDING: RefCell<Option<Error<'static>>> = const { RefCell::new(None) };
+    /// This run's LIVE base into the shared `avm2.scope_stack` (`scope_stack_len()` at entry).
+    /// Kept SEPARATE from the (per-callee, cacheable) `RunCtx` because it is a PER-CALL value: the
+    /// §8 in-WASM fast path installs a cached env whose `RunCtx.scope_base` is a stale 0, so it
+    /// sets THIS live instead. `scope_base()`/`reify()` read it; `with_run_ctx` (Rust path) seeds
+    /// it from `RunCtx.scope_base`; `jit_enter`/`jit_leave` (in-WASM) swap it LIFO.
+    static LIVE_SCOPE_BASE: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
@@ -105,6 +139,7 @@ mod single_thread {
     pub static RUN_CTX: One<*const RunCtx> = One(UnsafeCell::new(std::ptr::null()));
     pub static AMBIENT_CX: One<*mut ()> = One(UnsafeCell::new(std::ptr::null_mut()));
     pub static PENDING: One<Option<Error<'static>>> = One(UnsafeCell::new(None));
+    pub static LIVE_SCOPE_BASE: One<usize> = One(UnsafeCell::new(0));
 }
 
 #[inline]
@@ -178,6 +213,36 @@ fn run_ctx_swap(new: *const RunCtx) -> *const RunCtx {
 }
 
 #[inline]
+fn live_sb_get() -> usize {
+    #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+    {
+        LIVE_SCOPE_BASE.with(|c| c.get())
+    }
+    // SAFETY: single-threaded read (see the module note).
+    #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+    unsafe {
+        *single_thread::LIVE_SCOPE_BASE.0.get()
+    }
+}
+
+/// Sets `LIVE_SCOPE_BASE` to `new`, returning the previous value.
+#[inline]
+fn live_sb_swap(new: usize) -> usize {
+    #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+    {
+        LIVE_SCOPE_BASE.with(|c| c.replace(new))
+    }
+    // SAFETY: single-threaded swap (see the module note).
+    #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+    unsafe {
+        let p = single_thread::LIVE_SCOPE_BASE.0.get();
+        let old = *p;
+        *p = new;
+        old
+    }
+}
+
+#[inline]
 fn pending_set(e: Option<Error<'static>>) {
     #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
     {
@@ -220,7 +285,11 @@ fn pending_take() -> Option<Error<'static>> {
 /// nested run (a helper re-entering AS3) saves/restores LIFO. One TLS swap in, one out.
 pub(crate) fn with_run_ctx<R>(ctx: &RunCtx, f: impl FnOnce() -> R) -> R {
     let prev = run_ctx_swap(ctx as *const RunCtx);
+    // The Rust path's `RunCtx` carries the live base — seed `LIVE_SCOPE_BASE` from it so
+    // `scope_base()`/`reify()` (which now read `LIVE_SCOPE_BASE`) match the in-WASM path.
+    let prev_sb = live_sb_swap(ctx.scope_base);
     let r = f();
+    live_sb_swap(prev_sb);
     run_ctx_swap(prev);
     r
 }
@@ -239,11 +308,118 @@ pub(crate) fn pop_ctx(prev: *const RunCtx) {
     run_ctx_swap(prev);
 }
 
+// §8 in-WASM dispatch: a LIFO stack of the caller `RUN_CTX` values `jit_enter` swapped out, so
+// `jit_leave` (which takes no argument) can restore them. Nesting is LIFO with the wasm call
+// stack — a callee may itself make in-WASM calls — so a plain stack is exact. Web-only (the
+// in-WASM caller emit is `cfg(wasm32)`); native's `jit_enter`/`jit_leave` never touch it.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+thread_local! {
+    static JIT_PREV: RefCell<Vec<*const RunCtx>> = const { RefCell::new(Vec::new()) };
+}
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+mod jit_prev_store {
+    use super::RunCtx;
+    use std::cell::UnsafeCell;
+    /// A `Sync` cell relying on the single-AVM2-thread invariant (see the RUN_CTX note).
+    pub struct One(pub UnsafeCell<Vec<*const RunCtx>>);
+    // SAFETY: only ever accessed from the single AVM2 thread.
+    unsafe impl Sync for One {}
+    pub static JIT_PREV: One = One(UnsafeCell::new(Vec::new()));
+}
+
+/// Pushes a swapped-out caller ctx (see [`jit_enter`]).
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn jit_prev_push(p: *const RunCtx) {
+    #[cfg(target_feature = "atomics")]
+    JIT_PREV.with(|s| s.borrow_mut().push(p));
+    // SAFETY: single AVM2 thread; not held across a call.
+    #[cfg(not(target_feature = "atomics"))]
+    unsafe {
+        (*jit_prev_store::JIT_PREV.0.get()).push(p);
+    }
+}
+
+/// Pops the most recently swapped-out caller ctx (see [`jit_leave`]).
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn jit_prev_pop() -> *const RunCtx {
+    #[cfg(target_feature = "atomics")]
+    {
+        JIT_PREV.with(|s| s.borrow_mut().pop().unwrap_or(std::ptr::null()))
+    }
+    // SAFETY: single AVM2 thread; not held across a call.
+    #[cfg(not(target_feature = "atomics"))]
+    unsafe {
+        (*jit_prev_store::JIT_PREV.0.get()).pop().unwrap_or(std::ptr::null())
+    }
+}
+
+// §8 in-WASM dispatch: a LIFO stack of the caller `LIVE_SCOPE_BASE` values `jit_enter` swapped
+// out, so `jit_leave` can restore them (parallel to `JIT_PREV`). Web-only.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+thread_local! {
+    static JIT_SB: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+mod jit_sb_store {
+    use std::cell::UnsafeCell;
+    /// A `Sync` cell relying on the single-AVM2-thread invariant (see the RUN_CTX note).
+    pub struct One(pub UnsafeCell<Vec<usize>>);
+    // SAFETY: only ever accessed from the single AVM2 thread.
+    unsafe impl Sync for One {}
+    pub static JIT_SB: One = One(UnsafeCell::new(Vec::new()));
+}
+
+/// Opens the in-WASM scope-base bracket: install `live` as the callee's `LIVE_SCOPE_BASE`
+/// (`scope_stack_len()` at entry), saving the caller's for [`jit_pop_scope_base`]. Makes a
+/// `scope_base`-reading callee (`getscopeobject`/`newfunction`) sound on the fast path — its
+/// cached env's baked `0` is bypassed.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn jit_push_scope_base(live: usize) {
+    let prev = live_sb_swap(live);
+    #[cfg(target_feature = "atomics")]
+    JIT_SB.with(|s| s.borrow_mut().push(prev));
+    // SAFETY: single AVM2 thread; not held across a call.
+    #[cfg(not(target_feature = "atomics"))]
+    unsafe {
+        (*jit_sb_store::JIT_SB.0.get()).push(prev);
+    }
+}
+
+/// Closes the [`jit_push_scope_base`] bracket — restores the caller's `LIVE_SCOPE_BASE`.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn jit_pop_scope_base() {
+    #[cfg(target_feature = "atomics")]
+    let prev = JIT_SB.with(|s| s.borrow_mut().pop().unwrap_or(0));
+    // SAFETY: single AVM2 thread; not held across a call.
+    #[cfg(not(target_feature = "atomics"))]
+    let prev = unsafe { (*jit_sb_store::JIT_SB.0.get()).pop().unwrap_or(0) };
+    live_sb_swap(prev);
+}
+
+/// Pushes the in-WASM-dispatched callee onto the AVM2 call stack so it shows up in
+/// `Error.getStackTrace()` — mirroring `try_enter`'s `push_call`. Web-only bracket half.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn jit_push_call(method_ptr: *const ()) {
+    // SAFETY: called inside the run; `cx` is the installed ambient context, `method_ptr` a live
+    // `Method` (its class is alive — the invariant the cached call-IC `ClassBoundMethod` relies on).
+    let cx = unsafe { &mut *(cx_ptr() as *mut UpdateContext) };
+    let method = unsafe { Method::from_ptr(method_ptr) };
+    let gc = cx.gc();
+    cx.avm2.push_call(gc, method);
+}
+
+/// Pops the call pushed by [`jit_push_call`] (balances the same bracket).
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn jit_pop_call() {
+    // SAFETY: as `jit_push_call`.
+    let cx = unsafe { &mut *(cx_ptr() as *mut UpdateContext) };
+    let gc = cx.gc();
+    cx.avm2.pop_call(gc);
+}
+
 /// This run's base into the shared `avm2.scope_stack` (from the installed [`RunCtx`]).
 pub(crate) fn scope_base() -> usize {
-    let ptr = run_ctx_get();
-    debug_assert!(!ptr.is_null(), "avm2-jit3 scope helper with no RunCtx installed");
-    unsafe { &*ptr }.scope_base
+    live_sb_get()
 }
 
 /// Reifies a fresh callee-owned `Activation` from the installed [`RunCtx`].
@@ -265,8 +441,10 @@ pub(crate) unsafe fn reify<'gc>() -> Activation<'static, 'gc> {
     let domain = Some(scope.domain());
     let mut act = Activation::from_builtin(cx, bound_super, scope, domain, caller_library, None);
     // Retarget the scope frame to THIS method's base (not the live stack top), so
-    // `newfunction`'s `create_scopechain` captures the method's own local scopes.
-    act.jit_set_scope_base(ctx.scope_base);
+    // `newfunction`'s `create_scopechain` captures the method's own local scopes. Read from
+    // `LIVE_SCOPE_BASE` (the per-call value both paths set), NOT `ctx.scope_base` — the in-WASM
+    // fast path installs a cached env whose `RunCtx.scope_base` is a stale 0.
+    act.jit_set_scope_base(live_sb_get());
     act
 }
 

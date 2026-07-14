@@ -39,6 +39,13 @@ pub fn new_handle() -> Handle {
     Handle(Rc::new(RefCell::new(None)))
 }
 
+/// §8 in-WASM dispatch is web-only (each native method is its own wasmtime instance with its
+/// own table — there is no shared funcref table to `call_indirect` a callee through). So native
+/// never exposes a run index: the caller always keeps the Rust `call_method_ic` fallback.
+pub fn handle_run_idx(_handle: &Handle) -> Option<u32> {
+    None
+}
+
 /// Logs a first-sighting declined op (see `translate::record_decline`). Native: stderr,
 /// gated on `RUFFLE_JIT3_TRACE` so the test suite stays quiet.
 pub fn log_decline(name: &str) {
@@ -492,20 +499,29 @@ fn build(bytes: &[u8]) -> Option<Compiled> {
                         unsafe { helpers::call_method_ic_bits(r, d, &bits, ic) }
                     },
                 );
+                // §8 in-WASM dispatch bracket helpers. Web-only in the emit (the caller emits the
+                // `call_indirect` fast path only under `cfg(wasm32)`), so on native these are never
+                // called — but the table slots must exist so the helper index globals line up
+                // (NUM_HELPERS). `jit_enter` echoes `env` (no DEPTH bump — native has no shared
+                // frame arena to nest), `jit_leave` is a no-op.
+                let jit_enter = Func::wrap(&mut store, |env: i64, fm: i64, off: i64, argc: i64| -> i64 {
+                    helpers::jit_enter(env, fm, off, argc)
+                });
+                let jit_leave = Func::wrap(&mut store, || { helpers::jit_leave() });
                 let table = Table::new(
                     &mut store,
-                    TableType::new(RefType::new(true, HeapType::Func), 48, Some(48)),
+                    TableType::new(RefType::new(true, HeapType::Func), 50, Some(50)),
                     Ref::Func(None),
                 )
                 .ok()?;
-                let helpers_tbl: [Func; 48] = [
+                let helpers_tbl: [Func; 50] = [
                     gs, cr, gp, cp, perr, binop, unop, truthy, setprop, setslot, callmethod,
                     newarray, outerscope, scriptglobals, newactivation, pushscope, popscope,
                     getscope, construct, delprop, istype, astype, getsuper, setsuper, callsuper,
                     constructsuper, callnative, getpropfast, setpropfast, op_in, nextvalue,
                     nextname, hasnext, newfunction, applytype, constructslot, constructprop, call,
                     newobject, hasnext2, throw, gschecked, mopload, mopstore, gp_ic, dm_desc,
-                    call_prop_ic, call_method_ic,
+                    call_prop_ic, call_method_ic, jit_enter, jit_leave,
                 ];
                 for (i, f) in helpers_tbl.into_iter().enumerate() {
                     table.set(&mut store, i as u64, Ref::Func(Some(f))).ok()?;
@@ -514,7 +530,7 @@ fn build(bytes: &[u8]) -> Option<Compiled> {
                     Global::new(store, GlobalType::new(ValType::I32, Mutability::Const), Val::I32(i))
                 };
                 let mut imports: Vec<wasmtime::Extern> = vec![table.into()];
-                for i in 0..48 {
+                for i in 0..50 {
                     imports.push(idx(&mut store, i).ok()?.into());
                 }
                 let memory =

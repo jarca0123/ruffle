@@ -72,6 +72,18 @@ pub trait JitBackend {
         let _ = (cx, method, scope, receiver, bound_super, args);
         None
     }
+
+    /// §8 in-WASM dispatch: if `method` is already compiled AND eligible for a direct
+    /// caller→callee `call_indirect` at a call site passing `argc` args — a JIT-compiled,
+    /// no-scopes, non-arguments, untyped-parameter leaf whose parameter count equals `argc`
+    /// (so no coercion / defaulting is needed) — returns the shared-table index of its `run`
+    /// funcref, letting the caller's compiled body enter it in-WASM with no Rust dispatch
+    /// bounce. Returns `None` otherwise (the caller keeps the Rust call-IC fallback). The
+    /// backend fills this into its per-site call IC on a miss. Default: decline.
+    fn ic_dispatch_run_idx(&self, method: Method<'_>, argc: usize) -> Option<u32> {
+        let _ = (method, argc);
+        None
+    }
 }
 
 /// The default backend: never compiles anything, so every method is interpreted.
