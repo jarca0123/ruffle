@@ -37,6 +37,13 @@ pub struct VerifiedMethodInfo<'gc> {
     /// JIT marks their result `Number` so phase-2 type-specialization keeps it
     /// unboxed as `f64` (e.g. Starling matrix fields). Sorted; nop-remapped.
     pub number_slots: Vec<u32>,
+
+    /// Op indices of `GetSlot`s whose resolved value class is `int`. The JIT marks
+    /// their result `Repr::Int` — SOUND because an `int`-class value is ALWAYS a
+    /// `Value::Integer` at runtime (unlike `Number`, which has a second, heap-boxed
+    /// representation — hence `number_slots` only earns the box-safe `NumberBoxed`).
+    /// `uint` is deliberately excluded: a `u32` >= 2^31 boxes as a `Number`.
+    pub int_slots: Vec<u32>,
 }
 
 #[derive(Collect)]
@@ -520,6 +527,7 @@ pub fn verify_method<'gc>(
 
     let mut null_safe_getslots: Vec<u32> = Vec::new();
     let mut number_slots: Vec<u32> = Vec::new();
+    let mut int_slots: Vec<u32> = Vec::new();
     crate::avm2::optimizer::optimize(
         activation,
         method,
@@ -529,6 +537,7 @@ pub fn verify_method<'gc>(
         jump_targets,
         &mut null_safe_getslots,
         &mut number_slots,
+        &mut int_slots,
     )?;
 
     Ok(VerifiedMethodInfo {
@@ -536,6 +545,7 @@ pub fn verify_method<'gc>(
         exceptions: new_exceptions,
         null_safe_getslots,
         number_slots,
+        int_slots,
     })
 }
 

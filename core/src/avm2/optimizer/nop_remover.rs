@@ -6,6 +6,7 @@ pub fn remove_nops<'gc>(
     exceptions: &mut [Exception<'gc>],
     null_safe_getslots: &mut Vec<u32>,
     number_slots: &mut Vec<u32>,
+    int_slots: &mut Vec<u32>,
 ) {
     let mut offset_vec = vec![0; code.len()];
     let mut current_offset = 0;
@@ -64,6 +65,10 @@ pub fn remove_nops<'gc>(
     }
     // Same for the `Number`-typed `GetSlot` positions (phase-2 unbox input).
     for idx in number_slots {
+        *idx = offset_vec[*idx as usize] as u32;
+    }
+    // Same for the `int`-typed `GetSlot` positions (i32-register promotion input).
+    for idx in int_slots {
         *idx = offset_vec[*idx as usize] as u32;
     }
 }

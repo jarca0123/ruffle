@@ -24,6 +24,7 @@
 //! with no return-type coercion. Everything else makes translation decline.
 
 use wasm_encoder::{
+    NameMap, NameSection,
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
     GlobalType, ImportSection, Instruction, MemArg, MemoryType, Module, RefType, TableType,
     TypeSection, ValType,
@@ -169,8 +170,16 @@ const G_CALL_METHOD_IC: u32 = 47;
 const G_JIT_ENTER: u32 = 48;
 /// `jit_leave(prev)` — end the [`G_JIT_ENTER`] bracket (drop depth + restore ctx). `TY_I64_VOID`.
 const G_JIT_LEAVE: u32 = 49;
+/// `jit_tail_enter(env, fm, args_off, argc) -> 0|1` — §8 TAIL dispatch: replace the caller with
+/// the callee (no frame reserve / depth bump; ctx swapped without saving). `1` ⇒ the emit
+/// `return_call_indirect`s the callee; `0` ⇒ fall back to a normal call + return. `TY_CP` shape.
+const G_JIT_TAIL_ENTER: u32 = 50;
 /// Number of imported helper table slots / index globals.
-const NUM_HELPERS: u32 = 50;
+const NUM_HELPERS: u32 = 51;
+/// How many low `getscopeobject` indices we CSE into locals (see the cache in `compile`). FlasCC /
+/// Lua bodies read index `1` hundreds of times per method and `0` secondarily; `4` covers them with
+/// headroom. Only indices that actually appear get a local, so unused slots cost nothing.
+const SCOPE_CACHE_N: usize = 4;
 /// The single defined function (`run`) — index 0 (no imported functions).
 const F_RUN: u32 = 0;
 
@@ -198,7 +207,7 @@ const TY_CALL_IC: u32 = 18; // (i64,i64,i64,i64,i64)->i64 — call_prop_ic
 /// `cp` reads). Locals occupy `[0, CALL_SCRATCH_SLOT)`, outgoing args
 /// `[CALL_SCRATCH_SLOT, 512)` — both within one `FRAME_STRIDE` (512 slots). Methods with
 /// more locals decline (see [`compile`]).
-const CALL_SCRATCH_SLOT: u32 = 256;
+pub(crate) const CALL_SCRATCH_SLOT: u32 = 256;
 
 /// The most locals a compiled method can have (== [`CALL_SCRATCH_SLOT`]). Lets the caller
 /// build the frame on the stack (no per-call heap allocation).
@@ -244,6 +253,13 @@ pub enum JitOp {
     /// Pop `argc` args + the receiver; push `receiver.call_property(mn, args)`. Carries the
     /// baked `Gc<Multiname>` pointer and the arg count. Reification + may throw.
     CallProperty(u64, u32),
+    /// TAIL-position `callproperty` (`return receiver.f(args)`): like [`CallProperty`] but the
+    /// callee's result becomes THIS method's return — a `return_call_indirect` on web (§8), a plain
+    /// helper-call + `Return` otherwise. Fused by `translate` from `CallProperty; BailIfError;
+    /// ReturnValue` (untyped return only). A TERMINATOR: every path returns.
+    TailCallProperty(u64, u32),
+    /// TAIL-position `callmethod` (by disp-id). See [`TailCallProperty`].
+    TailCallMethod(u32, u32),
     /// Pop `value` then `receiver`; `receiver.set_property(mn, value)` (baked `mn` ptr). Void.
     SetProperty(u64),
     /// Pop `value` then `receiver`; `receiver.set_slot(index, value, mode)`. `mode` = 0
@@ -320,11 +336,14 @@ pub enum JitOp {
     /// terminator (the method has no exception handler, so the throw unwinds straight out).
     Throw,
     /// Pop the address (or value, for sign-extends); push a domain-memory load / sign-extend
-    /// result. Carries the MOP code. May throw (#1506 / coercion).
-    MopLoad(i32),
-    /// Pop the address then the value; store to domain memory (`code`). Result discarded.
+    /// result. Carries the MOP `code` and whether the address operand is a PROVEN `Int` (typed
+    /// frame) — when so, the inline path elides the per-access address tag check. May throw
+    /// (#1506 / coercion).
+    MopLoad(i32, bool),
+    /// Pop the address then the value; store to domain memory (`code`). Result discarded. The
+    /// `bool` is whether the address operand is a proven `Int` (elides the addr tag check).
     /// May throw (#1506 / coercion).
-    MopStore(i32),
+    MopStore(i32, bool),
     /// After a throwing i64-returning helper: if it returned the error SENTINEL (top of
     /// stack), return at once (`try_enter` propagates the stashed error); else restore the
     /// result. No `call_indirect` — a `SENTINEL_BITS` compare on the value.
@@ -336,16 +355,46 @@ pub enum JitOp {
     /// Pop two values, push `binop(a, b, code)` — a dynamic binary operator (add/compare/…).
     /// May coerce (`valueOf`) → reification + may throw.
     BinOp(i32),
-    /// Pop two operands PROVEN to be canonical inline `Number`s (by `translate`'s repr
-    /// analysis), push `a OP b` computed as a pure `f64` op (ADD/SUBTRACT/MULTIPLY/DIVIDE).
-    /// No runtime tag guard and no `binop` helper — pure `f64` arithmetic never runs `valueOf`,
-    /// so it cannot throw (no `BailIfError` follows). The unguarded core of `BinOp`'s f64 path.
-    BinOpNum(i32),
-    /// Pop two operands PROVEN to share a numeric repr and push `a CMP b` as a native compare
-    /// (`code` is a comparison binop code). `is_f64 = false` → both are `Int` boxes → signed i32
-    /// compare; `is_f64 = true` → both canonical `Number` → f64 compare (NaN → false). Result is
-    /// a `Bool` box. No runtime tag guard, no helper, no `BailIfError` — the hot `i < n` path.
-    BinOpCmp(i32, bool),
+    /// Pop two operands PROVEN numeric, push `a OP b` computed as a pure `f64` op
+    /// (ADD/SUBTRACT/MULTIPLY/DIVIDE). No runtime tag guard and no `binop` helper — unboxing a
+    /// proven-numeric operand runs no `valueOf`, so this cannot throw (no `BailIfError` follows).
+    /// The unguarded core of `BinOp`'s f64 path.
+    ///
+    /// `a`/`b` select each operand's unbox strategy (see [`NumUnbox`]) — every proven-numeric repr
+    /// unboxes without running `valueOf`. `translate` only emits this where the interpreter's
+    /// int-int arm provably CANNOT fire (see `bin`), so the result is always a canonical `Number`.
+    BinOpNum { code: i32, a: NumUnbox, b: NumUnbox },
+    /// Pop two operands PROVEN to be `Int` boxes, push `a OP b` as a native `i32` op — the
+    /// int-arithmetic twin of [`BinOpNum`], and the dominant FlasCC/Alchemy shape (C's wrapping
+    /// `int` arithmetic maps straight onto `add_i`/`bitand`/`lshift`/…).
+    ///
+    /// Sound for exactly the ops whose result is ALWAYS an `int` box regardless of input:
+    /// `add_i`/`subtract_i`/`multiply_i` (wrapping — they never overflow to `Number`, unlike plain
+    /// `add`/`subtract`/`multiply`) and `bitand`/`bitor`/`bitxor`/`lshift`/`rshift`. An `Int` box
+    /// unboxes exactly (`i32.wrap`), wasm's shifts already mask the count to 5 bits (matching the
+    /// interpreter's `& 0x1F`), and its i32 ops already wrap — so no guard, no `BailIfError`, and
+    /// the result re-boxes as `Int` (`Repr::Int` → feeds the i32-register promotion).
+    /// `urshift` is admitted ONLY under a precondition `translate` must establish: the shift count
+    /// is a literal whose `& 0x1F` is non-zero, so the `u32` result is < 2^31 and therefore boxes
+    /// as an `int` rather than a `Number`. (Like [`BinOpNum`]'s `a_int`, the emit trusts that
+    /// proof — emitting `BinOpInt(URSHIFT)` without it would box a ≥ 2^31 result as an `int`.)
+    BinOpInt(i32),
+    /// Pop two EXACTLY-unboxable numeric operands and push `a CMP b` as a native compare (`code`
+    /// is a comparison binop code) → a `Bool` box. No runtime tag guard, no helper, no
+    /// `BailIfError` — the hot `i < n` path.
+    ///
+    /// SOUND for any mix: every comparison (`abstract_eq`/`abstract_lt`, and `strict_eq` via
+    /// `Value`'s custom `PartialEq`) reduces two numerics to a compare of their `packed_number()`
+    /// f64s, and an `i32` converts to `f64` exactly. Unlike the arithmetic ops there is NO int-int
+    /// arm to worry about — the result is always a `Bool`. Two `Int`s use a signed i32 compare
+    /// (same answer, one instruction less); anything else compares as f64 (NaN → false, matching
+    /// `abstract_lt`'s `None`/`unwrap_or` handling).
+    BinOpCmp { code: i32, a: NumUnbox, b: NumUnbox },
+    /// Pop one value, push `x == null`-style nullish test as a `Bool` box — the inline for a
+    /// comparison whose OTHER operand is a `null`/`undefined` constant (a very common null check).
+    /// `loose` (`==`/`!=`, no coercion needed here: only `null`/`undefined` are `== null`) ⇒
+    /// `(x == null) | (x == undefined)`; strict (`===`) ⇒ `x == against` exactly. No throw.
+    NullishEq { against: u64, loose: bool },
     /// Pop one value, push `unop(a, code)` — a dynamic unary operator (negate/not/…).
     UnOp(i32),
     /// Coerce the top value to the baked return-type class pointer, leaving it on the stack
@@ -367,6 +416,29 @@ pub enum JitOp {
     ReturnVoid,
 }
 
+/// How an EXACTLY-unboxable operand of [`JitOp::BinOpNum`] becomes a native `f64`. Both variants
+/// are branch-free, allocation-free and cannot throw — hence no `BailIfError` follows.
+///
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumUnbox {
+    /// `Repr::Number` — a canonical inline `f64`: the box bits ARE the double. Branch-free.
+    Canonical,
+    /// `Repr::Int` — an `int` box whose low 32 bits ARE the payload. Exact (`i32.wrap` +
+    /// `f64.convert_i32_s`); no `ToInt32` needed. Branch-free.
+    Int,
+    /// `Repr::NumberBoxed` OR `Repr::Numeric` — the exact same runtime set, despite the different
+    /// names: an `int` box, a canonical inline `f64`, or a `TAG_BOXED_DOUBLE` (a colliding NaN the
+    /// interpreter heap-boxed to stay byte-exact). Mirrors `Value::packed_number` — and the `int`
+    /// case is NOT optional: a `Number`-CLASS value can be a `Value::Integer` (`matches_type(Number)`
+    /// admits an `int`-class value, so a `Number` slot can be `SetSlotNoCoerce`d with one). Omitting
+    /// it cost a grey screen. Two branches.
+    ///
+    /// ONLY VALID FOR COMPARISONS. Arithmetic must not use it: `add`/`subtract`/`multiply` have an
+    /// int-int arm that yields an `int` box, and this repr cannot rule it out (see `translate::bin`).
+    /// Comparisons have no such arm — their result is always a `Bool`.
+    AnyNumeric,
+}
+
 /// The typed WASM register a promoted local lives in. `IntI32`/`BoolI32` share the same i32
 /// declaration group and `i32.wrap` unbox; they differ only in the box tag `GetLocal` re-applies.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -377,6 +449,14 @@ pub enum RegKind {
     IntI32,
     /// A provable `Bool` local → an `i32` register (re-boxed with `VALUE_BOOL_MARK`).
     BoolI32,
+    /// ANY local → an `i64` register holding the box VERBATIM. Needs no repr proof: the register
+    /// holds exactly the bits the frame slot would, so `GetLocal`/`SetLocal` become a bare
+    /// `local.get`/`local.set` — no box, no unbox, no linear-memory round trip. This is the only
+    /// promotion open to `Boxed` (object/string) locals, which is what OO content is made of:
+    /// 464 of Starling's 718 methods promoted NOTHING before this, and a V8 instruction profile
+    /// put 60.6% of their `mov` traffic in linear memory. Tried last — the typed kinds are
+    /// strictly better where they apply (they also unlock unguarded arithmetic).
+    BoxedI64,
 }
 
 /// A local promoted out of the memory frame into a typed WASM register (Phase 3/4).
@@ -437,9 +517,114 @@ fn is_inline_mop(op: &JitOp) -> bool {
     use crate::helpers::mop_code as mc;
     matches!(
         op,
-        JitOp::MopLoad(mc::LI8 | mc::LI16 | mc::LI32 | mc::LF32 | mc::LF64)
-            | JitOp::MopStore(mc::SI8 | mc::SI16 | mc::SI32 | mc::SF32 | mc::SF64)
+        JitOp::MopLoad(mc::LI8 | mc::LI16 | mc::LI32 | mc::LF32 | mc::LF64, _)
+            | JitOp::MopStore(mc::SI8 | mc::SI16 | mc::SI32 | mc::SF32 | mc::SF64, _)
     )
+}
+
+/// Whether emitting `op` KEEPS the inline-domainMemory base/len local cache valid — i.e. `op`
+/// provably cannot grow or reassign domainMemory. Only two things move the descriptor: a `ByteArray`
+/// growth (a reallocation) or `Domain.domainMemory =` — both require running AS3 (a getter/setter,
+/// a call/construct, a coercing `valueOf`). So the whitelist admits ONLY ops that run no AS3: the
+/// MOPs themselves (a store is bounds-checked → never grows; a load/sign-extend only reads), local
+/// & constant shuffles, the unguarded native numeric ops (no `valueOf`), scope reads, and the
+/// sentinel bail checks. Anything else (property/slot/call/construct, guarded `BinOp`/`UnOp`/
+/// `Coerce` that may `valueOf`, `newfunction`, …) conservatively invalidates → the next MOP reloads
+/// base+len. Missing an inert op only costs a reload; wrongly admitting a mutating one would be
+/// unsound, so the list is deliberately tight.
+#[cfg(target_arch = "wasm32")]
+fn mop_cache_survives(op: &JitOp) -> bool {
+    matches!(
+        op,
+        JitOp::MopLoad(..)
+            | JitOp::MopStore(..)
+            | JitOp::GetLocal(_)
+            | JitOp::SetLocal(_)
+            | JitOp::PushBits(_)
+            | JitOp::BinOpNum { .. }
+            | JitOp::BinOpInt(_)
+            | JitOp::BinOpCmp { .. }
+            | JitOp::NullishEq { .. }
+            | JitOp::Swap
+            | JitOp::Pop
+            | JitOp::Dup
+            | JitOp::GetScope(_)
+            | JitOp::BailIfError
+            | JitOp::BailIfPerr
+    )
+}
+
+/// A `TAG_BOXED_DOUBLE` box's top 16 bits (`BOX_MARK | 6 << 48`, core `value.rs`): a `Number` whose
+/// f64 bits collide with the box space, so the exact bits live in a `Gc<f64>` whose address IS the
+/// payload (`Value::packed_f64` derefs it directly). No inline f64 can collide with this pattern —
+/// a colliding double is precisely what gets heap-boxed.
+const BOXED_DOUBLE_MARK: u64 = 0xFFFE_0000_0000_0000;
+/// The low 48 payload bits of a boxed `Value` (core `value.rs`'s `PAYLOAD_MASK`).
+const PAYLOAD_MASK: u64 = (1u64 << 48) - 1;
+
+/// Push local `l` (a PROVEN-numeric `Value`) as a native `f64`. Non-throwing in every case (no
+/// `valueOf` runs), so no `BailIfError` is needed after — see [`NumUnbox`].
+fn unbox_to_f64(body: &mut Function, l: u32, kind: NumUnbox) {
+    use Instruction as I;
+    match kind {
+        NumUnbox::Canonical => {
+            body.instruction(&I::LocalGet(l));
+            body.instruction(&I::F64ReinterpretI64);
+        }
+        NumUnbox::Int => {
+            body.instruction(&I::LocalGet(l));
+            body.instruction(&I::I32WrapI64);
+            body.instruction(&I::F64ConvertI32S);
+        }
+        // The boxed-double deref reads LINEAR MEMORY through the payload, which is only the `Gc`
+        // address on **web** (one address space); on native the `Gc` pointer is a host address
+        // unrelated to wasm memory — the same hazard that keeps `mop_emit` web-only. So the real
+        // native runtime routes through the `unop` `COERCE_D` helper (`coerce_to_number` cannot
+        // throw for a proven numeric, and re-packs a canonical `Number` whose bits ARE the f64 —
+        // a NaN's payload may be canonicalized, which no comparison can observe). Under `test` the
+        // INLINE form is emitted instead, so the web bytes are exercised by the unit tests.
+        NumUnbox::AnyNumeric => {
+            #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+            {
+                body.instruction(&I::LocalGet(l));
+                body.instruction(&I::I32Const(crate::helpers::unop_code::COERCE_D));
+                call_helper(body, G_UNOP, TY_UNOP);
+                body.instruction(&I::F64ReinterpretI64);
+            }
+            #[cfg(any(target_arch = "wasm32", test))]
+            {
+                // `int` box? → its payload IS an i32 (exact in f64).
+                body.instruction(&I::LocalGet(l));
+                body.instruction(&I::I64Const(48));
+                body.instruction(&I::I64ShrU);
+                body.instruction(&I::I64Const((VALUE_INT_MARK >> 48) as i64));
+                body.instruction(&I::I64Eq);
+                body.instruction(&I::If(BlockType::Result(ValType::F64)));
+                body.instruction(&I::LocalGet(l));
+                body.instruction(&I::I32WrapI64);
+                body.instruction(&I::F64ConvertI32S);
+                body.instruction(&I::Else);
+                // heap-boxed colliding NaN? → deref the payload (`*const f64`).
+                body.instruction(&I::LocalGet(l));
+                body.instruction(&I::I64Const(48));
+                body.instruction(&I::I64ShrU);
+                body.instruction(&I::I64Const((BOXED_DOUBLE_MARK >> 48) as i64));
+                body.instruction(&I::I64Eq);
+                body.instruction(&I::If(BlockType::Result(ValType::F64)));
+                body.instruction(&I::LocalGet(l));
+                body.instruction(&I::I64Const(PAYLOAD_MASK as i64));
+                body.instruction(&I::I64And);
+                body.instruction(&I::I32WrapI64);
+                body.instruction(&I::F64Load(mem_arg(0, 3)));
+                body.instruction(&I::Else);
+                // else a canonical inline f64: the bits ARE the double.
+                body.instruction(&I::LocalGet(l));
+                body.instruction(&I::F64ReinterpretI64);
+                body.instruction(&I::End);
+                body.instruction(&I::End);
+            }
+        }
+    }
 }
 
 /// Codegen for the INLINE domainMemory `li*`/`si*`/`lf*`/`sf*` fast path (web only). Shared
@@ -457,26 +642,54 @@ mod mop_emit {
     /// `bits & BOX_MARK == BOX_MARK` (see core `value.rs`).
     const BOX_MARK: i64 = 0xFFF8_0000_0000_0000u64 as i64;
 
-    /// `desc[0] + (addr as i32)` (i32) on the stack — the byte address of the access.
-    fn base_plus_addr(body: &mut Function) {
+    /// (Re)load the descriptor's `base` (`desc[0]`, i32) and `len` (`desc[2]`, i64) into the
+    /// `dm_cache` locals. UNCONDITIONAL (not gated on `P_DM != 0`): when `P_DM == 0` this reads the
+    /// low frame bytes into the locals, but the per-access `P_DM != 0` guard means those garbage
+    /// values are never USED (that access takes the helper). Stack-neutral. See the cache note in
+    /// `compile`. Emitted once at the first MOP of a call-free span; the rest reuse the locals.
+    fn refresh_dm_cache(body: &mut Function, (base_l, len_l): (u32, u32)) {
         body.instruction(&I::LocalGet(P_DM));
         body.instruction(&I::I32WrapI64);
         body.instruction(&I::I32Load(mem_arg(0, 2))); // base = desc[0]
+        body.instruction(&I::LocalSet(base_l));
+        body.instruction(&I::LocalGet(P_DM));
+        body.instruction(&I::I32WrapI64);
+        body.instruction(&I::I64Load32U(mem_arg(8, 2))); // len = desc[2]
+        body.instruction(&I::LocalSet(len_l));
+    }
+
+    /// `base + (addr as i32)` (i32) on the stack — the byte address of the access. `base` is the
+    /// cached local when `dm_cache` is set, else a fresh `desc[0]` load.
+    fn base_plus_addr(body: &mut Function, dm_cache: Option<(u32, u32)>) {
+        match dm_cache {
+            Some((base_l, _)) => body.instruction(&I::LocalGet(base_l)),
+            None => {
+                body.instruction(&I::LocalGet(P_DM));
+                body.instruction(&I::I32WrapI64);
+                body.instruction(&I::I32Load(mem_arg(0, 2))) // base = desc[0]
+            }
+        };
         body.instruction(&I::LocalGet(SCRATCH64));
         body.instruction(&I::I32WrapI64); // addr
         body.instruction(&I::I32Add);
     }
 
-    /// i32 bool: `(addr as u32) + width <= len` (`desc[2]`), in i64 so the add can't overflow.
-    fn in_bounds(body: &mut Function, width: i64) {
+    /// i32 bool: `(addr as u32) + width <= len`, in i64 so the add can't overflow. `len` is the
+    /// cached local when `dm_cache` is set, else a fresh `desc[2]` load.
+    fn in_bounds(body: &mut Function, width: i64, dm_cache: Option<(u32, u32)>) {
         body.instruction(&I::LocalGet(SCRATCH64));
         body.instruction(&I::I64Const(0xFFFF_FFFF));
         body.instruction(&I::I64And); // addr_u32 (zero-extended)
         body.instruction(&I::I64Const(width));
         body.instruction(&I::I64Add);
-        body.instruction(&I::LocalGet(P_DM));
-        body.instruction(&I::I32WrapI64);
-        body.instruction(&I::I64Load32U(mem_arg(8, 2))); // len = desc[2]
+        match dm_cache {
+            Some((_, len_l)) => body.instruction(&I::LocalGet(len_l)),
+            None => {
+                body.instruction(&I::LocalGet(P_DM));
+                body.instruction(&I::I32WrapI64);
+                body.instruction(&I::I64Load32U(mem_arg(8, 2))) // len = desc[2]
+            }
+        };
         body.instruction(&I::I64LeU);
     }
 
@@ -512,7 +725,16 @@ mod mop_emit {
     }
 
     /// Emit the inline for `MopLoad(code)`. `false` (no inline) for sxi* (no memory access).
-    pub fn load(body: &mut Function, code: i32) -> bool {
+    /// `addr_int` = the address operand is a PROVEN `Int` (typed frame), so its tag check is elided.
+    /// `dm_cache` = the base/len cache locals (used in place of `desc[0]`/`desc[2]` loads); `refresh`
+    /// = this is the first MOP of a call-free span, so (re)load those locals first.
+    pub fn load(
+        body: &mut Function,
+        code: i32,
+        addr_int: bool,
+        dm_cache: Option<(u32, u32)>,
+        refresh: bool,
+    ) -> bool {
         let width: i64 = match code {
             mc::LI8 => 1,
             mc::LI16 => 2,
@@ -521,18 +743,26 @@ mod mop_emit {
             _ => return false,
         };
         body.instruction(&I::LocalSet(SCRATCH64)); // address value
-        // outer guard: (addr is int) & (P_DM != 0).
-        body.instruction(&I::LocalGet(SCRATCH64));
-        body.instruction(&I::I64Const(48));
-        body.instruction(&I::I64ShrU);
-        body.instruction(&I::I64Const(0xFFFB));
-        body.instruction(&I::I64Eq);
+        if refresh {
+            refresh_dm_cache(body, dm_cache.expect("refresh implies a cache"));
+        }
+        // outer guard: (addr is int) & (P_DM != 0). `addr_int` ⇒ the address is a proven `Int`
+        // box, so skip the tag check — just `P_DM != 0`.
+        if !addr_int {
+            body.instruction(&I::LocalGet(SCRATCH64));
+            body.instruction(&I::I64Const(48));
+            body.instruction(&I::I64ShrU);
+            body.instruction(&I::I64Const(0xFFFB));
+            body.instruction(&I::I64Eq);
+        }
         body.instruction(&I::LocalGet(P_DM));
         body.instruction(&I::I64Eqz);
         body.instruction(&I::I32Eqz);
-        body.instruction(&I::I32And);
+        if !addr_int {
+            body.instruction(&I::I32And);
+        }
         body.instruction(&I::If(BlockType::Result(ValType::I64)));
-        in_bounds(body, width);
+        in_bounds(body, width, dm_cache);
         body.instruction(&I::If(BlockType::Result(ValType::I64)));
         match code {
             mc::LI8 | mc::LI16 | mc::LI32 => {
@@ -541,7 +771,7 @@ mod mop_emit {
                     mc::LI16 => I::I32Load16U(mem_arg(0, 0)),
                     _ => I::I32Load(mem_arg(0, 0)),
                 };
-                base_plus_addr(body);
+                base_plus_addr(body, dm_cache);
                 body.instruction(&loadw);
                 body.instruction(&I::I64ExtendI32U); // payload = value as u32
                 body.instruction(&I::I64Const(VALUE_INT_MARK as i64));
@@ -551,7 +781,7 @@ mod mop_emit {
                 // lf32/lf64: read the f64 bits. A `Number` is stored AS its raw bits unless they
                 // collide with the box space — then the interpreter heap-boxes to preserve the
                 // exact bits (`number_lossless`), which we can't do inline → helper.
-                base_plus_addr(body);
+                base_plus_addr(body, dm_cache);
                 if code == mc::LF32 {
                     body.instruction(&I::F32Load(mem_arg(0, 0)));
                     body.instruction(&I::F64PromoteF32);
@@ -581,7 +811,15 @@ mod mop_emit {
     }
 
     /// Emit the inline for `MopStore(code)`. `false` for sxi*/unknown codes.
-    pub fn store(body: &mut Function, code: i32) -> bool {
+    /// `addr_int` = the address operand is a PROVEN `Int` (typed frame), so its tag check is elided.
+    /// `dm_cache`/`refresh`: see [`load`].
+    pub fn store(
+        body: &mut Function,
+        code: i32,
+        addr_int: bool,
+        dm_cache: Option<(u32, u32)>,
+        refresh: bool,
+    ) -> bool {
         let width: i64 = match code {
             mc::SI8 => 1,
             mc::SI16 => 2,
@@ -592,12 +830,19 @@ mod mop_emit {
         let is_float = matches!(code, mc::SF32 | mc::SF64);
         body.instruction(&I::LocalSet(SCRATCH64)); // address (top)
         body.instruction(&I::LocalSet(SCRATCH64_B)); // value
+        if refresh {
+            refresh_dm_cache(body, dm_cache.expect("refresh implies a cache"));
+        }
         // outer guard: (addr int) & (value: int, or any numeric for float stores) & (P_DM != 0).
-        body.instruction(&I::LocalGet(SCRATCH64));
-        body.instruction(&I::I64Const(48));
-        body.instruction(&I::I64ShrU);
-        body.instruction(&I::I64Const(0xFFFB));
-        body.instruction(&I::I64Eq); // addr int
+        // `addr_int` ⇒ the address is a proven `Int` box → skip its tag check (and the addr∧value
+        // combine below); the guard becomes `value_ok & P_DM != 0`.
+        if !addr_int {
+            body.instruction(&I::LocalGet(SCRATCH64));
+            body.instruction(&I::I64Const(48));
+            body.instruction(&I::I64ShrU);
+            body.instruction(&I::I64Const(0xFFFB));
+            body.instruction(&I::I64Eq); // addr int
+        }
         body.instruction(&I::LocalGet(SCRATCH64_B));
         body.instruction(&I::I64Const(48));
         body.instruction(&I::I64ShrU);
@@ -611,15 +856,17 @@ mod mop_emit {
             body.instruction(&I::I64Ne); // OR value is inline double
             body.instruction(&I::I32Or);
         }
-        body.instruction(&I::I32And);
+        if !addr_int {
+            body.instruction(&I::I32And); // addr_int AND value_ok
+        }
         body.instruction(&I::LocalGet(P_DM));
         body.instruction(&I::I64Eqz);
         body.instruction(&I::I32Eqz);
         body.instruction(&I::I32And);
         body.instruction(&I::If(BlockType::Result(ValType::I64)));
-        in_bounds(body, width);
+        in_bounds(body, width, dm_cache);
         body.instruction(&I::If(BlockType::Result(ValType::I64)));
-        base_plus_addr(body); // store address (base+addr)
+        base_plus_addr(body, dm_cache); // store address (base+addr)
         if is_float {
             value_as_f64(body);
             if code == mc::SF32 {
@@ -809,6 +1056,105 @@ fn emit_inwasm_call_ic(
     body.instruction(&I::End); // end is-object If
 }
 
+/// §8 TAIL-call variant of [`emit_inwasm_call_ic`] for a call in tail position (`return foo()`).
+/// EVERY path is a terminator: the in-WASM hit `return_call_indirect`s the callee (replacing this
+/// frame — via `jit_tail_enter`, which reuses this frame + swaps ctx without saving), and every
+/// fallback runs the Rust helper then `Return`s its result (a SENTINEL propagates the error just as
+/// a following `BailIfError; ReturnValue` would). No `jit_leave` — control never comes back here.
+#[cfg(any(target_arch = "wasm32", test))]
+fn emit_inwasm_tail_call_ic(
+    body: &mut Function,
+    ic_addr: u64,
+    key: i64,
+    fallback_global: u32,
+    argc: u32,
+    vt_off: u64,
+) {
+    use Instruction as I;
+    let ic32 = ic_addr as i32;
+    let us = core::mem::size_of::<usize>() as u64;
+
+    // Rust call-IC fallback (reads args from scratch), then RETURN its result.
+    let emit_fallback_return = |body: &mut Function| {
+        body.instruction(&I::LocalGet(SCRATCH64)); // receiver
+        body.instruction(&I::I64Const(key));
+        body.instruction(&I::LocalGet(P_ARGS));
+        body.instruction(&I::I64ExtendI32U);
+        body.instruction(&I::I64Const((CALL_SCRATCH_SLOT as i64) * 8));
+        body.instruction(&I::I64Add);
+        body.instruction(&I::I64Const(argc as i64));
+        body.instruction(&I::I64Const(ic_addr as i64));
+        call_helper(body, fallback_global, TY_CALL_IC);
+        body.instruction(&I::Return);
+    };
+
+    // Is the receiver an object? (tag == 0xFFFD in the top 16 bits.)
+    body.instruction(&I::LocalTee(SCRATCH64));
+    body.instruction(&I::I64Const(48));
+    body.instruction(&I::I64ShrU);
+    body.instruction(&I::I64Const(0xFFFD));
+    body.instruction(&I::I64Eq);
+    body.instruction(&I::If(BlockType::Empty));
+    // (receiver.vtable == cell.vtable) && (cell.run_idx != 0)?
+    body.instruction(&I::LocalGet(SCRATCH64));
+    body.instruction(&I::I32WrapI64);
+    body.instruction(&I::I32Load(mem_arg(vt_off, 2)));
+    body.instruction(&I::I32Const(ic32));
+    body.instruction(&I::I32Load(mem_arg(0, 2)));
+    body.instruction(&I::I32Eq);
+    body.instruction(&I::I32Const(ic32));
+    body.instruction(&I::I32Load(mem_arg(3 * us, 2))); // cell.run_idx
+    body.instruction(&I::I32Const(0));
+    body.instruction(&I::I32Ne);
+    body.instruction(&I::I32And);
+    body.instruction(&I::If(BlockType::Empty));
+    // `jit_tail_enter(env, fm, args_off, argc) -> 0|1`: replace this frame with the callee's (0 ⇒
+    // scope-callee/type-mismatch → fall back). `args_off` = this frame's outgoing scratch.
+    body.instruction(&I::I32Const(ic32));
+    body.instruction(&I::I32Load(mem_arg(2 * us, 2))); // cell.env
+    body.instruction(&I::I64ExtendI32U);
+    body.instruction(&I::I32Const(ic32));
+    body.instruction(&I::I32Load(mem_arg(us, 2))); // cell.fm
+    body.instruction(&I::I64ExtendI32U);
+    body.instruction(&I::LocalGet(P_ARGS));
+    body.instruction(&I::I64ExtendI32U);
+    body.instruction(&I::I64Const((CALL_SCRATCH_SLOT as i64) * 8));
+    body.instruction(&I::I64Add);
+    body.instruction(&I::I64Const(argc as i64));
+    call_helper(body, G_JIT_TAIL_ENTER, TY_CP);
+    body.instruction(&I::I64Const(0));
+    body.instruction(&I::I64Ne); // tail-entered?
+    body.instruction(&I::If(BlockType::Empty));
+    // Entered: write `[this, args]` into THIS frame (`P_ARGS` — the callee reuses it), then tail
+    // into `run`. Args come from the outgoing scratch (`>= CALL_SCRATCH_SLOT`), dest is `< 256` →
+    // no overlap. `this` at slot 0, arg{k} at slot 1+k.
+    for k in 0..argc {
+        body.instruction(&I::LocalGet(P_ARGS)); // dest base = P_ARGS (i32 addr)
+        body.instruction(&I::LocalGet(P_ARGS));
+        body.instruction(&I::I64Load(slot(CALL_SCRATCH_SLOT + k))); // arg k from scratch
+        body.instruction(&I::I64Store(mem_arg(8 + (k as u64) * 8, 3)));
+    }
+    body.instruction(&I::LocalGet(P_ARGS));
+    body.instruction(&I::LocalGet(SCRATCH64)); // receiver = callee's `this`
+    body.instruction(&I::I64Store(mem_arg(0, 3)));
+    // return_call_indirect run(0, argc, P_ARGS) — the callee's result becomes OUR return.
+    body.instruction(&I::I32Const(0)); // env
+    body.instruction(&I::I32Const(argc as i32));
+    body.instruction(&I::LocalGet(P_ARGS)); // args_off = P_ARGS
+    body.instruction(&I::I32Const(ic32));
+    body.instruction(&I::I32Load(mem_arg(3 * us, 2))); // run_idx (table index)
+    body.instruction(&I::ReturnCallIndirect { type_index: 0, table_index: T_HELPERS });
+    body.instruction(&I::Else);
+    emit_fallback_return(body); // jit_tail_enter declined (scope callee / type mismatch)
+    body.instruction(&I::End);
+    body.instruction(&I::Else);
+    emit_fallback_return(body); // vtable / run_idx miss
+    body.instruction(&I::End);
+    body.instruction(&I::Else);
+    emit_fallback_return(body); // non-object receiver
+    body.instruction(&I::End);
+}
+
 /// Native call-IC emission for `callproperty`/`callmethod`: the Rust `call_prop_ic`/
 /// `call_method_ic` helper (`key` = `mn_ptr`/`disp_id`), reading args from this frame's scratch.
 /// Native has no shared table to `call_indirect` a callee through (each method is its own wasmtime
@@ -835,6 +1181,28 @@ fn emit_call_ic_native(body: &mut Function, key: i64, global: u32, argc: u32, ic
     call_helper(body, global, TY_CALL_IC);
 }
 
+/// Native emission of a TAIL call-IC (native has no shared table, so no `return_call` — the helper
+/// runs and its result is `Return`ed). Under the unit-test force flag, emits the web
+/// [`emit_inwasm_tail_call_ic`] shape instead, so `WtModule::new` validates the exact tail bytes.
+#[cfg(not(target_arch = "wasm32"))]
+fn emit_tail_call_ic_native(body: &mut Function, key: i64, global: u32, argc: u32, ic_addr: u64) {
+    use Instruction as I;
+    #[cfg(test)]
+    if test_force_inwasm_call_ic() {
+        emit_inwasm_tail_call_ic(body, ic_addr, key, global, argc, 0);
+        return;
+    }
+    body.instruction(&I::I64Const(key));
+    body.instruction(&I::LocalGet(P_ARGS));
+    body.instruction(&I::I64ExtendI32U);
+    body.instruction(&I::I64Const((CALL_SCRATCH_SLOT as i64) * 8));
+    body.instruction(&I::I64Add);
+    body.instruction(&I::I64Const(argc as i64));
+    body.instruction(&I::I64Const(ic_addr as i64));
+    call_helper(body, global, TY_CALL_IC);
+    body.instruction(&I::Return);
+}
+
 /// Unit-test toggle: force the native call-IC emission to use the web in-WASM shape (see
 /// [`emit_call_ic_native`]). Off by default; a test sets it around a `compile()` call.
 #[cfg(all(not(target_arch = "wasm32"), test))]
@@ -856,6 +1224,12 @@ pub fn compile(
     num_locals: usize,
     promoted: &[Promotion],
     undefined_init: &[u32],
+    // The AVM2 method's name, emitted into a wasm `name` custom section. Without it EVERY
+    // generated module's function is anonymous — `wasm-function[0]` in a browser profile,
+    // `wasm[0]::function[0]` in a `perf` map — so a profiler merges all ~1100 compiled methods
+    // into ONE symbol, which is exactly the blind spot that made the JIT unprofilable. Costs a
+    // few dozen bytes per module and nothing is shipped (these are built at runtime).
+    name: &str,
 ) -> Option<Vec<u8>> {
     if num_locals > CALL_SCRATCH_SLOT as usize {
         return None; // locals would overlap the outgoing call-arg scratch
@@ -977,6 +1351,7 @@ pub fn compile(
     imports.import("env", "callmethodic_i", idx_global);
     imports.import("env", "jitenter_i", idx_global);
     imports.import("env", "jitleave_i", idx_global);
+    imports.import("env", "jittailenter_i", idx_global);
     imports.import(
         "env",
         "memory",
@@ -1007,23 +1382,67 @@ pub fn compile(
     // starts at `SPILL_BASE + max_spill`, and the i32 group right after it.
     let max_spill = blocks.iter().map(|b| b.entry_depth).max().unwrap_or(0) as u32;
     let n_f64 = promoted.iter().filter(|p| p.kind == RegKind::F64).count() as u32;
-    let n_i32 = promoted.iter().filter(|p| p.kind != RegKind::F64).count() as u32;
+    let n_boxed = promoted.iter().filter(|p| p.kind == RegKind::BoxedI64).count() as u32;
+    let n_i32 = promoted.len() as u32 - n_f64 - n_boxed;
     let f64_base = SPILL_BASE + max_spill;
     let i32_base = f64_base + n_f64;
+    let boxed_base = i32_base + n_i32;
+    // getscopeobject(i) CSE: `getscopeobject i` reads `scope_stack[scope_base + i]`. With NO
+    // `popscope` in the body the scope stack only GROWS, so every already-valid index is a per-run
+    // constant — cache each low index lazily in a local (`0` = not yet fetched; a scope is always
+    // an object/undefined, never the `0` bits) and reuse: the repeated `get_scope` helper call (the
+    // top Lua/FlasCC helper — the hot index is 1, called 100s of times/method) collapses to a
+    // branch + load. `scope_cache[i] = Some(local)` for a cached index; `None` = keep the helper.
+    let has_popscope = blocks.iter().flat_map(|b| &b.ops).any(|op| matches!(op, JitOp::ScopePop));
+    let mut scope_cache = [None; SCOPE_CACHE_N];
+    let mut n_scope_locals = 0u32;
+    if !has_popscope {
+        let cache_base = boxed_base + n_boxed;
+        for i in 0..SCOPE_CACHE_N as u32 {
+            if blocks.iter().flat_map(|b| &b.ops).any(|op| matches!(op, JitOp::GetScope(idx) if *idx == i)) {
+                scope_cache[i as usize] = Some(cache_base + n_scope_locals);
+                n_scope_locals += 1;
+            }
+        }
+    }
+    // Inline-domainMemory base/len coalescing (web): the descriptor cell's `base` (`desc[0]`) and
+    // `len` (`desc[2]`) are loop-invariant across a call-free straight-line span — but the wasm
+    // engine can't hoist them past a MOP *store* (both are linear-memory accesses it must assume
+    // alias). So cache them in two locals, (re)loaded lazily at the first MOP of a valid span and
+    // reused by the rest; any op that could GROW/REASSIGN domainMemory (see `mop_cache_survives`),
+    // or a block boundary, invalidates the span → the next MOP reloads. Sound: growth/reassignment
+    // only happen via AS3 reentry, which those ops gate.
+    #[cfg(target_arch = "wasm32")]
+    let has_inline_mop = blocks.iter().flat_map(|b| &b.ops).any(is_inline_mop);
+    #[cfg(not(target_arch = "wasm32"))]
+    let has_inline_mop = false;
+    let n_dm_cache = u32::from(has_inline_mop);
+    // L_DM_LEN (i64) then L_DM_BASE (i32), after the scope-cache locals.
+    let dm_len_local = boxed_base + n_boxed + n_scope_locals;
+    let dm_base_local = dm_len_local + n_dm_cache;
+    let dm_cache = if has_inline_mop { Some((dm_base_local, dm_len_local)) } else { None };
     // `promote[local_i] = Some((wasm register index, kind))` for a promoted local, else `None`.
     // Read by `emit_op`'s `GetLocal`/`SetLocal` to use the register instead of `i64.load`/`store`.
     // `Int`/`Bool` share the i32 declaration group (indexed after the f64 group).
     let mut promote: Vec<Option<(u32, RegKind)>> = vec![None; num_locals];
-    let (mut f64_rank, mut i32_rank) = (0u32, 0u32);
+    let (mut f64_rank, mut i32_rank, mut boxed_rank) = (0u32, 0u32, 0u32);
     for p in promoted {
-        let idx = if p.kind == RegKind::F64 {
-            let r = f64_base + f64_rank;
-            f64_rank += 1;
-            r
-        } else {
-            let r = i32_base + i32_rank;
-            i32_rank += 1;
-            r
+        let idx = match p.kind {
+            RegKind::F64 => {
+                let r = f64_base + f64_rank;
+                f64_rank += 1;
+                r
+            }
+            RegKind::BoxedI64 => {
+                let r = boxed_base + boxed_rank;
+                boxed_rank += 1;
+                r
+            }
+            RegKind::IntI32 | RegKind::BoolI32 => {
+                let r = i32_base + i32_rank;
+                i32_rank += 1;
+                r
+            }
         };
         if let Some(slot) = promote.get_mut(p.local as usize) {
             *slot = Some((idx, p.kind));
@@ -1035,6 +1454,10 @@ pub fn compile(
         (1u32 + max_spill, ValType::I64),
         (n_f64, ValType::F64),
         (n_i32, ValType::I32),
+        (n_boxed, ValType::I64), // BoxedI64 registers — the box verbatim, no conversion
+        (n_scope_locals, ValType::I64), // getscopeobject(i) CSE cache locals (one per cached index)
+        (n_dm_cache, ValType::I64),      // L_DM_LEN — inline domainMemory `len` cache
+        (n_dm_cache, ValType::I32),      // L_DM_BASE — inline domainMemory `base` cache
     ];
     let mut body = Function::new(local_decls);
     // Prologue: a promoted typed PARAM (`init_from_frame`) is loaded from the frame ONCE into its
@@ -1047,11 +1470,11 @@ pub fn compile(
             let (idx, kind) = promote[p.local as usize].unwrap();
             body.instruction(&Instruction::LocalGet(P_ARGS));
             body.instruction(&Instruction::I64Load(slot(p.local)));
-            if kind == RegKind::F64 {
-                body.instruction(&Instruction::F64ReinterpretI64);
-            } else {
-                body.instruction(&Instruction::I32WrapI64);
-            }
+            match kind {
+                RegKind::F64 => body.instruction(&Instruction::F64ReinterpretI64),
+                RegKind::BoxedI64 => &mut body, // the box IS the register's value
+                RegKind::IntI32 | RegKind::BoolI32 => body.instruction(&Instruction::I32WrapI64),
+            };
             body.instruction(&Instruction::LocalSet(idx));
         }
     }
@@ -1069,18 +1492,23 @@ pub fn compile(
     // inline reads base+len from the cell on each access). Web only — native keeps the helper,
     // so the reifying `dm_desc_ptr` call is elided there (`P_DM` stays 0, inline is cfg'd out).
     #[cfg(target_arch = "wasm32")]
-    if blocks.iter().flat_map(|b| &b.ops).any(is_inline_mop) {
+    if has_inline_mop {
         call_helper(&mut body, G_DMDESC, TY_DMDESC);
         body.instruction(&Instruction::LocalSet(P_DM));
     }
     // Single straight-line block (ending in a return) → emit its ops directly. Otherwise
     // (branches/loops) → a `br_table` dispatch loop over the basic blocks.
     if blocks.len() == 1 && matches!(blocks[0].term, Term::Return) {
+        // `dm_valid` = the inline-domainMemory base/len cache is live (false at block start).
+        let mut dm_valid = false;
         for &op in &blocks[0].ops {
-            emit_op(&mut body, op, &promote)?;
+            emit_op(&mut body, op, &promote, &scope_cache, dm_cache, &mut dm_valid)?;
         }
+    } else if let Some(nodes) = crate::cfg::structure(blocks) {
+        // Structured control flow (the common case): every edge is a direct `br` or is gone.
+        emit_structured(&mut body, &nodes, blocks, &promote, &scope_cache, dm_cache, &mut Vec::new())?;
     } else {
-        emit_dispatch(&mut body, blocks, &promote)?;
+        emit_dispatch(&mut body, blocks, &promote, &scope_cache, dm_cache)?;
     }
     // Fallthrough guard: yield `undefined` so the function is always valid and total (for
     // the dispatch loop this is unreachable, but it keeps the function well-typed).
@@ -1091,13 +1519,35 @@ pub fn compile(
     code.function(&body);
     module.section(&code);
 
+    // Name the one defined function after the AVM2 method, so profilers can attribute per method.
+    let mut names = NameSection::new();
+    names.module(name);
+    let mut fnames = NameMap::new();
+    fnames.append(F_RUN, name);
+    names.functions(&fnames);
+    module.section(&names);
+
     Some(module.finish())
 }
 
-fn emit_op(body: &mut Function, op: JitOp, promote: &[Option<(u32, RegKind)>]) -> Option<()> {
+fn emit_op(
+    body: &mut Function,
+    op: JitOp,
+    promote: &[Option<(u32, RegKind)>],
+    scope_cache: &[Option<u32>; SCOPE_CACHE_N],
+    dm_cache: Option<(u32, u32)>,
+    dm_valid: &mut bool,
+) -> Option<()> {
     use Instruction as I;
     #[cfg(target_arch = "wasm32")]
     use crate::helpers::mop_code as mc;
+    // Any op that could grow/reassign domainMemory ends the inline base/len cache span (the MOP
+    // arms below refresh + re-validate it). Checked here so no arm can forget; sound because the
+    // whitelist admits only provably-domainMemory-inert ops.
+    #[cfg(target_arch = "wasm32")]
+    if !mop_cache_survives(&op) {
+        *dm_valid = false;
+    }
     match op {
         JitOp::GetLocal(i) => {
             // Promoted: read the register and RE-BOX. F64 → the canonical `Number`'s box bits ARE
@@ -1106,6 +1556,10 @@ fn emit_op(body: &mut Function, op: JitOp, promote: &[Option<(u32, RegKind)>]) -
                 Some(&Some((reg, RegKind::F64))) => {
                     body.instruction(&I::LocalGet(reg));
                     body.instruction(&I::I64ReinterpretF64);
+                }
+                // The register already holds the box — nothing to re-apply.
+                Some(&Some((reg, RegKind::BoxedI64))) => {
+                    body.instruction(&I::LocalGet(reg));
                 }
                 Some(&Some((reg, kind))) => {
                     let mark = if kind == RegKind::BoolI32 {
@@ -1131,6 +1585,10 @@ fn emit_op(body: &mut Function, op: JitOp, promote: &[Option<(u32, RegKind)>]) -
             match promote.get(i as usize) {
                 Some(&Some((reg, RegKind::F64))) => {
                     body.instruction(&I::F64ReinterpretI64);
+                    body.instruction(&I::LocalSet(reg));
+                }
+                // Store the box verbatim — this is the whole point of `BoxedI64`.
+                Some(&Some((reg, RegKind::BoxedI64))) => {
                     body.instruction(&I::LocalSet(reg));
                 }
                 Some(&Some((reg, _))) => {
@@ -1344,6 +1802,74 @@ fn emit_op(body: &mut Function, op: JitOp, promote: &[Option<(u32, RegKind)>]) -
                 }
             }
         }
+        JitOp::TailCallProperty(mn_ptr, argc) => {
+            // Tail `return receiver.f(args)`: store args to scratch (as `CallProperty`), then a
+            // call whose result becomes THIS method's return. Every path is a terminator.
+            for i in (0..argc).rev() {
+                body.instruction(&I::LocalSet(SCRATCH64));
+                body.instruction(&I::LocalGet(P_ARGS));
+                body.instruction(&I::LocalGet(SCRATCH64));
+                body.instruction(&I::I64Store(slot(CALL_SCRATCH_SLOT + i)));
+            }
+            match next_call_ic_site() {
+                #[cfg(target_arch = "wasm32")]
+                Some(ic_addr) => emit_inwasm_tail_call_ic(
+                    body,
+                    ic_addr,
+                    mn_ptr as i64,
+                    G_CALL_IC,
+                    argc,
+                    vtable_offset() as u64,
+                ),
+                #[cfg(not(target_arch = "wasm32"))]
+                Some(ic_addr) => {
+                    emit_tail_call_ic_native(body, mn_ptr as i64, G_CALL_IC, argc, ic_addr)
+                }
+                None => {
+                    body.instruction(&I::I64Const(mn_ptr as i64));
+                    body.instruction(&I::LocalGet(P_ARGS));
+                    body.instruction(&I::I64ExtendI32U);
+                    body.instruction(&I::I64Const((CALL_SCRATCH_SLOT as i64) * 8));
+                    body.instruction(&I::I64Add);
+                    body.instruction(&I::I64Const(argc as i64));
+                    call_helper(body, G_CP, TY_CP);
+                    body.instruction(&I::Return);
+                }
+            }
+        }
+        JitOp::TailCallMethod(disp_id, argc) => {
+            for i in (0..argc).rev() {
+                body.instruction(&I::LocalSet(SCRATCH64));
+                body.instruction(&I::LocalGet(P_ARGS));
+                body.instruction(&I::LocalGet(SCRATCH64));
+                body.instruction(&I::I64Store(slot(CALL_SCRATCH_SLOT + i)));
+            }
+            match next_call_ic_site() {
+                #[cfg(target_arch = "wasm32")]
+                Some(ic_addr) => emit_inwasm_tail_call_ic(
+                    body,
+                    ic_addr,
+                    disp_id as i64,
+                    G_CALL_METHOD_IC,
+                    argc,
+                    vtable_offset() as u64,
+                ),
+                #[cfg(not(target_arch = "wasm32"))]
+                Some(ic_addr) => {
+                    emit_tail_call_ic_native(body, disp_id as i64, G_CALL_METHOD_IC, argc, ic_addr)
+                }
+                None => {
+                    body.instruction(&I::I32Const(disp_id as i32));
+                    body.instruction(&I::LocalGet(P_ARGS));
+                    body.instruction(&I::I64ExtendI32U);
+                    body.instruction(&I::I64Const((CALL_SCRATCH_SLOT as i64) * 8));
+                    body.instruction(&I::I64Add);
+                    body.instruction(&I::I32Const(argc as i32));
+                    call_helper(body, G_CALLMETHOD, TY_CALLMETHOD);
+                    body.instruction(&I::Return);
+                }
+            }
+        }
         JitOp::NewArray(argc) => {
             // Store the `argc` elements to the outgoing scratch, then `new_array(off, argc)`.
             for i in (0..argc).rev() {
@@ -1394,8 +1920,26 @@ fn emit_op(body: &mut Function, op: JitOp, promote: &[Option<(u32, RegKind)>]) -
             call_helper(body, G_POPSCOPE, TY_VOID);
         }
         JitOp::GetScope(index) => {
-            body.instruction(&I::I32Const(index as i32));
-            call_helper(body, G_GETSCOPE, TY_I32_I64);
+            match scope_cache.get(index as usize).copied().flatten() {
+                // Cached getscopeobject(i): `if L == 0 { L = get_scope(i) }; L`. First read fetches +
+                // caches (a scope is never the `0` bits); the rest are a branch + load, skipping the
+                // helper. Sound only under no-`popscope` (index invariant per run) — see `compile`.
+                Some(l) => {
+                    body.instruction(&I::LocalGet(l));
+                    body.instruction(&I::I64Eqz);
+                    body.instruction(&I::If(BlockType::Result(ValType::I64)));
+                    body.instruction(&I::I32Const(index as i32));
+                    call_helper(body, G_GETSCOPE, TY_I32_I64);
+                    body.instruction(&I::LocalTee(l));
+                    body.instruction(&I::Else);
+                    body.instruction(&I::LocalGet(l));
+                    body.instruction(&I::End);
+                }
+                None => {
+                    body.instruction(&I::I32Const(index as i32));
+                    call_helper(body, G_GETSCOPE, TY_I32_I64);
+                }
+            }
         }
         JitOp::In => {
             // Stack: [.., name, value]. `op_in(name, value)` → Boolean.
@@ -1512,7 +2056,7 @@ fn emit_op(body: &mut Function, op: JitOp, promote: &[Option<(u32, RegKind)>]) -
             call_helper(body, G_THROW, TY_PTR1);
             body.instruction(&I::Return);
         }
-        JitOp::MopLoad(code) => {
+        JitOp::MopLoad(code, addr_int) => {
             // Stack: [.., address]. INLINE (web) domainMemory reads: integer (`li8/16/32`) and
             // float (`lf32/64`). When the address is a packed int, domainMemory is shareable
             // (`P_DM != 0`), and `addr + width <= len` (read from the descriptor cell), read the
@@ -1520,24 +2064,42 @@ fn emit_op(body: &mut Function, op: JitOp, promote: &[Option<(u32, RegKind)>]) -
             // collide with the box space bails to the helper (it heap-boxes). Any guard failing
             // (incl. OOB → the helper's #1506) takes `mop_load`. sxi* + native always helper.
             #[cfg(target_arch = "wasm32")]
-            let inlined = mop_emit::load(body, code);
+            let inlined = {
+                let refresh = dm_cache.is_some() && !*dm_valid;
+                if dm_cache.is_some() {
+                    *dm_valid = true;
+                }
+                mop_emit::load(body, code, addr_int, dm_cache, refresh)
+            };
             #[cfg(not(target_arch = "wasm32"))]
-            let inlined = false;
+            let inlined = {
+                let _ = (addr_int, dm_cache, &dm_valid);
+                false
+            };
             if !inlined {
                 body.instruction(&I::I32Const(code));
                 call_helper(body, G_MOPLOAD, TY_UNOP); // (i64,i32)->i64
             }
         }
-        JitOp::MopStore(code) => {
+        JitOp::MopStore(code, addr_int) => {
             // Stack: [.., value, address]. INLINE (web) domainMemory writes: integer
             // (`si8/16/32`, value must be a packed int) and float (`sf32/64`, value must be
             // numeric). When domainMemory is shareable and `addr + width <= len`, store the low
             // `width` bytes at `base + addr`; leave `undefined` (matching the helper's discarded
             // result). Any guard failing takes `mop_store` (which coerces / throws #1506).
             #[cfg(target_arch = "wasm32")]
-            let inlined = mop_emit::store(body, code);
+            let inlined = {
+                let refresh = dm_cache.is_some() && !*dm_valid;
+                if dm_cache.is_some() {
+                    *dm_valid = true;
+                }
+                mop_emit::store(body, code, addr_int, dm_cache, refresh)
+            };
             #[cfg(not(target_arch = "wasm32"))]
-            let inlined = false;
+            let inlined = {
+                let _ = (addr_int, dm_cache, &dm_valid);
+                false
+            };
             if !inlined {
                 body.instruction(&I::I32Const(code));
                 call_helper(body, G_MOPSTORE, TY_BINOP); // (i64,i64,i32)->i64
@@ -1960,9 +2522,40 @@ fn emit_op(body: &mut Function, op: JitOp, promote: &[Option<(u32, RegKind)>]) -
                 }
             }
         }
-        JitOp::BinOpNum(code) => {
-            // Stack: [.., a, b] — both PROVEN canonical inline `f64`s (translate's repr
-            // analysis). The unguarded core of `BinOp`'s f64 fast path: reinterpret, compute,
+        JitOp::BinOpInt(code) => {
+            // Stack: [.., a, b] — both PROVEN `Int` boxes. Unbox exactly (`i32.wrap` — the box's
+            // low 32 bits ARE the payload), compute natively, re-box as `Int`. wasm's shifts mask
+            // the count to 5 bits and its i32 arithmetic wraps, matching the interpreter's
+            // `& 0x1F` / `wrapping_*` exactly. No guard, no helper, no `BailIfError`.
+            use crate::helpers::binop_code as bc;
+            let iop = match code {
+                bc::ADD_I => I::I32Add,
+                bc::SUBTRACT_I => I::I32Sub,
+                bc::MULTIPLY_I => I::I32Mul,
+                bc::BITAND => I::I32And,
+                bc::BITOR => I::I32Or,
+                bc::BITXOR => I::I32Xor,
+                bc::LSHIFT => I::I32Shl,
+                bc::RSHIFT => I::I32ShrS,
+                // Sound only under translate's known-non-zero-shift proof (see the variant doc):
+                // the `u32` result is then < 2^31, so `i64.extend_i32_u` re-boxes it as an `int`.
+                bc::URSHIFT => I::I32ShrU,
+                _ => return None, // translate emits `BinOpInt` only for these
+            };
+            body.instruction(&I::LocalSet(SCRATCH64)); // b (top)
+            body.instruction(&I::LocalSet(SCRATCH64_B)); // a
+            body.instruction(&I::LocalGet(SCRATCH64_B));
+            body.instruction(&I::I32WrapI64);
+            body.instruction(&I::LocalGet(SCRATCH64));
+            body.instruction(&I::I32WrapI64);
+            body.instruction(&iop);
+            body.instruction(&I::I64ExtendI32U); // payload = result as u32
+            body.instruction(&I::I64Const(VALUE_INT_MARK as i64));
+            body.instruction(&I::I64Or); // re-box as an `int`
+        }
+        JitOp::BinOpNum { code, a, b } => {
+            // Stack: [.., a, b] — both PROVEN numeric (translate's repr analysis). The unguarded
+            // core of `BinOp`'s f64 fast path: unbox each per its proven repr, compute,
             // canonicalize a box-colliding NaN result. No guard, no helper, no `BailIfError`.
             use crate::helpers::binop_code as bc;
             const BOX_MARK: i64 = 0xFFF8_0000_0000_0000u64 as i64;
@@ -1976,10 +2569,8 @@ fn emit_op(body: &mut Function, op: JitOp, promote: &[Option<(u32, RegKind)>]) -
             };
             body.instruction(&I::LocalSet(SCRATCH64)); // b (top)
             body.instruction(&I::LocalSet(SCRATCH64_B)); // a
-            body.instruction(&I::LocalGet(SCRATCH64_B));
-            body.instruction(&I::F64ReinterpretI64);
-            body.instruction(&I::LocalGet(SCRATCH64));
-            body.instruction(&I::F64ReinterpretI64);
+            unbox_to_f64(body, SCRATCH64_B, a);
+            unbox_to_f64(body, SCRATCH64, b);
             body.instruction(&fop);
             body.instruction(&I::I64ReinterpretF64);
             // Canonicalize a NaN result whose bits alias the box space (see `BinOp`).
@@ -1994,39 +2585,60 @@ fn emit_op(body: &mut Function, op: JitOp, promote: &[Option<(u32, RegKind)>]) -
             body.instruction(&I::LocalGet(SCRATCH64));
             body.instruction(&I::End);
         }
-        JitOp::BinOpCmp(code, is_f64) => {
-            // Stack: [.., a, b] — both PROVEN the same numeric repr. Native same-type compare
-            // (unguarded core of `BinOp`'s comparison fast paths) → a `Bool` box. No `BailIfError`.
+        JitOp::BinOpCmp { code, a, b } => {
+            // Stack: [.., a, b] — both PROVEN exactly-unboxable numerics. See the variant doc.
             use crate::helpers::binop_code as bc;
             const BOOL_MARK: i64 = 0xFFFA_0000_0000_0000u64 as i64;
             body.instruction(&I::LocalSet(SCRATCH64)); // b (top)
             body.instruction(&I::LocalSet(SCRATCH64_B)); // a
-            body.instruction(&I::LocalGet(SCRATCH64_B));
-            if is_f64 {
-                body.instruction(&I::F64ReinterpretI64);
-            } else {
+            // Two `Int` boxes compare natively as i32; any other mix goes through f64 (an `Int`
+            // operand converts exactly, so a mixed compare is still the interpreter's answer).
+            let as_i32 = a == NumUnbox::Int && b == NumUnbox::Int;
+            if as_i32 {
+                body.instruction(&I::LocalGet(SCRATCH64_B));
                 body.instruction(&I::I32WrapI64); // Int box → i32 payload
-            }
-            body.instruction(&I::LocalGet(SCRATCH64));
-            if is_f64 {
-                body.instruction(&I::F64ReinterpretI64);
-            } else {
+                body.instruction(&I::LocalGet(SCRATCH64));
                 body.instruction(&I::I32WrapI64);
+            } else {
+                unbox_to_f64(body, SCRATCH64_B, a);
+                unbox_to_f64(body, SCRATCH64, b);
             }
-            let cmp = match (code, is_f64) {
-                (bc::EQUALS, false) | (bc::STRICT_EQUALS, false) => I::I32Eq,
-                (bc::LESS_THAN, false) => I::I32LtS,
-                (bc::LESS_EQUALS, false) => I::I32LeS,
-                (bc::GREATER_THAN, false) => I::I32GtS,
-                (bc::GREATER_EQUALS, false) => I::I32GeS,
-                (bc::EQUALS, true) | (bc::STRICT_EQUALS, true) => I::F64Eq,
-                (bc::LESS_THAN, true) => I::F64Lt,
-                (bc::LESS_EQUALS, true) => I::F64Le,
-                (bc::GREATER_THAN, true) => I::F64Gt,
-                (bc::GREATER_EQUALS, true) => I::F64Ge,
+            let cmp = match (code, as_i32) {
+                (bc::EQUALS, true) | (bc::STRICT_EQUALS, true) => I::I32Eq,
+                (bc::LESS_THAN, true) => I::I32LtS,
+                (bc::LESS_EQUALS, true) => I::I32LeS,
+                (bc::GREATER_THAN, true) => I::I32GtS,
+                (bc::GREATER_EQUALS, true) => I::I32GeS,
+                (bc::EQUALS, false) | (bc::STRICT_EQUALS, false) => I::F64Eq,
+                (bc::LESS_THAN, false) => I::F64Lt,
+                (bc::LESS_EQUALS, false) => I::F64Le,
+                (bc::GREATER_THAN, false) => I::F64Gt,
+                (bc::GREATER_EQUALS, false) => I::F64Ge,
                 _ => return None, // translate emits `BinOpCmp` only for the six comparisons
             };
             body.instruction(&cmp); // → i32 boolean (0/1)
+            body.instruction(&I::I64ExtendI32U);
+            body.instruction(&I::I64Const(BOOL_MARK));
+            body.instruction(&I::I64Or); // Bool box
+        }
+        JitOp::NullishEq { against, loose } => {
+            // Stack: [.., x]. `x ==/=== null|undefined` inline → a `Bool` box. `null`/`undefined`
+            // are only ever `== null` (no coercion of `x`), so this is exact for ANY `x`.
+            const BOOL_MARK: i64 = 0xFFFA_0000_0000_0000u64 as i64;
+            if loose {
+                // (x == NULL) | (x == UNDEFINED)
+                body.instruction(&I::LocalTee(SCRATCH64));
+                body.instruction(&I::I64Const(NULL_BITS as i64));
+                body.instruction(&I::I64Eq);
+                body.instruction(&I::LocalGet(SCRATCH64));
+                body.instruction(&I::I64Const(UNDEFINED_BITS as i64));
+                body.instruction(&I::I64Eq);
+                body.instruction(&I::I32Or);
+            } else {
+                // x === against (the specific null/undefined constant)
+                body.instruction(&I::I64Const(against as i64));
+                body.instruction(&I::I64Eq);
+            }
             body.instruction(&I::I64ExtendI32U);
             body.instruction(&I::I64Const(BOOL_MARK));
             body.instruction(&I::I64Or); // Bool box
@@ -2207,6 +2819,78 @@ fn emit_truthy(body: &mut Function) {
     body.instruction(&I::End);
 }
 
+/// Emits the structured-control-flow tree [`crate::cfg::structure`] rebuilt from the block list —
+/// the replacement for [`emit_dispatch`]'s state machine. `scopes` mirrors the wasm scope stack so
+/// each `Br` resolves to a branch depth; a label that is somehow not in scope declines the method
+/// rather than emitting a wrong jump.
+///
+/// Every block still starts with the inline-domainMemory cache invalidated, exactly as the
+/// dispatch loop did — an inlined block has a single predecessor and could inherit it, but that is
+/// a separate change.
+fn emit_structured(
+    body: &mut Function,
+    nodes: &[crate::cfg::Node],
+    blocks: &[Block],
+    promote: &[Option<(u32, RegKind)>],
+    scope_cache: &[Option<u32>; SCOPE_CACHE_N],
+    dm_cache: Option<(u32, u32)>,
+    scopes: &mut Vec<crate::cfg::Scope>,
+) -> Option<()> {
+    use crate::cfg::{Node, Scope};
+    use Instruction as I;
+    for node in nodes {
+        match node {
+            Node::Block { label, body: inner } => {
+                body.instruction(&I::Block(BlockType::Empty));
+                scopes.push(Scope::Block(*label));
+                emit_structured(body, inner, blocks, promote, scope_cache, dm_cache, scopes)?;
+                scopes.pop();
+                body.instruction(&I::End);
+            }
+            Node::Loop { label, body: inner } => {
+                body.instruction(&I::Loop(BlockType::Empty));
+                scopes.push(Scope::Loop(*label));
+                emit_structured(body, inner, blocks, promote, scope_cache, dm_cache, scopes)?;
+                scopes.pop();
+                body.instruction(&I::End);
+            }
+            Node::Code(b) => {
+                // Reload the values that crossed into this block from its predecessor.
+                for d in 0..blocks[*b].entry_depth {
+                    body.instruction(&I::LocalGet(SPILL_BASE + d as u32));
+                }
+                let mut dm_valid = false;
+                for &op in &blocks[*b].ops {
+                    emit_op(body, op, promote, scope_cache, dm_cache, &mut dm_valid)?;
+                }
+            }
+            Node::Spill(n) => {
+                for d in (0..*n).rev() {
+                    body.instruction(&I::LocalSet(SPILL_BASE + d as u32));
+                }
+            }
+            Node::Br(label) => {
+                body.instruction(&I::Br(crate::cfg::depth_of(scopes, *label)?));
+            }
+            Node::Cond { cross, then, els } => {
+                body.instruction(&I::LocalSet(SCRATCH64)); // pop the condition
+                for d in (0..*cross).rev() {
+                    body.instruction(&I::LocalSet(SPILL_BASE + d as u32));
+                }
+                emit_truthy(body); // SCRATCH64 → an i32 boolean on the stack
+                body.instruction(&I::If(BlockType::Empty));
+                scopes.push(Scope::If);
+                emit_structured(body, then, blocks, promote, scope_cache, dm_cache, scopes)?;
+                body.instruction(&I::Else);
+                emit_structured(body, els, blocks, promote, scope_cache, dm_cache, scopes)?;
+                scopes.pop();
+                body.instruction(&I::End);
+            }
+        }
+    }
+    Some(())
+}
+
 /// Emits the basic-block dispatch loop: a `loop` wrapping nested `block`s, dispatched by a
 /// `br_table` on the `STATE` local (current block index). Each block body runs, then its
 /// terminator sets `STATE` to the successor and `br`s back to the loop (re-dispatch), or the
@@ -2215,7 +2899,13 @@ fn emit_truthy(body: &mut Function) {
 /// Layout (n blocks): `loop { block B0 { … block B_{n-1} { block Bdef {
 /// br_table[B0..B_{n-1}] Bdef } unreachable } <blk n-1> } … <blk 0> } <guard>`. Blocks are
 /// emitted in REVERSE, so at block `k` the enclosing `loop` sits at branch depth `k`.
-fn emit_dispatch(body: &mut Function, blocks: &[Block], promote: &[Option<(u32, RegKind)>]) -> Option<()> {
+fn emit_dispatch(
+    body: &mut Function,
+    blocks: &[Block],
+    promote: &[Option<(u32, RegKind)>],
+    scope_cache: &[Option<u32>; SCOPE_CACHE_N],
+    dm_cache: Option<(u32, u32)>,
+) -> Option<()> {
     use Instruction as I;
     let n = blocks.len();
     if n == 0 {
@@ -2237,8 +2927,11 @@ fn emit_dispatch(body: &mut Function, blocks: &[Block], promote: &[Option<(u32, 
         for d in 0..blocks[k].entry_depth {
             body.instruction(&I::LocalGet(SPILL_BASE + d as u32));
         }
+        // The inline-domainMemory base/len cache never survives a control-flow edge (a block may be
+        // reached from anywhere, incl. after a domainMemory swap) — start each block invalidated.
+        let mut dm_valid = false;
         for &op in &blocks[k].ops {
-            emit_op(body, op, promote)?;
+            emit_op(body, op, promote, scope_cache, dm_cache, &mut dm_valid)?;
         }
         match blocks[k].term {
             Term::Return => {} // the body already emitted a `Return`
@@ -2304,8 +2997,13 @@ mod tests {
 
     /// [`run_blocks`] with an explicit promoted-locals set (Phase 3/4).
     fn run_blocks_p(blocks: Vec<Block>, frame: &[u64], promoted: &[Promotion]) -> u64 {
-        let bytes = compile(&blocks, frame.len(), promoted, &[]).expect("compiles");
-        let engine = Engine::default();
+        let bytes = compile(&blocks, frame.len(), promoted, &[], "test").expect("compiles");
+        // Cranelift with tail calls enabled, so a `return_call_indirect` (the §8 tail-call path)
+        // both VALIDATES and RUNS in these codegen tests. (The web runtime is the real target;
+        // native runtime uses Winch, which never emits/runs the §8 path.)
+        let mut cfg = wasmtime::Config::new();
+        cfg.wasm_tail_call(true);
+        let engine = Engine::new(&cfg).expect("engine");
         let module = WtModule::new(&engine, &bytes).expect("valid module");
         let mut store = Store::new(&engine, ());
         // Test helpers: `gs` returns `obj_bits + slot_id`; `cr` is identity (no coercion).
@@ -2354,7 +3052,10 @@ mod tests {
         // scope-stack stubs: no-ops; `get_scope` echoes the index.
         let pushscope = Func::wrap(&mut store, |_b: i64| {});
         let popscope = Func::wrap(&mut store, || {});
-        let getscope = Func::wrap(&mut store, |i: i32| -> i64 { i as i64 });
+        // Object-tagged (non-zero) so it round-trips through the getscopeobject(0) cache (which
+        // uses `0` = "not yet fetched"): `getscope(i)` = an object Value carrying `i`.
+        let getscope =
+            Func::wrap(&mut store, |i: i32| -> i64 { 0xFFFD_0000_0000_0000u64 as i64 | (i as u32 as i64) });
         // `construct` stub: ctor + argc (proves args reached it).
         let construct = Func::wrap(&mut store, |ctor: i64, _off: i64, n: i32| -> i64 {
             ctor.wrapping_add(n as i64)
@@ -2451,10 +3152,14 @@ mod tests {
         let jit_enter =
             Func::wrap(&mut store, |_env: i64, _fm: i64, _off: i64, _argc: i64| -> i64 { 0 });
         let jit_leave = Func::wrap(&mut store, || {});
-        // Helper table (50 slots); index globals name each.
+        // Tail stub: return 0 so a tail-call emit takes the normal call+return FALLBACK in these
+        // tests (validating the `return_call_indirect` branch's bytes without needing a parked run).
+        let jit_tail_enter =
+            Func::wrap(&mut store, |_env: i64, _fm: i64, _off: i64, _argc: i64| -> i64 { 0 });
+        // Helper table (51 slots); index globals name each.
         let table = Table::new(
             &mut store,
-            TableType::new(RefType::new(true, HeapType::Func), 50, Some(50)),
+            TableType::new(RefType::new(true, HeapType::Func), 51, Some(51)),
             Ref::Func(None),
         )
         .expect("helper table");
@@ -2465,6 +3170,7 @@ mod tests {
             getpropfast, setpropfast, op_in, nextvalue, nextname, hasnext, newfunction, applytype,
             constructslot, constructprop, call, newobject, hasnext2, throw, gschecked, mopload,
             mopstore, gp_ic, dm_desc, call_prop_ic, call_method_ic, jit_enter, jit_leave,
+            jit_tail_enter,
         ];
         for (i, f) in helpers_tbl.into_iter().enumerate() {
             table.set(&mut store, i as u64, Ref::Func(Some(f))).expect("set helper");
@@ -2473,7 +3179,7 @@ mod tests {
             Global::new(store, GlobalType::new(WtV::I32, Mutability::Const), Val::I32(i))
                 .expect("index global")
         };
-        let g: Vec<_> = (0..50).map(|i| idx(&mut store, i)).collect();
+        let g: Vec<_> = (0..51).map(|i| idx(&mut store, i)).collect();
         let mem = Memory::new(&mut store, MemoryType::new(FRAME_PAGES, Some(FRAME_PAGES)))
             .expect("frame memory");
         let mut imports: Vec<wasmtime::Extern> = vec![table.into()];
@@ -2581,7 +3287,7 @@ mod tests {
             term: Term::Return,
             entry_depth: 0,
         }];
-        let bytes = compile(&blocks, 2, &[], &[]).expect("compiles");
+        let bytes = compile(&blocks, 2, &[], &[], "test").expect("compiles");
         FORCE_INWASM_CALL_IC.with(|c| c.set(false));
         std::fs::write("/tmp/claude-1000/-home-jaroslavb-rufflepostatnicich-jestedalsiruffle-jitruffle/9fc2f868-b600-4693-b922-7a4947cd13f8/scratchpad/inwasm.wasm", &bytes).unwrap();
     }
@@ -2622,6 +3328,35 @@ mod tests {
     }
 
     #[test]
+    fn inwasm_tail_call_module_validates_and_falls_back() {
+        // §8 TAIL: force the web `return_call_indirect` shape on native (Cranelift + `wasm_tail_call`
+        // in the test engine) so `WtModule::new` VALIDATES the exact tail bytes — the guard, the
+        // `jit_tail_enter` call, the frame-reuse arg copy, and the `return_call_indirect`. A
+        // NON-object receiver (100) takes the fallback branch: `call_prop_ic`/`call_method_ic`
+        // (stubs = recv[+disp]+Σargs) run and their result is `Return`ed (proving the terminator
+        // fallback round-trips). The `return_call` HIT branch is validated structurally; its runtime
+        // behaviour is covered on the web. `TailCall*` is the `translate` fusion of `Call*;
+        // BailIfError; ReturnValue`, passed directly here.
+        FORCE_INWASM_CALL_IC.with(|c| c.set(true));
+        let prop = run(
+            &[
+                JitOp::GetLocal(1),
+                JitOp::PushBits(11),
+                JitOp::PushBits(22),
+                JitOp::TailCallProperty(7, 2),
+            ],
+            &[UNDEFINED_BITS, 100],
+        );
+        let meth = run(
+            &[JitOp::GetLocal(1), JitOp::PushBits(5), JitOp::TailCallMethod(3, 1)],
+            &[UNDEFINED_BITS, 100],
+        );
+        FORCE_INWASM_CALL_IC.with(|c| c.set(false));
+        assert_eq!(prop, 133); // 100 + 11 + 22 via call_prop_ic fallback, then Return
+        assert_eq!(meth, 108); // 100 + 3 (disp_id) + 5 via call_method_ic fallback, then Return
+    }
+
+    #[test]
     fn binop_passes_both_operands_and_the_code() {
         // push 10, 20; binop(code=5); bail; return → stub `binop` = a + b + op = 10+20+5.
         let out = run(
@@ -2638,13 +3373,183 @@ mod tests {
     }
 
     #[test]
+    fn binopint_computes_native_i32() {
+        // Both operands proven `Int` boxes → native i32 op, result re-boxed as `Int`. Checks the
+        // three semantics the soundness argument leans on: wasm's i32 arithmetic WRAPS (matching
+        // the interpreter's `wrapping_*`, so `*_i` never overflows to `Number`), its shifts MASK
+        // the count to 5 bits (the interpreter's `& 0x1F`), and the result is always an `int` box.
+        use crate::helpers::binop_code as bc;
+        let int = |x: i32| VALUE_INT_MARK | (x as u32 as u64);
+        let bin = |code: i32, a: i32, b: i32| {
+            run(
+                &[JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::BinOpInt(code), JitOp::ReturnValue],
+                &[UNDEFINED_BITS, int(a), int(b)],
+            )
+        };
+        assert_eq!(bin(bc::ADD_I, 5, 7), int(12));
+        assert_eq!(bin(bc::SUBTRACT_I, 5, 7), int(-2));
+        assert_eq!(bin(bc::MULTIPLY_I, 6, 7), int(42));
+        assert_eq!(bin(bc::BITAND, 0b1100, 0b1010), int(0b1000));
+        assert_eq!(bin(bc::BITOR, 0b1100, 0b1010), int(0b1110));
+        assert_eq!(bin(bc::BITXOR, 0b1100, 0b1010), int(0b0110));
+        assert_eq!(bin(bc::LSHIFT, 1, 4), int(16));
+        assert_eq!(bin(bc::RSHIFT, -16, 2), int(-4)); // ARITHMETIC (sign-preserving) shift
+        // `add_i`/`multiply_i` WRAP rather than widening to a double (unlike plain `add`/`multiply`).
+        assert_eq!(bin(bc::ADD_I, i32::MAX, 1), int(i32::MIN));
+        assert_eq!(bin(bc::MULTIPLY_I, i32::MAX, 2), int(-2));
+        // Shift counts are taken mod 32, matching the interpreter's `& 0x1F`.
+        assert_eq!(bin(bc::LSHIFT, 1, 36), int(16));
+        // `urshift` is UNSIGNED (translate only emits it here under its known-non-zero-count
+        // proof): -1 read as u32 shifted right by 1 is 0x7FFF_FFFF, and being < 2^31 it re-boxes
+        // as an `int` — which is exactly what makes that proof sound.
+        assert_eq!(bin(bc::URSHIFT, -1, 1), int(0x7FFF_FFFF));
+        assert_eq!(bin(bc::URSHIFT, -1, 31), int(1));
+    }
+
+    #[test]
+    fn binopcmp_compares_a_mixed_int_number_pair() {
+        // A MIXED `Int`/`Number` compare goes through f64 (the `Int` converts exactly), matching
+        // the interpreter, which reduces any two numerics to a `packed_number()` f64 compare.
+        use crate::helpers::binop_code as bc;
+        let dbl = |x: f64| x.to_bits();
+        let int = |x: i32| VALUE_INT_MARK | (x as u32 as u64);
+        const BOOL_MARK: u64 = 0xFFFA_0000_0000_0000;
+        let cmp = |code: i32, a: u64, ai: NumUnbox, b: u64, bi: NumUnbox| {
+            run(
+                &[
+                    JitOp::GetLocal(1),
+                    JitOp::GetLocal(2),
+                    JitOp::BinOpCmp { code, a: ai, b: bi },
+                    JitOp::ReturnValue,
+                ],
+                &[UNDEFINED_BITS, a, b],
+            )
+        };
+        use NumUnbox::{Canonical as C, Int as N};
+        // 2 < 2.5  /  2.5 < 2
+        assert_eq!(cmp(bc::LESS_THAN, int(2), N, dbl(2.5), C), BOOL_MARK | 1);
+        assert_eq!(cmp(bc::LESS_THAN, dbl(2.5), C, int(2), N), BOOL_MARK);
+        // A NEGATIVE int must sign-extend, not read as a huge u32: -1 < 0.5
+        assert_eq!(cmp(bc::LESS_THAN, int(-1), N, dbl(0.5), C), BOOL_MARK | 1);
+        // `3 === 3.0` is TRUE — `Value`'s `PartialEq` compares `(Integer, Number)` NUMERICALLY
+        // (`*a as f64 == *b`), not by bits, so the f64 compare is the interpreter's answer.
+        assert_eq!(cmp(bc::STRICT_EQUALS, int(3), N, dbl(3.0), C), BOOL_MARK | 1);
+        assert_eq!(cmp(bc::EQUALS, int(3), N, dbl(3.5), C), BOOL_MARK);
+        // Every NaN compare is false — matching `abstract_lt`'s `None` → `unwrap_or` handling.
+        assert_eq!(cmp(bc::LESS_THAN, int(1), N, dbl(f64::NAN), C), BOOL_MARK);
+        assert_eq!(cmp(bc::GREATER_EQUALS, int(1), N, dbl(f64::NAN), C), BOOL_MARK);
+        assert_eq!(cmp(bc::STRICT_EQUALS, dbl(f64::NAN), C, dbl(f64::NAN), C), BOOL_MARK);
+        // `0.0 === -0.0` is TRUE (an f64 compare, not a bit compare).
+        assert_eq!(cmp(bc::STRICT_EQUALS, dbl(0.0), C, dbl(-0.0), C), BOOL_MARK | 1);
+    }
+
+    #[test]
+    fn binopcmp_anynumeric_unboxes_all_three_runtime_shapes() {
+        // The 3-way unbox, exercised on the ACTUAL web bytes (the inline form is emitted under
+        // `test` too). A `TAG_BOXED_DOUBLE`'s payload is a raw address of the f64, so the frame —
+        // which `run` writes at memory offset 0 — doubles as a fake `Gc<f64>`: slot `i` lives at
+        // byte offset `i * 8`.
+        use crate::helpers::binop_code as bc;
+        const BOOL_MARK: u64 = 0xFFFA_0000_0000_0000;
+        let boxed_double_at = |slot: u64| BOXED_DOUBLE_MARK | (slot * 8);
+        let int = |x: i32| VALUE_INT_MARK | (x as u32 as u64);
+        let cmp = |code: i32, frame: &[u64]| {
+            run(
+                &[
+                    JitOp::GetLocal(1),
+                    JitOp::GetLocal(2),
+                    JitOp::BinOpCmp { code, a: NumUnbox::AnyNumeric, b: NumUnbox::AnyNumeric },
+                    JitOp::ReturnValue,
+                ],
+                frame,
+            )
+        };
+        // (1) boxed double vs canonical inline: 2.5 < 4.0. Slot 3 holds the boxed value's f64.
+        let f = &[UNDEFINED_BITS, boxed_double_at(3), 4.0f64.to_bits(), 2.5f64.to_bits()];
+        assert_eq!(cmp(bc::LESS_THAN, f), BOOL_MARK | 1);
+        assert_eq!(cmp(bc::GREATER_THAN, f), BOOL_MARK);
+        // (2) THE CASE THAT CAUSED THE GREY SCREEN: an `int` box reaching an "is a Number" repr.
+        // A blind reinterpret here reads the tag as a double (a huge negative NaN) and gets these
+        // backwards; the int arm converts it exactly. 3 < 4.0, and 3 !< 2.5.
+        let f = &[UNDEFINED_BITS, int(3), 4.0f64.to_bits()];
+        assert_eq!(cmp(bc::LESS_THAN, f), BOOL_MARK | 1);
+        let f = &[UNDEFINED_BITS, int(3), 2.5f64.to_bits()];
+        assert_eq!(cmp(bc::LESS_THAN, f), BOOL_MARK);
+        // A negative int must sign-extend, not read as a huge u32.
+        let f = &[UNDEFINED_BITS, int(-1), 0.5f64.to_bits()];
+        assert_eq!(cmp(bc::LESS_THAN, f), BOOL_MARK | 1);
+        // (3) int box vs boxed double, and equality across shapes: 3 == 3.0 (slot 3 holds 3.0).
+        let f = &[UNDEFINED_BITS, int(3), boxed_double_at(3), 3.0f64.to_bits()];
+        assert_eq!(cmp(bc::EQUALS, f), BOOL_MARK | 1);
+        assert_eq!(cmp(bc::STRICT_EQUALS, f), BOOL_MARK | 1);
+        // (4) a boxed double really is dereferenced, not compared by its box bits: the two boxes
+        // differ (different slots) but hold the same value.
+        let f = &[UNDEFINED_BITS, boxed_double_at(3), boxed_double_at(4), 7.5f64.to_bits(), 7.5f64.to_bits()];
+        assert_eq!(cmp(bc::STRICT_EQUALS, f), BOOL_MARK | 1);
+    }
+
+    #[test]
+    fn binopnum_accepts_an_int_operand() {
+        // The generalized f64 path: an `Int` operand converts exactly (its payload IS an i32), so
+        // mixed Number/Int arithmetic needs no guard. translate emits these only where the
+        // interpreter's int-int arm provably cannot fire, so the result is a canonical `Number`.
+        use crate::helpers::binop_code as bc;
+        let dbl = |x: f64| x.to_bits();
+        let int = |x: i32| VALUE_INT_MARK | (x as u32 as u64);
+        // divide(Number, Int) → 3.0 / 2 = 1.5
+        let out = run(
+            &[
+                JitOp::GetLocal(1),
+                JitOp::GetLocal(2),
+                JitOp::BinOpNum { code: bc::DIVIDE, a: NumUnbox::Canonical, b: NumUnbox::Int },
+                JitOp::ReturnValue,
+            ],
+            &[UNDEFINED_BITS, dbl(3.0), int(2)],
+        );
+        assert_eq!(f64::from_bits(out as u64), 1.5);
+        // multiply(Int, Number) → 3 * 1.5 = 4.5
+        let out = run(
+            &[
+                JitOp::GetLocal(1),
+                JitOp::GetLocal(2),
+                JitOp::BinOpNum { code: bc::MULTIPLY, a: NumUnbox::Int, b: NumUnbox::Canonical },
+                JitOp::ReturnValue,
+            ],
+            &[UNDEFINED_BITS, int(3), dbl(1.5)],
+        );
+        assert_eq!(f64::from_bits(out as u64), 4.5);
+        // divide(Int, Int) → 7 / 2 = 3.5 (divide has NO int arm — it always yields a Number).
+        let out = run(
+            &[
+                JitOp::GetLocal(1),
+                JitOp::GetLocal(2),
+                JitOp::BinOpNum { code: bc::DIVIDE, a: NumUnbox::Int, b: NumUnbox::Int },
+                JitOp::ReturnValue,
+            ],
+            &[UNDEFINED_BITS, int(7), int(2)],
+        );
+        assert_eq!(f64::from_bits(out as u64), 3.5);
+        // A NEGATIVE int operand must sign-extend (`convert_i32_s`), not read as a huge u32.
+        let out = run(
+            &[
+                JitOp::GetLocal(1),
+                JitOp::GetLocal(2),
+                JitOp::BinOpNum { code: bc::SUBTRACT, a: NumUnbox::Int, b: NumUnbox::Canonical },
+                JitOp::ReturnValue,
+            ],
+            &[UNDEFINED_BITS, int(-5), dbl(0.5)],
+        );
+        assert_eq!(f64::from_bits(out as u64), -5.5);
+    }
+
+    #[test]
     fn binopnum_computes_unguarded_f64() {
         // The unguarded f64 core: same results as `BinOp`'s guarded f64 path, but no runtime
         // tag check and no `BailIfError` (translate proves both operands canonical `Number`).
         let dbl = |x: f64| x.to_bits();
         let bin = |code: i32, a: f64, b: f64| {
             f64::from_bits(run(
-                &[JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::BinOpNum(code), JitOp::ReturnValue],
+                &[JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::BinOpNum { code, a: NumUnbox::Canonical, b: NumUnbox::Canonical }, JitOp::ReturnValue],
                 &[UNDEFINED_BITS, dbl(a), dbl(b)],
             ))
         };
@@ -2656,7 +3561,7 @@ mod tests {
         assert_eq!(bin(bc::DIVIDE, 1.0, 0.0), f64::INFINITY);
         // A NaN result is canonicalized to a non-box-colliding double.
         let raw = run(
-            &[JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::BinOpNum(bc::DIVIDE), JitOp::ReturnValue],
+            &[JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::BinOpNum { code: bc::DIVIDE, a: NumUnbox::Canonical, b: NumUnbox::Canonical }, JitOp::ReturnValue],
             &[UNDEFINED_BITS, dbl(0.0), dbl(0.0)],
         );
         assert!(f64::from_bits(raw).is_nan());
@@ -2666,9 +3571,9 @@ mod tests {
             &[
                 JitOp::GetLocal(1),
                 JitOp::GetLocal(2),
-                JitOp::BinOpNum(bc::MULTIPLY),
+                JitOp::BinOpNum { code: bc::MULTIPLY, a: NumUnbox::Canonical, b: NumUnbox::Canonical },
                 JitOp::GetLocal(3),
-                JitOp::BinOpNum(bc::MULTIPLY),
+                JitOp::BinOpNum { code: bc::MULTIPLY, a: NumUnbox::Canonical, b: NumUnbox::Canonical },
                 JitOp::ReturnValue,
             ],
             &[UNDEFINED_BITS, dbl(2.0), dbl(3.0), dbl(4.0)],
@@ -2685,7 +3590,7 @@ mod tests {
         // Two `Int`s → signed i32 compare.
         let icmp = |code: i32, a: i32, b: i32| {
             run(
-                &[JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::BinOpCmp(code, false), JitOp::ReturnValue],
+                &[JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::BinOpCmp { code, a: NumUnbox::Int, b: NumUnbox::Int }, JitOp::ReturnValue],
                 &[UNDEFINED_BITS, ib(a), ib(b)],
             )
         };
@@ -2699,7 +3604,7 @@ mod tests {
         let dbl = |x: f64| x.to_bits();
         let fcmp = |code: i32, a: f64, b: f64| {
             run(
-                &[JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::BinOpCmp(code, true), JitOp::ReturnValue],
+                &[JitOp::GetLocal(1), JitOp::GetLocal(2), JitOp::BinOpCmp { code, a: NumUnbox::Canonical, b: NumUnbox::Canonical }, JitOp::ReturnValue],
                 &[UNDEFINED_BITS, dbl(a), dbl(b)],
             )
         };
@@ -2708,6 +3613,33 @@ mod tests {
         assert_eq!(fcmp(bc::EQUALS, 2.0, 2.0), tru);
         assert_eq!(fcmp(bc::LESS_THAN, f64::NAN, 1.0), fal, "NaN compares false");
         assert_eq!(fcmp(bc::EQUALS, f64::NAN, f64::NAN), fal);
+    }
+
+    #[test]
+    fn nullish_eq_inlines_null_checks() {
+        let tru = VALUE_BOOL_MARK | 1;
+        let fal = VALUE_BOOL_MARK;
+        let ib = |v: i32| VALUE_INT_MARK | (v as u32 as u64);
+        let obj = 0xFFFD_0000_0000_1000u64; // a fake object Value
+        let nq = |against: u64, loose: bool, x: u64| {
+            run(
+                &[JitOp::GetLocal(1), JitOp::NullishEq { against, loose }, JitOp::ReturnValue],
+                &[UNDEFINED_BITS, x],
+            )
+        };
+        // loose `== null` (or `== undefined`): true for BOTH null and undefined, false otherwise.
+        assert_eq!(nq(NULL_BITS, true, NULL_BITS), tru);
+        assert_eq!(nq(NULL_BITS, true, UNDEFINED_BITS), tru);
+        assert_eq!(nq(NULL_BITS, true, ib(5)), fal);
+        assert_eq!(nq(NULL_BITS, true, obj), fal);
+        assert_eq!(nq(UNDEFINED_BITS, true, NULL_BITS), tru); // `== undefined` is also nullish
+        // strict `=== null`: ONLY null.
+        assert_eq!(nq(NULL_BITS, false, NULL_BITS), tru);
+        assert_eq!(nq(NULL_BITS, false, UNDEFINED_BITS), fal);
+        assert_eq!(nq(NULL_BITS, false, ib(0)), fal);
+        // strict `=== undefined`: ONLY undefined.
+        assert_eq!(nq(UNDEFINED_BITS, false, UNDEFINED_BITS), tru);
+        assert_eq!(nq(UNDEFINED_BITS, false, NULL_BITS), fal);
     }
 
     #[test]
@@ -2761,7 +3693,7 @@ mod tests {
                 ops: vec![
                     JitOp::GetLocal(1),
                     JitOp::GetLocal(1),
-                    JitOp::BinOpNum(crate::helpers::binop_code::MULTIPLY),
+                    JitOp::BinOpNum { code: crate::helpers::binop_code::MULTIPLY, a: NumUnbox::Canonical, b: NumUnbox::Canonical },
                     JitOp::ReturnValue,
                 ],
                 term: Term::Return,
@@ -2788,7 +3720,7 @@ mod tests {
                     JitOp::SetLocal(1),
                     JitOp::GetLocal(1),
                     JitOp::PushBits(b),
-                    JitOp::BinOpNum(crate::helpers::binop_code::ADD),
+                    JitOp::BinOpNum { code: crate::helpers::binop_code::ADD, a: NumUnbox::Canonical, b: NumUnbox::Canonical },
                     JitOp::SetLocal(1),
                     JitOp::GetLocal(1),
                     JitOp::ReturnValue,
@@ -2855,8 +3787,9 @@ mod tests {
 
     #[test]
     fn scope_push_and_get_balance_the_stack() {
-        // push an object; scopepush consumes it (stub no-op); getscope 3 (stub echoes 3);
-        // return → 3. Proves ScopePush pops one and GetScope pushes one (stack balanced).
+        // push an object; scopepush consumes it (stub no-op); getscope 3 (stub → object|3);
+        // return. Proves ScopePush pops one and GetScope pushes one (stack balanced). A single
+        // cached read still yields the stub value on its first (only) fetch.
         let out = run(
             &[
                 JitOp::PushBits(VALUE_INT_MARK | 9),
@@ -2867,7 +3800,31 @@ mod tests {
             ],
             &[UNDEFINED_BITS],
         );
-        assert_eq!(out, 3);
+        assert_eq!(out, 0xFFFD_0000_0000_0003);
+    }
+
+    #[test]
+    fn getscope0_is_cached() {
+        // Two `getscopeobject 0` with NO `popscope` → `compile` caches index 0 in a local, so the
+        // second read is a branch + load (not a second `get_scope` helper call). Both yield the
+        // same (object-tagged, non-zero) scope. The `0`-sentinel is safe: a scope is never `0`.
+        let out = run(
+            &[JitOp::GetScope(0), JitOp::Pop, JitOp::GetScope(0), JitOp::ReturnValue],
+            &[UNDEFINED_BITS],
+        );
+        assert_eq!(out, 0xFFFD_0000_0000_0000); // scope object for index 0, via the cache
+    }
+
+    #[test]
+    fn getscope1_is_cached() {
+        // Index 1 is the hot FlasCC/Lua getscopeobject index — the cache must cover it, not just 0.
+        // Two `getscopeobject 1` with no `popscope` share one cache local; the second is branch +
+        // load. Stub `get_scope(1)` → object-tagged `1`.
+        let out = run(
+            &[JitOp::GetScope(1), JitOp::Pop, JitOp::GetScope(1), JitOp::ReturnValue],
+            &[UNDEFINED_BITS],
+        );
+        assert_eq!(out, 0xFFFD_0000_0000_0001); // scope object for index 1, via the cache
     }
 
     #[test]

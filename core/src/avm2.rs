@@ -91,7 +91,7 @@ pub use crate::avm2::class::{BuiltinType, Class};
 pub use crate::avm2::domain::{Domain, DomainPtr};
 pub use crate::avm2::error::Error;
 pub use crate::avm2::jit::{JitBackend, NullJit};
-pub use crate::avm2::method::{Method, NativeMethodImpl};
+pub use crate::avm2::method::{Method, NativeMethodImpl, ResolvedParamConfig};
 pub use crate::avm2::op::Op;
 pub use crate::avm2::flv::FlvValueAvm2Ext;
 pub use crate::avm2::function::FunctionArgs;
@@ -214,6 +214,15 @@ pub struct Avm2<'gc> {
     /// it without conflicting with the `&mut Avm2` borrow held during execution.
     #[collect(require_static)]
     jit: Rc<dyn JitBackend>,
+
+    /// Bumped whenever any domain's `domainMemory` is REASSIGNED (see
+    /// [`Domain::set_domain_memory`]). The JIT's inline `li*`/`si*` path caches the
+    /// domainMemory descriptor-cell pointer keyed by this counter (plus the domain), so a
+    /// per-method-entry re-reify is only paid when memory is actually swapped — growth keeps
+    /// the same stable cell, so it does NOT bump this. Wraps harmlessly (a wrap can only cause
+    /// a spurious cache miss, never a stale hit, since the domain key must also match).
+    #[collect(require_static)]
+    dm_generation: u64,
 }
 
 impl<'gc> Avm2<'gc> {
@@ -224,6 +233,11 @@ impl<'gc> Avm2<'gc> {
         player_runtime: PlayerRuntime,
     ) -> Self {
         let mc = context.gc();
+
+        // The method-resolution IC is per thread but its raw vtable keys are only meaningful for
+        // one player's arena. A previous player on this thread may have left entries behind whose
+        // addresses this player is about to reuse — see `resolve_ic_clear`.
+        crate::avm2::value::resolve_ic_clear();
 
         let playerglobals_domain = Domain::uninitialized_domain(mc, None);
         let stage_domain = Domain::uninitialized_domain(mc, Some(playerglobals_domain));
@@ -266,7 +280,22 @@ impl<'gc> Avm2<'gc> {
 
             optimizer_enabled: true,
             jit: Rc::new(NullJit),
+            dm_generation: 0,
         }
+    }
+
+    /// The current domainMemory-reassignment generation (see the `dm_generation` field). Read by
+    /// the JIT's inline `li*`/`si*` descriptor-pointer cache to detect a memory swap.
+    #[inline]
+    pub fn dm_generation(&self) -> u64 {
+        self.dm_generation
+    }
+
+    /// Bump the domainMemory generation — call whenever a domain's `domainMemory` is reassigned so
+    /// the JIT's cached descriptor pointer is invalidated.
+    #[inline]
+    pub fn bump_dm_generation(&mut self) {
+        self.dm_generation = self.dm_generation.wrapping_add(1);
     }
 
     pub fn load_player_globals(context: &mut UpdateContext<'gc>) {
@@ -284,10 +313,34 @@ impl<'gc> Avm2<'gc> {
         self.scope_stack.len()
     }
 
+    /// The `getscopeobject`-th local scope's object (`scope_stack[base + index]`), or `undefined`
+    /// if out of range. The AVM2 JIT's `get_scope` helper calls this DIRECTLY on the ambient
+    /// `Avm2` (via the installed scope base) — no per-op `Activation` reification. Mirrors
+    /// `Activation::jit_local_scope`.
+    pub fn jit_local_scope(&self, base: usize, index: usize) -> Value<'gc> {
+        match self.scope_stack.get(base + index) {
+            Some(scope) => scope.values(),
+            None => Value::Undefined,
+        }
+    }
+
     /// Truncate the shared scope stack back to `len` — the AVM2 JIT calls this after a run to
     /// drop any scopes the compiled method left (e.g. an early error bail).
     pub fn truncate_scope_stack(&mut self, len: usize) {
         self.scope_stack.truncate(len);
+    }
+
+    /// `pushscope` for the AVM2 JIT: push onto the shared scope stack. Identical to what
+    /// `Activation::push_scope` does (it is a one-line forwarder to the same `Avm2`), exposed so
+    /// the JIT's helper need not reify a whole `Activation` just to reach this `Vec::push` —
+    /// `pushscope` runs in nearly every FlasCC method prologue. See [`Self::jit_local_scope`].
+    pub fn jit_push_scope(&mut self, scope: Scope<'gc>) {
+        self.scope_stack.push(scope);
+    }
+
+    /// `popscope` for the AVM2 JIT — the counterpart of [`Self::jit_push_scope`].
+    pub fn jit_pop_scope(&mut self) {
+        self.scope_stack.pop();
     }
 
     /// Return the current set of system classes.

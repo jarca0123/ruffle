@@ -18,7 +18,7 @@ use ruffle_core::avm2::property::Property;
 use ruffle_core::avm2::script::Script;
 use ruffle_core::avm2::{
     exec, Activation, ArrayStorage, Class, ClassBoundMethod, Error, FunctionArgs, Method,
-    Multiname, NativeMethodImpl, Scope, TObject, Value, ValueEnum,
+    Multiname, NativeMethodImpl, ResolvedParamConfig, Scope, TObject, Value, ValueEnum,
 };
 
 const SUPER_ON_PRIMITIVE: &str = "Super ops should not appear in primitive functions";
@@ -229,6 +229,66 @@ pub fn get_slot_checked(obj_bits: i64, slot_id: i64) -> i64 {
     }
 }
 
+/// TEMPORARY diagnostic (native, `RUFFLE_JIT3_POLY=1`): how many DISTINCT vtables each call site
+/// actually sees. The call IC is monomorphic, so a site with >1 re-resolves and RESETS the §8
+/// in-WASM dispatch cell on every alternation — which is why a V8 profile of Starling puts 10.6%
+/// in `try_enter` (the slow path) while Lua, whose sites are monomorphic, takes the in-WASM path
+/// for 99.7% of entries. This decides the width an N-way PIC would need: it is only worth building
+/// if the hot sites are a few-way, not megamorphic. Polymorphism is a property of the CONTENT, so
+/// a native run answers it for the web build too — but the web is the target, so it runs there.
+///
+/// TURN OFF (`POLY_DIAG = false`) once answered: this is a `BTreeMap` insert on every call IC
+/// hit, on the hottest path there is.
+pub(crate) const POLY_DIAG: bool = false;
+
+pub(crate) fn record_ic_poly(ic_addr: usize, vt: usize) {
+    use std::cell::RefCell;
+    use std::collections::{BTreeMap, BTreeSet};
+    if !POLY_DIAG {
+        return;
+    }
+    thread_local! {
+        static SITES: RefCell<BTreeMap<usize, (BTreeSet<usize>, u64)>> = RefCell::new(BTreeMap::new());
+        static N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    SITES.with(|s| {
+        let mut s = s.borrow_mut();
+        let e = s.entry(ic_addr).or_default();
+        e.0.insert(vt);
+        e.1 += 1;
+    });
+    let n = N.with(|c| {
+        c.set(c.get() + 1);
+        c.get()
+    });
+    if n % 2_000_000 != 0 {
+        return;
+    }
+    SITES.with(|s| {
+        let s = s.borrow();
+        // Weight by CALLS, not by site: a 1-way site called a million times is what makes the
+        // fast path pay, and a 12-way site called twice costs nothing.
+        let mut by_width: BTreeMap<usize, (usize, u64)> = BTreeMap::new();
+        for (ways, calls) in s.values() {
+            let e = by_width.entry(ways.len().min(9)).or_default();
+            e.0 += 1;
+            e.1 += *calls;
+        }
+        let total: u64 = s.values().map(|v| v.1).sum();
+        let mut out = String::new();
+        let mut cum = 0u64;
+        for (w, (sites, calls)) in &by_width {
+            cum += calls;
+            out.push_str(&format!(
+                " {w}way:{sites}sites/{:.1}%calls(cum {:.1}%)",
+                100.0 * *calls as f64 / total as f64,
+                100.0 * cum as f64 / total as f64
+            ));
+        }
+        crate::runner::diag_log(&format!("JIT3 CALL-IC POLY: sites={} calls={total} |{out}", s.len()));
+    });
+}
+
 /// Property inline-cache backing store: `IC_ENTRIES` pairs of `[vtable_ptr: u32, slot_id:
 /// u32]`, one per compiled `GetProperty` site (its address is baked into the module). The
 /// compiled fast path reads an entry INLINE (web only — GC memory) and, on a `vtable` hit,
@@ -408,7 +468,21 @@ pub fn new_activation(class_ptr: i64) -> i64 {
 pub fn push_scope(bits: i64) {
     // SAFETY: a live `Value` this frame.
     let v: Value<'_> = unsafe { from_bits(bits as u64) };
-    // SAFETY: called from JIT wasm inside `with_run_ctx`; `act` does not escape.
+    // De-reified fast path (`pushscope` runs in nearly every FlasCC method prologue, and reifying
+    // was making this the single most expensive helper). Both halves of the original only ever
+    // reach the ambient `Avm2`: `null_check` needs an `Activation` ONLY to CONSTRUCT the #1009
+    // error — a non-null/undefined value passes through untouched — and `Activation::push_scope` is
+    // a one-line forwarder to `avm2.scope_stack.push`. `reify()` builds its `Activation` over this
+    // same ambient `cx`, so `act.avm2()` and `cx.avm2` are the very same object: skipping it is
+    // exactly equivalent, not an approximation.
+    if !matches!(v.unpack(), ValueEnum::Null | ValueEnum::Undefined) {
+        // SAFETY: `cx` is the installed ambient context (this runs inside a run).
+        let cx = unsafe { &mut *(context::cx_ptr() as *mut ruffle_core::context::UpdateContext) };
+        cx.avm2.jit_push_scope(Scope::new(v));
+        return;
+    }
+    // Slow path: null/undefined → reify only to build the error. SAFETY: called from JIT wasm
+    // inside a run; `act` does not escape.
     let mut act = unsafe { context::reify() };
     match v.null_check(&mut act, None) {
         Ok(obj) => act.push_scope(Scope::new(obj)),
@@ -418,17 +492,21 @@ pub fn push_scope(bits: i64) {
 
 /// `popscope`: pops the top of the shared scope stack. No throw.
 pub fn pop_scope() {
-    // SAFETY: called from JIT wasm inside `with_run_ctx`; `act` does not escape.
-    let mut act = unsafe { context::reify() };
-    act.pop_scope();
+    // As `push_scope`: `Activation::pop_scope` is a one-line forwarder to `avm2.scope_stack.pop`
+    // on this same ambient `Avm2`, so no `Activation` is needed at all.
+    // SAFETY: `cx` is the installed ambient context (this runs inside a run).
+    let cx = unsafe { &mut *(context::cx_ptr() as *mut ruffle_core::context::UpdateContext) };
+    cx.avm2.jit_pop_scope();
 }
 
 /// `getscopeobject`: the `index`-th LOCAL scope's object (relative to this run's scope base
 /// on the shared stack). No throw.
 pub fn get_scope(index: i32) -> i64 {
-    // SAFETY: called from JIT wasm inside `with_run_ctx`; `act` does not escape.
-    let act = unsafe { context::reify() };
-    to_bits(act.jit_local_scope(context::scope_base(), index as usize)) as i64
+    // `getscopeobject` only reads `avm2.scope_stack[scope_base + index]` — access it DIRECTLY on
+    // the ambient cx instead of reifying a whole `Activation` per op (getscopeobject is hot in
+    // FlasCC/Alchemy dispatch loops). SAFETY: the ambient cx is installed for this run.
+    let cx = unsafe { &*(context::cx_ptr() as *const ruffle_core::context::UpdateContext) };
+    to_bits(cx.avm2.jit_local_scope(context::scope_base(), index as usize)) as i64
 }
 
 /// `istypelate`: `value is Type` — `type` (top) must be a class object (else #1041), then
@@ -1053,16 +1131,36 @@ fn mop_load_inner<'gc>(
 /// buffers get the inline path (promoting content-driven ByteArrays mid-frame desynced Starling
 /// rendering), so we never `make_shareable` here. Reifies.
 pub fn dm_desc_ptr() -> i64 {
-    // SAFETY: called from JIT wasm inside `with_run_ctx`; `act` does not escape.
+    // Fast path: the descriptor CELL is stable for a given (domainMemory generation, domain) — it
+    // only moves when `set_domain_memory` swaps the buffer (which bumps the generation); growth
+    // updates the cell contents in place, not its address. So skip the reify when both keys match.
+    // SAFETY: ambient `cx` is installed for the run.
+    let generation = {
+        let cx = unsafe { &*(context::cx_ptr() as *const ruffle_core::context::UpdateContext) };
+        cx.avm2.dm_generation()
+    };
+    let domain = context::current_domain_ptr();
+    let (cache_gen, cache_domain, cache_desc) = context::dm_cache_get();
+    if domain != 0 && cache_domain == domain && cache_gen == generation {
+        return cache_desc;
+    }
+    // Slow path: reify and recompute. SAFETY: called from JIT wasm inside a run; `act` does not
+    // escape.
     let mut act = unsafe { context::reify() };
     let mut storage = act.domain_memory().storage_mut();
     if !storage.is_shareable() {
+        // Do NOT cache a `0` (not-yet-shareable) result: a later `make_shareable` (e.g. a Stage3D
+        // upload) within the same generation must still be observed on the next call.
         return 0;
     }
-    match storage.dm_base_len() {
-        Some((desc, _)) => desc as i64,
+    let desc = match storage.dm_base_len() {
+        Some((d, _)) => d as i64,
         None => 0,
+    };
+    if desc != 0 && domain != 0 {
+        context::dm_cache_set((generation, domain, desc));
     }
+    desc
 }
 
 /// `si8/si16/si32/sf32/sf64`: a domain-memory store selected by `code`. Pops the value and
@@ -1282,6 +1380,27 @@ pub fn call_method_ic(receiver_bits: i64, disp_id: i64, args_off: i64, argc: i64
 /// `base = jit_enter(env, fm, args_off, argc); if base { write frame; r = call_indirect(run_idx)(0, argc, base); jit_leave() }`.
 /// `fm` is the cached `*const ClassBoundMethod` (cell[1]); its `resolved_param_config` gives the
 /// param types. Emitted web-only (native never calls it — it keeps the `call_method_ic` fallback).
+/// Writes the DEFAULT value of every param the call site did not supply into the callee frame at
+/// `frame_base` (slot `1 + i`, mirroring `build_frame`). No-op when `argc == sig.len()`, which is
+/// the common case.
+///
+/// Callable only after [`crate::Jit3::ic_dispatch_run_idx`] admitted this (`argc`, callee) pair,
+/// which proves every missing param has a default needing NO coercion — so this is a plain store:
+/// no `Activation`, no allocation, nothing that can throw. That proof is why the fast path can do
+/// what `build_frame` needs a full `try_enter` for.
+///
+/// # Safety
+/// `frame_base` must be the callee frame's byte address in this module's linear memory, with the
+/// `1 + sig.len()` slots reserved, and the caller must not go on to write the `argc..sig.len()`
+/// range itself.
+#[cfg(target_arch = "wasm32")]
+unsafe fn write_defaults(frame_base: usize, sig: &[ResolvedParamConfig<'_>], argc: usize) {
+    for (i, p) in sig.iter().enumerate().skip(argc) {
+        let bits = crate::value::to_bits(p.default_value.expect("proven by eligibility"));
+        unsafe { *((frame_base + 8 + i * 8) as *mut i64) = bits as i64 };
+    }
+}
+
 pub fn jit_enter(env: i64, fm: i64, args_off: i64, argc: i64) -> i64 {
     #[cfg(target_arch = "wasm32")]
     {
@@ -1292,11 +1411,60 @@ pub fn jit_enter(env: i64, fm: i64, args_off: i64, argc: i64) -> i64 {
         // just `i64.store`d `argc` `Value`s in this frame (a valid main-memory offset on web).
         let fm_ref = unsafe { &*(fm as usize as *const ClassBoundMethod) };
         let sig = fm_ref.method.resolved_param_config();
-        let args = unsafe { core::slice::from_raw_parts(args_off as usize as *const i64, argc as usize) };
-        for (bits, p) in args.iter().zip(sig.iter()) {
+        // MUTABLE: an `int → Number` arg is rewritten in place (see below). SAFETY: as the
+        // read-only version — the outgoing scratch this frame just `i64.store`d `argc` values into,
+        // owned by this call and dead after it.
+        let args =
+            unsafe { core::slice::from_raw_parts_mut(args_off as usize as *mut i64, argc as usize) };
+        for (bits, p) in args.iter_mut().zip(sig.iter()) {
             if let Some(c) = p.param_type {
                 let v: Value<'_> = unsafe { from_bits(*bits as u64) };
                 if !v.coerces_identically_to(c) {
+                    // `int → Number` — 100% of the coercions a census found here, and a pure bit
+                    // conversion: no Activation, no alloc, nothing that throws. Mirrors
+                    // `build_frame`'s `coerce_to_number().into()` exactly (`Value::Number` stores
+                    // the f64 bits verbatim; it does NOT re-normalise to an int box).
+                    //
+                    // Rewriting the SCRATCH, not the callee frame, is what makes this work: the
+                    // caller copies scratch → frame AFTER we return, so a frame write would be
+                    // clobbered. Bailing later (a further arg, or a full arena) stays correct —
+                    // the fallback re-reads the scratch and coerces again, and coercing a `Number`
+                    // to `Number` is the identity.
+                    if matches!(c.builtin_type(), Some(ruffle_core::avm2::BuiltinType::Number))
+                        && let ValueEnum::Integer(i) = v.unpack()
+                    {
+                        *bits = crate::value::to_bits(Value::Number(i as f64)) as i64;
+                        continue;
+                    }
+                    // Split the bail: an instance of a SUBCLASS of `c` needs no coercion at all
+                    // (`coerces_identically_to` only compares classes for equality), so if that is
+                    // what we keep rejecting, the walk below is the whole fix. See `Slow`.
+                    let sub = c.builtin_type().is_none()
+                        && v.as_object()
+                            .is_some_and(|o| o.instance_class().has_class_in_chain(c));
+                    context::record_slow(if sub {
+                        context::Slow::CoerceSubclass
+                    } else {
+                        context::Slow::Coerce
+                    });
+                    if !sub {
+                        // Census only — which coercion is this? See `COERCE_LABELS`.
+                        use ruffle_core::avm2::BuiltinType as B;
+                        let is_int = matches!(v.unpack(), ValueEnum::Integer(_));
+                        let is_num = matches!(v.unpack(), ValueEnum::Number(_));
+                        context::record_coerce_kind(match c.builtin_type() {
+                            Some(B::Number) if is_int => 0,
+                            Some(B::Number) => 1,
+                            Some(B::Int) if is_num => 2,
+                            Some(B::Int) => 9,
+                            Some(B::Uint) => 3,
+                            Some(B::Boolean) => 4,
+                            Some(B::String) => 5,
+                            Some(B::Object) => 6,
+                            Some(_) => 8,
+                            None => 7,
+                        });
+                    }
                     return 0; // would need coercion → fall back to the coercing helper
                 }
             }
@@ -1304,8 +1472,12 @@ pub fn jit_enter(env: i64, fm: i64, args_off: i64, argc: i64) -> i64 {
         // Reserve the callee's stride (no state changed yet): 0 ⇒ arena full ⇒ fall back.
         let base = crate::runner::callee_frame_base();
         if base == 0 {
+            context::record_slow(context::Slow::Arena);
             return 0;
         }
+        // SAFETY: `base` is this callee frame's byte address in linear memory — the caller stores
+        // `[this, args]` through it identically right after we return.
+        unsafe { write_defaults(base as usize, sig, argc as usize) };
         // Install the CACHED per-callee ctx (the leaked `JitEnv` in cell[2]) — no per-call rebuild
         // or heap alloc. The cached env's `RunCtx.scope_base` is a stale 0; the LIVE base (below)
         // supplies the real value so `scope_base`-reading callees (getscopeobject/newfunction) are
@@ -1313,21 +1485,100 @@ pub fn jit_enter(env: i64, fm: i64, args_off: i64, argc: i64) -> i64 {
         // `fill_inwasm_dispatch_cell` sets together with a real `env`, so `env` is valid here.
         let env_ref = unsafe { &*(env as usize as *const context::JitEnv) };
         context::jit_prev_push(context::push_ctx(env_ref.ctx_ptr()));
-        // Open the scope-base bracket with this call's LIVE base = the shared scope stack's current
-        // length (exactly what `enter_run` bakes into the Rust path's `RunCtx`).
-        // SAFETY: `cx` is the installed ambient context (this runs inside the caller's run).
-        let live_base = {
-            let cx = unsafe { &*(context::cx_ptr() as *const ruffle_core::context::UpdateContext) };
-            cx.avm2.scope_stack_len()
-        };
-        context::jit_push_scope_base(live_base);
+        // Scope-base bracket — ONLY for a callee that reads its scope base (getscopeobject/
+        // newfunction). The ~99% that don't skip it: no `scope_stack_len` read, no LIVE swap, no
+        // truncate on leave. A scope callee installs this call's LIVE base = the shared scope
+        // stack's current length (exactly what `enter_run` bakes into the Rust path's `RunCtx`).
+        if env_ref.scope_base_used() {
+            // SAFETY: `cx` is the installed ambient context (this runs inside the caller's run).
+            let live_base = {
+                let cx = unsafe { &*(context::cx_ptr() as *const ruffle_core::context::UpdateContext) };
+                cx.avm2.scope_stack_len()
+            };
+            context::jit_push_scope_base(live_base);
+        } else {
+            context::jit_push_scope_base_noop();
+        }
         crate::runner::bump_depth();
+        context::record_callee_ops(env_ref.n_ops(), env_ref.inline_safe());
         context::jit_push_call(fm_ref.method.as_ptr());
+        context::record_entry(true);
         base as i64
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = (env, fm, args_off, argc); // native never emits the in-WASM path (no shared table)
+        0
+    }
+}
+
+/// §8 TAIL call: the caller is being REPLACED by the callee (`return foo()`), so — unlike
+/// [`jit_enter`] — it does NOT reserve a new frame or bump depth (the callee reuses the caller's
+/// frame, which the emit fills; this keeps tail recursion O(1) in the frame arena and the depth
+/// accounting balanced by the caller's own `jit_enter`/`jit_leave`). It swaps `RUN_CTX` to the
+/// callee's ctx **without saving** the caller's (the caller won't run again; its OWN caller's ctx
+/// is already on `JIT_PREV`), and replaces the caller with the callee on the AVM2 call stack.
+/// Returns `1` when the callee was tail-entered (the emit then `return_call_indirect`s it), `0` to
+/// fall back to a normal call + return (arg-type mismatch, or a `scope_base`-using callee — the
+/// first cut skips those to avoid the caller's scope-base bracket). There is NO closing half:
+/// control never returns here (the `return_call` transfers straight to the caller's caller).
+pub fn jit_tail_enter(env: i64, fm: i64, args_off: i64, argc: i64) -> i64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let env_ref = unsafe { &*(env as usize as *const context::JitEnv) };
+        // First cut: don't tail-call a scope-base-reading callee — its LIVE-base bracket is owned
+        // by the CALLER's `jit_enter`/`jit_leave`, and the tail path leaves that bracket in place
+        // (sound only if the callee never reads/pushes scopes). Fall back to a normal call.
+        if env_ref.scope_base_used() {
+            return 0;
+        }
+        // Type-guard: args must already match the param types (same as `jit_enter`), else fall back
+        // to the coercing helper. SAFETY: `fm` is the cached live `ClassBoundMethod`; `args_off` is
+        // this frame's outgoing scratch.
+        let fm_ref = unsafe { &*(fm as usize as *const ClassBoundMethod) };
+        let sig = fm_ref.method.resolved_param_config();
+        // MUTABLE + the `int → Number` rewrite, for the same reasons as `jit_enter`'s (which see):
+        // it is a pure bit conversion, it goes in the SCRATCH the caller copies from, and a later
+        // bail stays correct because re-coercing a `Number` to `Number` is the identity.
+        let args =
+            unsafe { core::slice::from_raw_parts_mut(args_off as usize as *mut i64, argc as usize) };
+        for (bits, p) in args.iter_mut().zip(sig.iter()) {
+            if let Some(c) = p.param_type {
+                let v: Value<'_> = unsafe { from_bits(*bits as u64) };
+                if !v.coerces_identically_to(c) {
+                    if matches!(c.builtin_type(), Some(ruffle_core::avm2::BuiltinType::Number))
+                        && let ValueEnum::Integer(i) = v.unpack()
+                    {
+                        *bits = crate::value::to_bits(Value::Number(i as f64)) as i64;
+                        continue;
+                    }
+                    return 0;
+                }
+            }
+        }
+        // Committed from here — nothing below returns 0, so mutating the frame is safe.
+        //
+        // DEFAULTED params, into the frame this tail call REUSES. `emit` builds `args_off` as
+        // `P_ARGS + CALL_SCRATCH_SLOT*8`, so the frame base is that minus the scratch offset — the
+        // one constant, shared, not re-spelled here. Ordering is why this is sound: the caller then
+        // copies `args[0..argc)` from the scratch (slots >= `CALL_SCRATCH_SLOT`) into slots
+        // `1..1+argc`, which cannot touch the `1+argc..1+nparams` written here, nor can this touch
+        // the scratch it reads. The caller's own locals in that range are dead — it is being
+        // replaced. SAFETY: as `jit_enter`'s — a byte address in this module's linear memory.
+        let frame_base = args_off as usize - (crate::emit::CALL_SCRATCH_SLOT as usize) * 8;
+        unsafe { write_defaults(frame_base, sig, argc as usize) };
+        // Swap RUN_CTX to the callee's, DISCARDING the caller's (not saved to JIT_PREV — the
+        // caller's own caller restores its ctx on that call's `jit_leave`).
+        context::push_ctx(env_ref.ctx_ptr());
+        // Replace the caller with the callee on the AVM2 call stack (the caller's `jit_enter`
+        // pushed the caller; the caller's caller's `jit_leave` will pop the callee — balanced).
+        context::jit_pop_call();
+        context::jit_push_call(fm_ref.method.as_ptr());
+        1
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (env, fm, args_off, argc);
         0
     }
 }
@@ -1338,16 +1589,17 @@ pub fn jit_enter(env: i64, fm: i64, args_off: i64, argc: i64) -> i64 {
 pub fn jit_leave() {
     #[cfg(target_arch = "wasm32")]
     {
-        // Truncate the shared scope stack back to this callee's base — cleans any scopes it left
-        // (verifier-balanced on a normal return, so usually a no-op; matters on an exceptional
-        // exit / a `scope_base`-using callee). `scope_base()` is still the callee's LIVE base here
-        // (restored by `jit_pop_scope_base` just below). SAFETY: ambient `cx` is installed.
-        let base = context::scope_base();
-        let cx = unsafe { &mut *(context::cx_ptr() as *mut ruffle_core::context::UpdateContext) };
-        if cx.avm2.scope_stack_len() > base {
-            cx.avm2.truncate_scope_stack(base);
+        // Close the scope-base bracket. `Some(base)` = a scope-using callee: truncate the shared
+        // scope stack back to its base — cleans any scopes it left (verifier-balanced on a normal
+        // return, so usually a no-op; matters on an exceptional exit). `None` = the cheap callee:
+        // nothing to restore or truncate. SAFETY: ambient `cx` is installed.
+        if let Some(base) = context::jit_pop_scope_base() {
+            let cx =
+                unsafe { &mut *(context::cx_ptr() as *mut ruffle_core::context::UpdateContext) };
+            if cx.avm2.scope_stack_len() > base {
+                cx.avm2.truncate_scope_stack(base);
+            }
         }
-        context::jit_pop_scope_base();
         context::jit_pop_call();
         crate::runner::drop_depth();
         context::pop_ctx(context::jit_prev_pop());
@@ -1412,6 +1664,9 @@ fn vtable_word(receiver_bits: i64) -> usize {
 /// native settles every eligible-looking callee to the ineligible sentinel and always falls back.
 fn fill_inwasm_dispatch_cell(cell: *mut usize, fm: &ClassBoundMethod<'_>, argc: usize) {
     // Already resolved (env slot non-zero: a real leaked `JitEnv`, or the `1` ineligible sentinel).
+    // The `1` sentinel is a PERMANENT ineligible memo. That is sound: a census (see `Slow`) found
+    // it never goes stale — 0 of ~1.4M hits re-resolved to eligible — because the fill only runs
+    // after `try_dispatch_jit` already compiled the callee.
     if unsafe { *cell.add(2) } != 0 {
         return;
     }
@@ -1421,7 +1676,9 @@ fn fill_inwasm_dispatch_cell(cell: *mut usize, fm: &ClassBoundMethod<'_>, argc: 
     let jit = cx.avm2.jit_backend();
     match jit.ic_dispatch_run_idx(fm.method, argc) {
         Some(run_idx) => {
-            let env = intern_jit_env(fm);
+            let scope_base_used = jit.method_scope_base_used(fm.method);
+            let env =
+                intern_jit_env(fm, scope_base_used, jit.method_n_ops(fm.method), jit.method_inline_safe(fm.method));
             unsafe {
                 *cell.add(2) = env as usize;
                 *cell.add(3) = run_idx as usize;
@@ -1438,7 +1695,12 @@ fn fill_inwasm_dispatch_cell(cell: *mut usize, fm: &ClassBoundMethod<'_>, argc: 
 /// long as the class (hence the cached `ClassBoundMethod`) is alive — the same class-liveness
 /// invariant the call IC already relies on; the leak is bounded by the number of distinct
 /// JIT-dispatched callees.
-fn intern_jit_env(fm: &ClassBoundMethod<'_>) -> *const context::JitEnv {
+fn intern_jit_env(
+    fm: &ClassBoundMethod<'_>,
+    scope_base_used: bool,
+    n_ops: u32,
+    inline_safe: bool,
+) -> *const context::JitEnv {
     thread_local! {
         static JIT_ENV_CACHE: core::cell::RefCell<std::collections::HashMap<usize, usize>> =
             core::cell::RefCell::new(std::collections::HashMap::new());
@@ -1448,11 +1710,19 @@ fn intern_jit_env(fm: &ClassBoundMethod<'_>) -> *const context::JitEnv {
         if let Some(&p) = c.borrow().get(&key) {
             return p as *const context::JitEnv;
         }
-        // `scope_base` is unused for the no-scopes callees this path targets (eligibility requires
-        // `!needs_scopes`), so 0 is fine. `caller_library` mirrors `try_enter` (`owner_library`).
+        // The env's baked `scope_base = 0` is bypassed by `jit_enter`'s live-base bracket for a
+        // scope-using callee; a non-scope callee never reads it. `caller_library` mirrors
+        // `try_enter` (`owner_library`).
         let ctx = context::RunCtx::new(fm.scope(), fm.super_class_obj, 0, fm.method.owner_library());
-        let env = Box::leak(Box::new(context::JitEnv::new(ctx, fm.method.as_ptr())))
-            as *const context::JitEnv;
+        let env =
+            Box::leak(Box::new(context::JitEnv::new(
+                ctx,
+                fm.method.as_ptr(),
+                scope_base_used,
+                n_ops,
+                inline_safe,
+            )))
+                as *const context::JitEnv;
         c.borrow_mut().insert(key, env as usize);
         env
     })
@@ -1509,6 +1779,7 @@ pub unsafe fn call_prop_ic_bits(receiver_bits: i64, mn_ptr: i64, arg_bits: &[i64
         let vt_ptr = vtable_word(receiver_bits);
         #[cfg(not(target_arch = "wasm32"))]
         let vt_ptr = vt.as_ptr() as usize;
+        record_ic_poly(ic_addr as usize, vt_ptr);
         let cell = ic_addr as usize as *mut usize;
         // SAFETY: `cell` is a live baked `[usize; 2]`. `cell[0] == 0` (init) never matches a
         // real vtable pointer; on a match, `cell[1]` is a `&ClassBoundMethod` this cache stored,
@@ -1588,6 +1859,7 @@ pub unsafe fn call_method_ic_bits(receiver_bits: i64, disp_id: i64, arg_bits: &[
         let vt_ptr = vtable_word(receiver_bits);
         #[cfg(not(target_arch = "wasm32"))]
         let vt_ptr = vt.as_ptr() as usize;
+        record_ic_poly(ic_addr as usize, vt_ptr);
         let cell = ic_addr as usize as *mut usize;
         // SAFETY: baked `[usize; 2]` cell; see `call_prop_ic`. Resolution needs no `Activation`.
         if unsafe { *cell } == vt_ptr {

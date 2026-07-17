@@ -54,6 +54,11 @@ pub fn log_decline(name: &str) {
     }
 }
 
+/// An always-on diagnostic line (the `RUFFLE_JIT3_HISTO` dump gates itself). Native: stdout.
+pub fn diag_log(s: &str) {
+    println!("{s}");
+}
+
 thread_local! {
     // `Engine::default()` compiles every emitted method module with Cranelift, which
     // dominated the native thread (profiled ~63%: `cranelift_codegen` optimization +
@@ -66,12 +71,48 @@ thread_local! {
     // trade for a per-method JIT. A module Winch can't compile just fails `Module::new` →
     // `run_leaf` returns `None` → that method declines to the interpreter (correctness kept).
     // Web is unaffected (the browser compiles the emitted modules, not wasmtime).
+    //
+    // PROFILING ESCAPE HATCHES (native only; both off by default):
+    // * `RUFFLE_JIT3_CRANELIFT=1` — use Cranelift instead. Slow to compile, but its OPTIMIZING
+    //   output is structurally much closer to what a browser's optimizing tier emits, so a native
+    //   profile of the generated code is actually representative. Winch's single-pass output is
+    //   not (no register allocation, everything through the stack).
+    // * `RUFFLE_JIT3_PERF=1` — write `/tmp/perf-<pid>.map` so `perf report` symbolicates the
+    //   generated methods instead of showing one anonymous blob. Pair with `perf record -g`.
+    //
+    // CAVEAT for anyone reading such a profile: native does NOT emit the inline `li*`/`si*` path
+    // (mop_emit is web-only — every MOP is a helper call here) and never takes the §8 in-WASM
+    // dispatch. So it is representative for ARITHMETIC / boxing / register pressure inside the
+    // generated code, and NOT for MOP or dispatch cost.
     static ENGINE: Engine = {
         let mut cfg = wasmtime::Config::new();
-        cfg.strategy(wasmtime::Strategy::Winch);
+        if std::env::var_os("RUFFLE_JIT3_CRANELIFT").is_none() {
+            cfg.strategy(wasmtime::Strategy::Winch);
+        }
+        // `=jitdump` records the generated MACHINE CODE (so `perf annotate` can disassemble and
+        // give a PER-INSTRUCTION profile); anything else = a plain perf map (names only — enough
+        // for per-method self time, but `perf annotate` cannot disassemble it because the map
+        // carries no code bytes and the code dies with the process).
+        //   perf record -k mono -- <run>;  perf inject --jit -i perf.data -o perf.jit.data
+        //   perf annotate -i perf.jit.data -s F_luaV_execute
+        match std::env::var("RUFFLE_JIT3_PERF").as_deref() {
+            Ok("jitdump") => cfg.profiler(wasmtime::ProfilingStrategy::JitDump),
+            Ok(_) => cfg.profiler(wasmtime::ProfilingStrategy::PerfMap),
+            Err(_) => &mut cfg,
+        };
         // Fall back to the default (Cranelift) engine if Winch isn't available (feature off,
-        // or an unsupported host arch) instead of panicking the whole player.
-        Engine::new(&cfg).unwrap_or_default()
+        // or an unsupported host arch) instead of panicking the whole player. NB this also
+        // swallows a bad PROFILER config (e.g. `jitdump` feature off) — so shout about that case
+        // rather than silently producing a profile with no jitdump, which wasted a run once.
+        match Engine::new(&cfg) {
+            Ok(e) => e,
+            Err(err) => {
+                if std::env::var_os("RUFFLE_JIT3_PERF").is_some() {
+                    eprintln!("JIT3: profiler config rejected ({err}) — falling back, NO profile data!");
+                }
+                Engine::default()
+            }
+        }
     };
     /// Current frame nesting level; a call runs at `DEPTH * STRIDE` and bumps it.
     static DEPTH: Cell<u32> = const { Cell::new(0) };
@@ -508,20 +549,24 @@ fn build(bytes: &[u8]) -> Option<Compiled> {
                     helpers::jit_enter(env, fm, off, argc)
                 });
                 let jit_leave = Func::wrap(&mut store, || { helpers::jit_leave() });
+                let jit_tail_enter =
+                    Func::wrap(&mut store, |env: i64, fm: i64, off: i64, argc: i64| -> i64 {
+                        helpers::jit_tail_enter(env, fm, off, argc)
+                    });
                 let table = Table::new(
                     &mut store,
-                    TableType::new(RefType::new(true, HeapType::Func), 50, Some(50)),
+                    TableType::new(RefType::new(true, HeapType::Func), 51, Some(51)),
                     Ref::Func(None),
                 )
                 .ok()?;
-                let helpers_tbl: [Func; 50] = [
+                let helpers_tbl: [Func; 51] = [
                     gs, cr, gp, cp, perr, binop, unop, truthy, setprop, setslot, callmethod,
                     newarray, outerscope, scriptglobals, newactivation, pushscope, popscope,
                     getscope, construct, delprop, istype, astype, getsuper, setsuper, callsuper,
                     constructsuper, callnative, getpropfast, setpropfast, op_in, nextvalue,
                     nextname, hasnext, newfunction, applytype, constructslot, constructprop, call,
                     newobject, hasnext2, throw, gschecked, mopload, mopstore, gp_ic, dm_desc,
-                    call_prop_ic, call_method_ic, jit_enter, jit_leave,
+                    call_prop_ic, call_method_ic, jit_enter, jit_leave, jit_tail_enter,
                 ];
                 for (i, f) in helpers_tbl.into_iter().enumerate() {
                     table.set(&mut store, i as u64, Ref::Func(Some(f))).ok()?;
@@ -530,7 +575,7 @@ fn build(bytes: &[u8]) -> Option<Compiled> {
                     Global::new(store, GlobalType::new(ValType::I32, Mutability::Const), Val::I32(i))
                 };
                 let mut imports: Vec<wasmtime::Extern> = vec![table.into()];
-                for i in 0..50 {
+                for i in 0..51 {
                     imports.push(idx(&mut store, i).ok()?.into());
                 }
                 let memory =

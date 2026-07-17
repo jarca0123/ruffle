@@ -690,6 +690,9 @@ pub fn type_aware_optimize<'gc>(
     // marks their result `Number` so phase-2 type-specialization can keep it
     // unboxed as `f64` (e.g. Starling matrix fields). Sorted; nop-remapped.
     number_slots: &mut Vec<u32>,
+    // Op indices of `GetSlot`s whose resolved value class is `int` — the JIT marks
+    // their result `Repr::Int` (an `int`-class value is ALWAYS a `Value::Integer`).
+    int_slots: &mut Vec<u32>,
 ) -> Result<(), Error<'gc>> {
     let (block_list, op_index_to_block_index_table) = assemble_blocks(code_slice, jump_targets);
 
@@ -788,6 +791,7 @@ pub fn type_aware_optimize<'gc>(
             false,
             null_safe_getslots,
             number_slots,
+            int_slots,
         )?;
     }
 
@@ -810,6 +814,7 @@ pub fn type_aware_optimize<'gc>(
                 true,
                 null_safe_getslots,
                 number_slots,
+                int_slots,
             )?;
         }
     }
@@ -884,6 +889,9 @@ fn abstract_interpret_ops<'gc>(
     null_safe_getslots: &mut Vec<u32>,
     // Op indices of `Number`-typed `GetSlot`s (phase-2 unbox input). See caller.
     number_slots: &mut Vec<u32>,
+    // Op indices of `GetSlot`s whose resolved value class is `int` — the JIT marks
+    // their result `Repr::Int` (an `int`-class value is ALWAYS a `Value::Integer`).
+    int_slots: &mut Vec<u32>,
 ) -> Result<(), Error<'gc>> {
     let mut locals = initial_state.locals;
     let mut stack = initial_state.stack;
@@ -1579,6 +1587,9 @@ fn abstract_interpret_ops<'gc>(
                 if do_optimize && resolved_value_class == Some(types.number) {
                     number_slots.push((start_index + i) as u32);
                 }
+                if do_optimize && resolved_value_class == Some(types.int) {
+                    int_slots.push((start_index + i) as u32);
+                }
 
                 if let Some(class) = resolved_value_class {
                     stack.push_class(activation, class)?;
@@ -1638,6 +1649,12 @@ fn abstract_interpret_ops<'gc>(
                         && return_type == Some(types.number)
                     {
                         number_slots.push((start_index + i) as u32);
+                    }
+                    if do_optimize
+                        && matches!(new_op, Op::GetSlot { .. })
+                        && return_type == Some(types.int)
+                    {
+                        int_slots.push((start_index + i) as u32);
                     }
                     optimize_op_to!(new_op);
 

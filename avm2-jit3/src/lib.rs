@@ -19,6 +19,7 @@
 //! it unchanged. Later phases add `env` tables, slot/property ops, the reification ABI,
 //! native thunks, and the error-sentinel unwinding.
 
+mod cfg;
 mod context;
 mod emit;
 mod helpers;
@@ -78,6 +79,22 @@ struct CompiledMethod {
     /// nested callee that reads the base would see the wrong frame — such methods are in-WASM
     /// ineligible (they still run via the Rust `try_enter` fallback, which sets `scope_base` live).
     scope_base_used: bool,
+    /// TEMPORARY (inlining census): total `JitOp`s across all blocks — the callee's SIZE. A
+    /// JIT→JIT call pays a ~21%-of-worker bracket (`jit_enter` + `jit_leave` + `push_call`);
+    /// splicing a small callee into its caller behind the existing vtable guard would erase that
+    /// for the call. This measures whether it is worth building: what share of CALLS (not sites)
+    /// target a callee small enough to inline.
+    n_ops: u32,
+    /// TEMPORARY (inlining census): whether the body contains NO `BailIfError`/`BailIfPerr` — i.e.
+    /// it cannot throw. `translate` emits one after every op that can, so their absence is a proof.
+    ///
+    /// This is the gate INLINING actually needs, and it is stricter than it first looks. Splicing a
+    /// callee's body into its caller erases the callee's `push_call`, so it vanishes from
+    /// `Error.getStackTrace()` — which the test suite checks. It also erases `jit_enter`'s ctx
+    /// install, so any helper that reifies would read the CALLER's scope/bound_super (the exact
+    /// corruption class jit3 exists to avoid). A body that cannot throw and makes no calls has
+    /// neither problem: no trace can be captured inside it, and nothing reifies.
+    cannot_throw: bool,
 }
 
 /// The avm2-jit3 backend. Install via
@@ -280,6 +297,8 @@ impl JitBackend for Jit3 {
         //   B `build_frame`      — param-config + writing `[this, params]` (fast / coerce paths).
         //   C `enter_run`        — context install + `push_call` + `run_leaf` + unwind.
         let compiled = self.resolve_compiled(method)?;
+        #[cfg(target_arch = "wasm32")]
+        context::record_entry(false);
         let num_locals = compiled.num_locals as usize; // cached — no `body()` lookup per call
         let argc = args.len() as u32;
         let mut frame_storage: [MaybeUninit<u64>; emit::MAX_LOCALS] =
@@ -328,6 +347,8 @@ impl JitBackend for Jit3 {
         let key = method.as_ptr() as usize;
         let cache = self.compiled.borrow();
         let Some(Ok(cm)) = cache.get(&key) else {
+            #[cfg(target_arch = "wasm32")]
+            context::record_slow(context::Slow::NotCompiled);
             return None;
         };
         // `scope_base_used` (getscopeobject/newfunction) is NO LONGER excluded: `jit_enter` now
@@ -337,10 +358,50 @@ impl JitBackend for Jit3 {
         // TYPED params are NOT excluded — `jit_enter` validates at call time that the args already
         // match (else it returns 0 → the caller falls back to the coercing helper). See the note
         // above `has_typed_params` on `CompiledMethod`.
-        if cm.nparams as usize != argc {
+        // Fewer args than params is fine when every MISSING one has a default that needs no
+        // coercion: they are static, so `jit_enter` writes them straight into the callee frame
+        // (the caller only ever fills `[this, args[0..argc])`, leaving those slots to us). This is
+        // the whole of the remaining fast-path gap — 100% of ineligible sites were this, ~9.6% of
+        // all entries, and AS3 libraries default parameters everywhere. A default needing coercion
+        // stays out: `jit_enter` must not allocate or throw. `argc > nparams` is `build_frame`'s
+        // `args_extra` decline and stays ineligible.
+        if argc > cm.nparams as usize {
+            #[cfg(target_arch = "wasm32")]
+            context::record_slow(context::Slow::ArgcMismatch);
             return None;
         }
+        if argc < cm.nparams as usize {
+            let sig = method.resolved_param_config();
+            let defaults_ok = sig[argc..].iter().all(|p| {
+                p.default_value
+                    .is_some_and(|d| p.param_type.is_none_or(|c| d.coerces_identically_to(c)))
+            });
+            if !defaults_ok {
+                #[cfg(target_arch = "wasm32")]
+                context::record_slow(context::Slow::ArgcMismatch);
+                return None;
+            }
+        }
         runner::handle_run_idx(&cm.handle)
+    }
+
+    fn method_scope_base_used(&self, method: Method<'_>) -> bool {
+        let key = method.as_ptr() as usize;
+        matches!(self.compiled.borrow().get(&key), Some(Ok(cm)) if cm.scope_base_used)
+    }
+
+    fn method_inline_safe(&self, method: Method<'_>) -> bool {
+        let key = method.as_ptr() as usize;
+        matches!(self.compiled.borrow().get(&key),
+            Some(Ok(cm)) if cm.cannot_throw && !cm.makes_calls && !cm.scope_base_used)
+    }
+
+    fn method_n_ops(&self, method: Method<'_>) -> u32 {
+        let key = method.as_ptr() as usize;
+        match self.compiled.borrow().get(&key) {
+            Some(Ok(cm)) => cm.n_ops,
+            _ => 0,
+        }
     }
 }
 
@@ -349,6 +410,145 @@ impl JitBackend for Jit3 {
 /// for **verified** methods (`try_enter` fires before `init_from_method` verifies, so a
 /// first, unverified sighting declines and the interpreter verifies + runs it; a later call
 /// then compiles).
+/// Minimum op count a method must have for the [`jitop_histogram`] dump; `0` disables it entirely
+/// (zero cost — the whole diagnostic short-circuits). Works on BOTH targets: web has no
+/// `std::env`, so the const is the gate there; on native `RUFFLE_JIT3_HISTO=<n>` overrides it.
+/// OFF: the dump costs real time on web — `console_log` measured **5.86%** of the AVM2 worker
+/// (228ms) on a Lua-bench trace, plus the `record_*` bookkeeping inside the translate fixpoint.
+/// It also has to be off for any profile to be trustworthy. Set to e.g. `250` to bring it back.
+const HISTO_MIN_OPS: usize = 0;
+
+/// The effective histogram threshold (see [`HISTO_MIN_OPS`]).
+pub(crate) fn histo_min_ops() -> usize {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Ok(v) = std::env::var("RUFFLE_JIT3_HISTO").unwrap_or_default().parse::<usize>() {
+        return v;
+    }
+    HISTO_MIN_OPS
+}
+
+/// TEMPORARY diagnostic (gated by [`HISTO_MIN_OPS`] / `RUFFLE_JIT3_HISTO=<min_ops>`): dump the STATIC JitOp mix of
+/// each compiled method with at least `min_ops` ops. Answers "what fraction of the generated code
+/// is guard/box vs useful work" — the question the sampling profiler can no longer answer now that
+/// everything is inlined into one `wasm-function[0]` symbol. `translate` is architecture-neutral,
+/// so a desktop run yields the same op stream the web build compiles. NOTE: this is a STATIC mix
+/// over all blocks, NOT an execution-weighted one — read it as the method's shape, not its profile.
+fn jitop_histogram(method: &Method<'_>, blocks: &[emit::Block], promoted: &[emit::Promotion]) {
+    use emit::JitOp as J;
+    let min_ops = histo_min_ops();
+    if min_ops == 0 {
+        return;
+    }
+    let ops: Vec<&J> = blocks.iter().flat_map(|b| &b.ops).collect();
+    // Always drain (they accumulated during THIS method's translate), even if we don't report.
+    let guarded_why = translate::take_guard_log();
+    let promo_why = translate::take_promo_log();
+    if ops.len() < min_ops {
+        return;
+    }
+    let mut c: std::collections::BTreeMap<&str, usize> = Default::default();
+    for op in &ops {
+        let bucket = match op {
+            // Raw domainMemory access: each carries an inline bounds check (+ tag check unless the
+            // address is a proven Int). The target of a range/induction analysis.
+            J::MopLoad(_, true) | J::MopStore(_, true) => "mop_addr_proven",
+            J::MopLoad(_, false) | J::MopStore(_, false) => "mop_addr_guarded",
+            // Arithmetic the typed frame PROVED — native f64/i32, no tag guard, no helper.
+            J::BinOpNum { .. } | J::BinOpInt(_) | J::BinOpCmp { .. } | J::NullishEq { .. } => {
+                "arith_proven"
+            }
+            // Arithmetic it did NOT prove — boxed operands, tag guards, may call the helper.
+            J::BinOp(_) | J::UnOp(_) => "arith_guarded",
+            J::GetLocal(_) | J::SetLocal(_) => "local",
+            J::PushBits(_) => "const",
+            J::Swap | J::Pop | J::Dup => "stack_shuffle",
+            J::GetScope(_) | J::ScopePush | J::ScopePop | J::OuterScope(_) => "scope",
+            J::Coerce(_) | J::CoerceReturn(_) => "coerce",
+            J::BailIfError | J::BailIfPerr => "bail_check",
+            J::GetSlot(_) | J::GetSlotChecked(_) | J::SetSlot(..) => "slot",
+            J::GetProperty(_) | J::SetProperty(_) | J::GetPropertyFast(_)
+            | J::SetPropertyFast(_) => "property",
+            J::CallProperty(..) | J::CallMethod(..) | J::CallNative(..) | J::Call(_)
+            | J::TailCallProperty(..) | J::TailCallMethod(..) | J::CallSuper(..) => "call",
+            J::ReturnValue | J::ReturnVoid | J::Throw => "return",
+            _ => "other",
+        };
+        *c.entry(bucket).or_default() += 1;
+    }
+    let total = ops.len();
+    let pct = |k: &str| 100.0 * *c.get(k).unwrap_or(&0) as f64 / total as f64;
+    let n_f64 = promoted.iter().filter(|p| p.kind == emit::RegKind::F64).count();
+    let n_i32 = promoted.len() - n_f64;
+    let mix: Vec<String> =
+        c.iter().map(|(k, v)| format!("{k}={v} ({:.1}%)", 100.0 * *v as f64 / total as f64)).collect();
+    runner::diag_log(&format!(
+        "JIT3 HISTO {name:?}: ops={total} blocks={nb} regs=(f64:{n_f64},i32:{n_i32}) \
+         | mop={mop:.1}% arith_proven={ap:.1}% arith_guarded={ag:.1}% \
+         | {mix}",
+        name = method.method_name(),
+        nb = blocks.len(),
+        mop = pct("mop_addr_proven") + pct("mop_addr_guarded"),
+        ap = pct("arith_proven"),
+        ag = pct("arith_guarded"),
+        mix = mix.join(" "),
+    ));
+    // How much of the `br_table` dispatch a relooper could remove: `inline` edges vanish, `br_*`
+    // become one direct branch, `dispatch` (irreducible only) would still need the state machine.
+    let g = cfg::analyze(blocks);
+    runner::diag_log(&format!(
+        "JIT3 CFG {name:?}: blocks={nb} edges={e} | inline={i} ({ip:.1}%) br_fwd={bf} \
+         br_loop={bl} DISPATCH={d} | loops={lp} merges={mg} cross_stack_blocks={cs}",
+        name = method.method_name(),
+        nb = g.blocks,
+        e = g.edges,
+        i = g.inline,
+        ip = 100.0 * g.inline as f64 / g.edges.max(1) as f64,
+        bf = g.br_fwd,
+        bl = g.br_loop,
+        d = g.dispatch,
+        lp = g.loops,
+        mg = g.merges,
+        cs = g.cross_blocks,
+    ));
+    // WHY each arithmetic op stayed guarded: the `(binop, repr_a, repr_b)` triple `bin()` saw.
+    // This is the actionable half — it names exactly which proof is missing.
+    let why: Vec<String> =
+        guarded_why.iter().take(12).map(|(k, n)| format!("{k}={n}")).collect();
+    runner::diag_log(&format!(
+        "JIT3 GUARDED-WHY {:?}: {}",
+        method.method_name(),
+        why.join(" ")
+    ));
+    // What PRECEDES each BailIfError — i.e. which throwing op each sentinel check is paying for.
+    {
+        let mut prev: std::collections::BTreeMap<&str, usize> = Default::default();
+        for b in blocks {
+            for w in b.ops.windows(2) {
+                if matches!(w[1], J::BailIfError | J::BailIfPerr) {
+                    let k = match w[0] {
+                        J::MopLoad(..) | J::MopStore(..) => "mop",
+                        J::BinOp(_) | J::UnOp(_) => "arith",
+                        J::GetSlot(_) | J::GetSlotChecked(_) | J::SetSlot(..) => "slot",
+                        J::GetProperty(_) | J::SetProperty(_) | J::GetPropertyFast(_)
+                        | J::SetPropertyFast(_) => "property",
+                        J::CallProperty(..) | J::CallMethod(..) | J::CallNative(..) => "call",
+                        J::ScopePush => "scopepush",
+                        J::Coerce(_) => "coerce",
+                        _ => "other",
+                    };
+                    *prev.entry(k).or_default() += 1;
+                }
+            }
+        }
+        let v: Vec<String> = prev.iter().map(|(k, n)| format!("{k}={n}")).collect();
+        runner::diag_log(&format!("JIT3 BAIL-SRC {:?}: {}", method.method_name(), v.join(" ")));
+    }
+    // WHY each local failed register promotion — the other half of the boxing cost (`local` is the
+    // single biggest op bucket, and an unpromoted local is a frame `i64.load` per read).
+    let promo: Vec<String> = promo_why.iter().take(10).map(|(k, n)| format!("{k}={n}")).collect();
+    runner::diag_log(&format!("JIT3 PROMO-WHY {:?}: {}", method.method_name(), promo.join(" ")));
+}
+
 fn try_compile(method: Method<'_>) -> Result<CompiledMethod, &'static str> {
     let verified = method.try_verified_info().ok_or("unverified")?; // native/unverified
     let num_locals = method.body().ok_or("no_body")?.num_locals as usize; // bytecode only
@@ -380,13 +580,17 @@ fn try_compile(method: Method<'_>) -> Result<CompiledMethod, &'static str> {
     let (blocks, promoted, undefined_init) = translate::translate(
         &verified.parsed_code,
         &verified.null_safe_getslots,
+        &verified.number_slots,
+        &verified.int_slots,
         &local_types,
         canonical_params,
         sig.len(),
     )
     .ok_or_else(translate::last_decline_reason)?;
+    jitop_histogram(&method, &blocks, &promoted);
     let bytes =
-        emit::compile(&blocks, num_locals, &promoted, &undefined_init).ok_or("emit_failed")?;
+        emit::compile(&blocks, num_locals, &promoted, &undefined_init, &method.method_name())
+            .ok_or("emit_failed")?;
     // Cache the metadata the per-call entry needs (avoids re-deriving it every call).
     let needs_scopes = verified
         .parsed_code
@@ -426,6 +630,11 @@ fn try_compile(method: Method<'_>) -> Result<CompiledMethod, &'static str> {
         nparams: sig.len() as u32,
         scope_base_used,
         makes_calls,
+        n_ops: blocks.iter().map(|b| b.ops.len()).sum::<usize>() as u32,
+        cannot_throw: !blocks
+            .iter()
+            .flat_map(|b| &b.ops)
+            .any(|op| matches!(op, emit::JitOp::BailIfError | emit::JitOp::BailIfPerr)),
     })
 }
 
@@ -449,26 +658,32 @@ const DECLINE_DUMP_EVERY: u64 = 2_000_000;
 /// (native: stderr under `RUFFLE_JIT3_TRACE`; web: console) so the biggest blocker of the
 /// hot path is visible. Frequency-weighted — every declined CALL counts, not first sighting.
 fn record_decline_reason(reason: &'static str) {
-    let ptr = reason.as_ptr() as usize;
-    DECLINE_COUNTS.with(|c| {
-        let mut m = c.borrow_mut();
-        let e = m.entry(ptr).or_insert((reason, 0));
-        e.1 += 1;
-    });
-    let total = DECLINE_TOTAL.with(|t| {
-        let n = t.get() + 1;
-        t.set(n);
-        n
-    });
-    if total % DECLINE_DUMP_EVERY == 0 {
-        let mut items: Vec<(&'static str, u64)> =
-            DECLINE_COUNTS.with(|c| c.borrow().values().copied().collect());
-        items.sort_by(|a, b| b.1.cmp(&a.1));
-        let mut line = format!("JIT3 DECLINE PROFILE ({total} calls to interp):");
-        for (reason, n) in items {
-            line.push_str(&format!(" {reason}={n}({}%)", n * 100 / total));
+    // Off by default: this runs on the HOT decline path (a hot method that declines the JIT
+    // executes via the interpreter EVERY call and lands here), and the per-call map entry showed
+    // up as ~1.7% in a Starling profile. Flip to `true` to bring the decline histogram back.
+    const DECLINE_PROFILE: bool = false;
+    if DECLINE_PROFILE {
+        let ptr = reason.as_ptr() as usize;
+        DECLINE_COUNTS.with(|c| {
+            let mut m = c.borrow_mut();
+            let e = m.entry(ptr).or_insert((reason, 0));
+            e.1 += 1;
+        });
+        let total = DECLINE_TOTAL.with(|t| {
+            let n = t.get() + 1;
+            t.set(n);
+            n
+        });
+        if total % DECLINE_DUMP_EVERY == 0 {
+            let mut items: Vec<(&'static str, u64)> =
+                DECLINE_COUNTS.with(|c| c.borrow().values().copied().collect());
+            items.sort_by(|a, b| b.1.cmp(&a.1));
+            let mut line = format!("JIT3 DECLINE PROFILE ({total} calls to interp):");
+            for (reason, n) in items {
+                line.push_str(&format!(" {reason}={n}({}%)", n * 100 / total));
+            }
+            runner::log_decline(&line);
         }
-        runner::log_decline(&line);
     }
 }
 

@@ -1453,6 +1453,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "debugid"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef552e6f588e446098f6ba40d89ac146c8c7b64aade83c051ee00bb5d2bc18d"
+dependencies = [
+ "uuid",
+]
+
+[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2297,6 +2306,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fxprof-processed-profile"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25234f20a3ec0a962a61770cfe39ecf03cb529a6e474ad8cff025ed497eda557"
+dependencies = [
+ "bitflags 2.13.0",
+ "debugid",
+ "rustc-hash 2.1.2",
+ "serde",
+ "serde_derive",
+ "serde_json",
+]
+
+[[package]]
 name = "gc-arena"
 version = "0.5.3"
 source = "git+https://github.com/kyren/gc-arena.git?rev=75671ae03f53718357b741ed4027560f14e90836#75671ae03f53718357b741ed4027560f14e90836"
@@ -3065,6 +3088,26 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "ittapi"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b996fe614c41395cdaedf3cf408a9534851090959d90d54a535f675550b64b1"
+dependencies = [
+ "anyhow",
+ "ittapi-sys",
+ "log",
+]
+
+[[package]]
+name = "ittapi-sys"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52f5385394064fa2c886205dba02598013ce83d3e92d33dbdc0c52fe0e7bf4fc"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "jiff"
@@ -7359,6 +7402,8 @@ dependencies = [
  "cc",
  "cfg-if",
  "futures",
+ "fxprof-processed-profile",
+ "ittapi",
  "libc",
  "log",
  "mach2 0.6.0",
@@ -7370,6 +7415,7 @@ dependencies = [
  "rustix 1.1.4",
  "serde",
  "serde_derive",
+ "serde_json",
  "smallvec",
  "target-lexicon",
  "wasmparser 0.251.0",
@@ -7482,6 +7528,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f667288cb4dfa68a4639ffac4d5628535dda64ebdc2b990526efb12b30ba803"
 dependencies = [
  "cc",
+ "object",
+ "rustix 1.1.4",
  "wasmtime-internal-versioned-export-macros",
 ]
 

@@ -413,6 +413,9 @@ impl<'gc> Domain<'gc> {
         };
         let write = Gc::write(activation.gc(), self.0);
         unlock!(write, DomainData, domain_memory).set(Some(memory));
+        // Invalidate the JIT's cached inline-domainMemory descriptor pointer: the buffer (and thus
+        // its stable descriptor cell) may now differ. Growth does NOT bump this — only reassignment.
+        activation.avm2().bump_dm_generation();
         Ok(())
     }
 

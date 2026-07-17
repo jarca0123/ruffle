@@ -26,6 +26,7 @@ pub fn optimize<'gc>(
     mut jump_targets: FnvHashSet<usize>,
     null_safe_getslots: &mut Vec<u32>,
     number_slots: &mut Vec<u32>,
+    int_slots: &mut Vec<u32>,
 ) -> Result<(), Error<'gc>> {
     let code_slice = Cell::from_mut(code.as_mut_slice());
     let code_slice = code_slice.as_slice_of_cells();
@@ -43,13 +44,14 @@ pub fn optimize<'gc>(
         &mut jump_targets,
         null_safe_getslots,
         number_slots,
+        int_slots,
     )?;
 
     peephole::postprocess_peephole(code_slice, &jump_targets, !method_exceptions.is_empty());
 
     dce::eliminate_dead_code(code_slice, &jump_targets);
 
-    nop_remover::remove_nops(code, method_exceptions, null_safe_getslots, number_slots);
+    nop_remover::remove_nops(code, method_exceptions, null_safe_getslots, number_slots, int_slots);
 
     Ok(())
 }

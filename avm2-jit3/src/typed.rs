@@ -72,8 +72,14 @@ impl Repr {
         matches!(self, Repr::Bool)
     }
 
-    /// Unboxable to a raw `f64` (a genuine `Number`, inline or heap-boxed). An `int`
-    /// box (`Numeric` only) is excluded — it needs `convert_i`, not the `f64` path.
+    /// Unboxable to a raw `f64` (a genuine `Number`, inline or heap-boxed).
+    ///
+    /// ⚠ DOES NOT MEAN "never an `int` box at runtime". [`Repr::NumberBoxed`] is included here,
+    /// but a `Number`-CLASS value can be a `Value::Integer` (`matches_type(Number)` accepts an
+    /// `int`-class value, so a `Number`-typed slot can be `SetSlotNoCoerce`d with one). So this
+    /// must NOT gate anything that assumes "the interpreter's int-int arm cannot fire" or that
+    /// blindly `f64.reinterpret`s — use [`Repr::is_canonical_number`] for those. Misusing it here
+    /// cost a grey screen once; see the notes in `translate::bin` / `binop_result_repr`.
     pub(crate) fn is_f64_unboxable(self) -> bool {
         matches!(self, Repr::Number | Repr::NumberBoxed)
     }

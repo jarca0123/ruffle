@@ -946,6 +946,17 @@ fn resolve_ic_get<'gc>(vt: usize, id: usize) -> Option<&'gc ClassBoundMethod<'gc
     })
 }
 
+/// Drop every cached resolution. MUST be called whenever the vtables the cache keys on can go
+/// away — i.e. when a player's arena is torn down. The cache is per *thread* but its keys are
+/// only meaningful per *player*: once an arena is dropped, the allocator reuses those addresses
+/// for the next player's vtables, and a stale entry then matches by ABA and hands out a
+/// `ClassBoundMethod` from the destroyed player (a use-after-free that surfaces as a dangling
+/// `Method` in `exec`). Sequential players on one thread — the test harness, a reloaded SWF,
+/// a worker — hit this reliably.
+pub(crate) fn resolve_ic_clear() {
+    RESOLVE_IC.with(|ic| ic.borrow_mut().fill(None));
+}
+
 /// Record a `(vtable, id) -> method` resolution for the fast path above.
 fn resolve_ic_put(vt: usize, id: usize, fm: &ClassBoundMethod<'_>) {
     let slot = resolve_ic_slot(vt, id);
@@ -2122,10 +2133,13 @@ impl<'gc> Value<'gc> {
             // `Object` passes everything through except `undefined` (→ `null`).
             Some(BuiltinType::Object) => self.is_f64() || self.tag() != TAG_UNDEFINED,
             Some(_) => false,
-            // A concrete class: `null` passes through unchanged, and an object
-            // of EXACTLY this class is returned as-is. (A subclass instance is
-            // too, but proving that needs the class-chain walk — leave it to
-            // the full coercion.)
+            // A concrete class or interface: `null` passes through unchanged, and so does an
+            // object that IS one — `coerce_to_type` returns an `is_of_type` value verbatim, so
+            // there is nothing to coerce. The chain walk opens the fast path to the shape OO
+            // content is made of (`addChild(child:DisplayObject)` handed a `Quad`): it was 32.9%
+            // of the JIT's slow entries, each paying a full `try_enter` to conclude that nothing
+            // needed doing. It costs nothing on the common exact-class hit — `has_class_in_chain`
+            // compares `test_class` first, which IS the equality test this used to do.
             None => {
                 if self.is_f64() {
                     return false;
@@ -2133,7 +2147,8 @@ impl<'gc> Value<'gc> {
                 match self.tag() {
                     TAG_NULL => true,
                     TAG_OBJECT => {
-                        matches!(self.unpack(), ValueEnum::Object(o) if o.instance_class() == class)
+                        matches!(self.unpack(), ValueEnum::Object(o)
+                            if o.instance_class().has_class_in_chain(class))
                     }
                     _ => false,
                 }

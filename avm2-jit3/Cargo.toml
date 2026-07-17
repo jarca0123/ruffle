@@ -30,7 +30,9 @@ fnv = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # `winch` = the baseline single-pass compiler (no regalloc2), used by the runner to avoid
 # Cranelift's per-method optimizing-compile cost (profiled ~63% of the native thread).
-wasmtime = { version = "46", default-features = false, features = ["cranelift", "runtime", "winch"] }
+# `profiling` powers `RUFFLE_JIT3_PERF=jitdump` (records the generated machine code so `perf
+# annotate` can disassemble it) — profiling only; unused unless that env var is set.
+wasmtime = { version = "46", default-features = false, features = ["cranelift", "runtime", "winch", "profiling"] }
 
 # Web execution: hand the emitted bytes to the browser's WASM engine via js-sys.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

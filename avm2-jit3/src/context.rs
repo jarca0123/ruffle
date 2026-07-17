@@ -86,11 +86,34 @@ impl RunCtx {
 pub(crate) struct JitEnv {
     ctx: RunCtx,
     method_ptr: *const (),
+    /// Whether the callee reads its scope base (`getscopeobject`/`newfunction`). Only then does the
+    /// in-WASM `jit_enter`/`jit_leave` need the LIVE-scope-base bracket (+ scope-stack truncate);
+    /// the ~99% of callees that don't skip it entirely — the bracket isn't free.
+    scope_base_used: bool,
+    /// TEMPORARY (inlining census): the callee's op count, cached here because this env is built
+    /// ONCE per callee — so `jit_enter` can bucket every call by callee size for free.
+    n_ops: u32,
+    /// TEMPORARY (inlining census): whether this callee is safe to splice (see `method_inline_safe`).
+    inline_safe: bool,
 }
 
 impl JitEnv {
-    pub(crate) fn new(ctx: RunCtx, method_ptr: *const ()) -> Self {
-        Self { ctx, method_ptr }
+    pub(crate) fn new(
+        ctx: RunCtx,
+        method_ptr: *const (),
+        scope_base_used: bool,
+        n_ops: u32,
+        inline_safe: bool,
+    ) -> Self {
+        Self { ctx, method_ptr, scope_base_used, n_ops, inline_safe }
+    }
+    /// Whether this callee is safe to splice (see the field).
+    pub(crate) fn inline_safe(&self) -> bool {
+        self.inline_safe
+    }
+    /// The callee's op count (see the field).
+    pub(crate) fn n_ops(&self) -> u32 {
+        self.n_ops
     }
     /// The callee's per-run context (`&self.ctx` — stable while the leaked env lives).
     pub(crate) fn ctx_ptr(&self) -> *const RunCtx {
@@ -99,6 +122,10 @@ impl JitEnv {
     /// The callee `Method`'s stable identity (`Method::as_ptr`), for the call-stack push.
     pub(crate) fn method_ptr(&self) -> *const () {
         self.method_ptr
+    }
+    /// Whether this callee reads its scope base (see the field).
+    pub(crate) fn scope_base_used(&self) -> bool {
+        self.scope_base_used
     }
 }
 
@@ -126,6 +153,11 @@ thread_local! {
     /// sets THIS live instead. `scope_base()`/`reify()` read it; `with_run_ctx` (Rust path) seeds
     /// it from `RunCtx.scope_base`; `jit_enter`/`jit_leave` (in-WASM) swap it LIFO.
     static LIVE_SCOPE_BASE: Cell<usize> = const { Cell::new(0) };
+    /// Inline-domainMemory descriptor-pointer cache: `(dm_generation, domain_ptr, desc_ptr)`. Read
+    /// by [`dm_desc_ptr`](crate::helpers::dm_desc_ptr) to skip a per-entry reify when memory hasn't
+    /// been swapped. A `domain_ptr` of `0` means "empty" (a real entry has a non-zero domain AND a
+    /// non-zero, shareable `desc_ptr`).
+    static DM_DESC_CACHE: Cell<(u64, usize, i64)> = const { Cell::new((0, 0, 0)) };
 }
 
 #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
@@ -140,6 +172,7 @@ mod single_thread {
     pub static AMBIENT_CX: One<*mut ()> = One(UnsafeCell::new(std::ptr::null_mut()));
     pub static PENDING: One<Option<Error<'static>>> = One(UnsafeCell::new(None));
     pub static LIVE_SCOPE_BASE: One<usize> = One(UnsafeCell::new(0));
+    pub static DM_DESC_CACHE: One<(u64, usize, i64)> = One(UnsafeCell::new((0, 0, 0)));
 }
 
 #[inline]
@@ -369,6 +402,36 @@ mod jit_sb_store {
     pub static JIT_SB: One = One(UnsafeCell::new(Vec::new()));
 }
 
+/// A `JIT_SB` sentinel for a callee that does NOT read its scope base: `jit_leave` then leaves
+/// `LIVE_SCOPE_BASE` untouched and skips the scope-stack truncate (the common, cheap case). A real
+/// saved base is a `scope_stack_len()` — never `usize::MAX` — so this can't collide.
+#[cfg(target_arch = "wasm32")]
+const SB_NOOP: usize = usize::MAX;
+
+#[cfg(target_arch = "wasm32")]
+fn jit_sb_push(v: usize) {
+    #[cfg(target_feature = "atomics")]
+    JIT_SB.with(|s| s.borrow_mut().push(v));
+    // SAFETY: single AVM2 thread; not held across a call.
+    #[cfg(not(target_feature = "atomics"))]
+    unsafe {
+        (*jit_sb_store::JIT_SB.0.get()).push(v);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn jit_sb_pop() -> usize {
+    #[cfg(target_feature = "atomics")]
+    {
+        JIT_SB.with(|s| s.borrow_mut().pop().unwrap_or(SB_NOOP))
+    }
+    // SAFETY: single AVM2 thread; not held across a call.
+    #[cfg(not(target_feature = "atomics"))]
+    unsafe {
+        (*jit_sb_store::JIT_SB.0.get()).pop().unwrap_or(SB_NOOP)
+    }
+}
+
 /// Opens the in-WASM scope-base bracket: install `live` as the callee's `LIVE_SCOPE_BASE`
 /// (`scope_stack_len()` at entry), saving the caller's for [`jit_pop_scope_base`]. Makes a
 /// `scope_base`-reading callee (`getscopeobject`/`newfunction`) sound on the fast path — its
@@ -376,24 +439,29 @@ mod jit_sb_store {
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn jit_push_scope_base(live: usize) {
     let prev = live_sb_swap(live);
-    #[cfg(target_feature = "atomics")]
-    JIT_SB.with(|s| s.borrow_mut().push(prev));
-    // SAFETY: single AVM2 thread; not held across a call.
-    #[cfg(not(target_feature = "atomics"))]
-    unsafe {
-        (*jit_sb_store::JIT_SB.0.get()).push(prev);
-    }
+    jit_sb_push(prev);
 }
 
-/// Closes the [`jit_push_scope_base`] bracket — restores the caller's `LIVE_SCOPE_BASE`.
+/// The cheap path for a callee that does NOT read its scope base: leave `LIVE_SCOPE_BASE` alone and
+/// record a sentinel so [`jit_pop_scope_base`] skips both the restore and the scope-stack truncate.
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn jit_pop_scope_base() {
-    #[cfg(target_feature = "atomics")]
-    let prev = JIT_SB.with(|s| s.borrow_mut().pop().unwrap_or(0));
-    // SAFETY: single AVM2 thread; not held across a call.
-    #[cfg(not(target_feature = "atomics"))]
-    let prev = unsafe { (*jit_sb_store::JIT_SB.0.get()).pop().unwrap_or(0) };
-    live_sb_swap(prev);
+pub(crate) fn jit_push_scope_base_noop() {
+    jit_sb_push(SB_NOOP);
+}
+
+/// Closes a scope-base bracket. `Some(callee_base)` for a scope-using callee — its LIVE base (for
+/// `jit_leave`'s scope-stack truncate); `LIVE_SCOPE_BASE` is restored to the caller's. `None` for
+/// the no-op case (nothing to restore or truncate).
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn jit_pop_scope_base() -> Option<usize> {
+    let prev = jit_sb_pop();
+    if prev == SB_NOOP {
+        None
+    } else {
+        let callee_base = live_sb_get();
+        live_sb_swap(prev);
+        Some(callee_base)
+    }
 }
 
 /// Pushes the in-WASM-dispatched callee onto the AVM2 call stack so it shows up in
@@ -417,9 +485,288 @@ pub(crate) fn jit_pop_call() {
     cx.avm2.pop_call(gc);
 }
 
+/// Why an in-WASM fast entry bailed to the Rust path. See [`record_slow`].
+#[cfg(target_arch = "wasm32")]
+pub(crate) enum Slow {
+    /// An argument is an instance of a SUBCLASS of its declared param class. Coercing it is a
+    /// no-op — the value passes through unchanged — so this bail is pure loss: it costs a full
+    /// `try_enter` to conclude nothing needed doing. `coerces_identically_to` rejects it only
+    /// because it compares classes for EQUALITY rather than walking the superclass chain.
+    CoerceSubclass,
+    /// An argument would need REAL coercion (int→Number, undefined→Object, …) — the raw-copy
+    /// fast path cannot do it.
+    Coerce,
+    /// The frame arena is full (deep nesting).
+    Arena,
+    /// The site was memoised INELIGIBLE for the in-WASM entry, but re-asking now says it IS
+    /// eligible — the callee compiled after this site first ran, and the memo is permanent, so the
+    /// site is stuck on the slow path for nothing. A bug, and fixable.
+    StaleMemo,
+    /// The site is memoised ineligible and still is: `argc != nparams` (a defaulted parameter) or
+    /// the callee never compiled. Real, but the `argc` half could be lifted.
+    Ineligible,
+    /// Ineligible because the callee is not in the compiled cache (declined, or never hot).
+    NotCompiled,
+    /// Ineligible because this site passes fewer args than the callee declares params — an AS3
+    /// DEFAULTED parameter (`function f(a, b = 0)` called as `f(1)`). The in-WASM path raw-copies
+    /// `argc` values and cannot materialise the defaults, so it bails. Liftable: the defaults are
+    /// static, so the caller could store them into the callee frame at the call site.
+    ArgcMismatch,
+    /// Ruffle core called an AS3 method directly (event broadcast, frame construction, a timer):
+    /// there is no JIT caller to dispatch from, so `try_enter` is the only way in. No JIT change
+    /// removes this — it is the floor.
+    Boundary,
+}
+
+/// TEMPORARY: tally WHY `jit_enter` returned 0, to split the entry-path gap. Starling runs 73.6%
+/// fast vs Lua's 99.7%; the call IC is NOT the reason (a POLY census put 97.6% of calls on
+/// monomorphic sites), so the remaining 26.4% is either these two bail-outs or a boundary crossing
+/// (Ruffle core → AS3: event broadcast, frame construction), which no JIT change can remove.
+/// Reported by [`record_entry`].
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static SLOW_SUB: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SLOW_COERCE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SLOW_ARENA: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SLOW_BOUND: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SLOW_STALE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SLOW_INELIG: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SLOW_NOCOMP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SLOW_ARGC: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Master switch for the entry-path census ([`record_entry`] / [`record_slow`]). OFF: `record_entry`
+/// fires on EVERY method entry and measured **3.41%** of the AVM2 worker once the fast path carried
+/// ~90% of them — it distorts any profile taken with it on. Flip to `true` to re-run the census.
+#[cfg(target_arch = "wasm32")]
+pub(crate) const ENTRY_DIAG: bool = false;
+
+/// TEMPORARY census: which coercions does `jit_enter` keep bailing on? `real-coerce` is now the
+/// biggest FIXABLE slice of the slow entries (~32%), and the split decides whether it is worth
+/// doing on the fast path: `int→Number` is a bit conversion (no alloc, no throw — `jit_enter`
+/// could do it exactly as it now writes defaults), `→String` allocates, `→class` throws. Labels
+/// are `target<-source`; ordered by [`COERCE_LABELS`].
+#[cfg(target_arch = "wasm32")]
+pub(crate) const COERCE_LABELS: [&str; 10] = [
+    "num<-int",    // 0 — CHEAP: i32 as f64
+    "num<-other",  // 1
+    "int<-num",    // 2 — cheap-ish: ToInt32
+    "uint<-any",   // 3
+    "bool<-any",   // 4 — cheap: truthiness, never throws
+    "str<-any",    // 5 — ALLOCATES
+    "obj<-undef",  // 6 — cheap: undefined → null
+    "class<-any",  // 7 — throws #1034 unless null (subclass already handled)
+    "builtin<-any",// 8 — the `Some(_) => false` arm (XML/Function/…)
+    "other",       // 9
+];
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static COERCE_KINDS: std::cell::Cell<[u64; 10]> = const { std::cell::Cell::new([0; 10]) };
+}
+
+/// TEMPORARY (inlining census): callee-size buckets, by OP COUNT, weighted by CALLS. A JIT→JIT
+/// call pays a bracket measured at ~21% of the AVM2 worker (`jit_enter` 12.9 + `jit_leave` 4.1 +
+/// `push_call` 4.2); inlining the callee behind the existing vtable guard erases it for that call.
+/// This says how much of that is reachable: a call to a 40-op callee is nearly all bracket, a call
+/// to a 400-op one is nearly all work. Needs NO deopt — a guard miss just calls the helper — but
+/// it does need a second compile tier, so the payoff must be known FIRST.
+#[cfg(target_arch = "wasm32")]
+pub(crate) const OPS_BUCKETS: [u32; 6] = [32, 64, 128, 256, 512, u32::MAX];
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static CALLEE_OPS: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
+    static CALLEE_SAFE: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
+}
+
+/// Tally one in-WASM entry by its callee's op count, and separately whether the callee is
+/// INLINE-SAFE (cannot throw / makes no calls / no scope base). Size alone overstates the prize:
+/// only the safe ones can be spliced without breaking stack traces or handing a helper the
+/// caller's scope. See [`OPS_BUCKETS`].
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn record_callee_ops(n_ops: u32, inline_safe: bool) {
+    if !ENTRY_DIAG {
+        return;
+    }
+    let i = OPS_BUCKETS.iter().position(|&b| n_ops <= b).unwrap_or(5);
+    let mut a = CALLEE_OPS.with(|c| c.get());
+    a[i] += 1;
+    CALLEE_OPS.with(|c| c.set(a));
+    if inline_safe {
+        let mut s = CALLEE_SAFE.with(|c| c.get());
+        s[i] += 1;
+        CALLEE_SAFE.with(|c| c.set(s));
+    }
+}
+
+/// Tally one `jit_enter` coercion bail by kind (an index into [`COERCE_LABELS`]).
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn record_coerce_kind(kind: usize) {
+    if !ENTRY_DIAG {
+        return;
+    }
+    let mut a = COERCE_KINDS.with(|c| c.get());
+    a[kind] += 1;
+    COERCE_KINDS.with(|c| c.set(a));
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn record_slow(why: Slow) {
+    if !ENTRY_DIAG {
+        return;
+    }
+    match why {
+        Slow::CoerceSubclass => SLOW_SUB.with(|c| c.set(c.get() + 1)),
+        Slow::Coerce => SLOW_COERCE.with(|c| c.set(c.get() + 1)),
+        Slow::Arena => SLOW_ARENA.with(|c| c.set(c.get() + 1)),
+        Slow::Boundary => SLOW_BOUND.with(|c| c.set(c.get() + 1)),
+        Slow::StaleMemo => SLOW_STALE.with(|c| c.set(c.get() + 1)),
+        Slow::Ineligible => SLOW_INELIG.with(|c| c.set(c.get() + 1)),
+        Slow::NotCompiled => SLOW_NOCOMP.with(|c| c.set(c.get() + 1)),
+        Slow::ArgcMismatch => SLOW_ARGC.with(|c| c.set(c.get() + 1)),
+    }
+}
+
+/// TEMPORARY: tally method ENTRIES by path — the §8 in-WASM `jit_enter` fast path vs the Rust
+/// `try_enter` bounce. `try_enter`'s cost is spread evenly over resolve/build/enter (measured
+/// ~8/7/3.9/5.6), so it cannot be made much cheaper — the only lever is NOT CALLING IT, which makes
+/// this ratio the number that decides whether that lever is worth anything. Plain `Cell`s: a
+/// HashMap-based tally once cost ~20% on this path (see the PERF note in memory).
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn record_entry(inwasm: bool) {
+    if !ENTRY_DIAG {
+        return;
+    }
+    use std::cell::Cell;
+    thread_local! {
+        static INWASM: Cell<u64> = const { Cell::new(0) };
+        static RUSTY: Cell<u64> = const { Cell::new(0) };
+    }
+    if inwasm {
+        INWASM.with(|c| c.set(c.get() + 1));
+    } else {
+        RUSTY.with(|c| c.set(c.get() + 1));
+        // Is anything JIT-compiled on the stack? `RUN_CTX` is still the CALLER's here (`try_enter`
+        // records before `enter_run` installs the callee's), so null ⇒ Ruffle core called AS3
+        // directly and `try_enter` is the only way in. A non-null one is a JIT caller that fell
+        // back — counted as guard-miss BY SUBTRACTION below, since `jit_enter`'s own coerce/arena
+        // bail-outs land here too and must not be double-counted.
+        if run_ctx_get().is_null() {
+            record_slow(Slow::Boundary);
+        }
+    }
+    let (i, r) = (INWASM.with(|c| c.get()), RUSTY.with(|c| c.get()));
+    if (i + r) % 50000 == 0 {
+        let pct = 100.0 * i as f64 / (i + r) as f64;
+        // Split the slow half: `coerce`/`arena` are in-WASM guard HITS that `jit_enter` then
+        // rejected (fixable in the JIT); the rest is a guard miss or a Ruffle-core → AS3 boundary
+        // crossing (event broadcast, frame construction), which no JIT change removes.
+        let (sub, co, ar, bo) = (
+            SLOW_SUB.with(|c| c.get()),
+            SLOW_COERCE.with(|c| c.get()),
+            SLOW_ARENA.with(|c| c.get()),
+            SLOW_BOUND.with(|c| c.get()),
+        );
+        let guard = r.saturating_sub(sub + co + ar + bo);
+        let (st, il) = (SLOW_STALE.with(|c| c.get()), SLOW_INELIG.with(|c| c.get()));
+        let (nc, ag) = (SLOW_NOCOMP.with(|c| c.get()), SLOW_ARGC.with(|c| c.get()));
+        let p = |x: u64| 100.0 * x as f64 / r.max(1) as f64;
+        crate::runner::diag_log(&format!(
+            "JIT3 ENTRY PATH: in-wasm={i} try_enter={r} ({pct:.1}% fast) | of the slow {r}: \
+             subclass={sub} ({:.1}%) real-coerce={co} ({:.1}%) arena={ar} ({:.1}%) \
+             GUARD-MISS={guard} ({:.1}%) BOUNDARY={bo} ({:.1}%, the floor) \
+             | ineligible: STALE(bug)={st} still={il} => NOT-COMPILED={nc} ARGC-MISMATCH={ag} \
+             | coerce kinds: {ck} | INLINE CENSUS (calls by callee ops): {oc}",
+            p(sub),
+            p(co),
+            p(ar),
+            p(guard),
+            p(bo),
+            ck = {
+                let a = COERCE_KINDS.with(|c| c.get());
+                let tot: u64 = a.iter().sum();
+                COERCE_LABELS
+                    .iter()
+                    .zip(a.iter())
+                    .filter(|(_, n)| **n > 0)
+                    .map(|(l, n)| {
+                        format!("{l}={n}({:.0}%)", 100.0 * *n as f64 / tot.max(1) as f64)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            },
+            oc = {
+                let a = CALLEE_OPS.with(|c| c.get());
+                let sf = CALLEE_SAFE.with(|c| c.get());
+                let tot: u64 = a.iter().sum();
+                let (mut cum, mut cums) = (0u64, 0u64);
+                let pct = |n: u64| 100.0 * n as f64 / tot.max(1) as f64;
+                OPS_BUCKETS
+                    .iter()
+                    .zip(a.iter())
+                    .zip(sf.iter())
+                    .map(|((b, n), s)| {
+                        cum += n;
+                        cums += s;
+                        let lbl = if *b == u32::MAX { ">512".into() } else { format!("<={b}") };
+                        format!(
+                            "{lbl}:{:.1}%(cum {:.1}%)/SAFE {:.1}%(cum {:.1}%)",
+                            pct(*n), pct(cum), pct(*s), pct(cums)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            },
+        ));
+    }
+}
+
 /// This run's base into the shared `avm2.scope_stack` (from the installed [`RunCtx`]).
 pub(crate) fn scope_base() -> usize {
     live_sb_get()
+}
+
+/// The current run's domain pointer, read cheaply from the installed [`RunCtx`]'s captured scope —
+/// no full [`reify`]. This is the SAME domain `Activation::domain_memory` would resolve (both go
+/// through `scope.domain()`), so it is a sound cache key for the inline-domainMemory descriptor.
+/// Returns `0` if no run is installed.
+pub(crate) fn current_domain_ptr() -> usize {
+    let ptr = run_ctx_get();
+    if ptr.is_null() {
+        return 0;
+    }
+    // SAFETY: `RunCtx` installed for this run; its `scope` is a live `ScopeChain` (erased to
+    // 'static by `RunCtx::new`). We only read a Gc pointer identity, which does not depend on the
+    // lifetime, and the domain outlives the run.
+    let ctx = unsafe { &*ptr };
+    ctx.scope.domain().as_ptr() as usize
+}
+
+/// Read the inline-domainMemory descriptor cache `(dm_generation, domain_ptr, desc_ptr)`.
+pub(crate) fn dm_cache_get() -> (u64, usize, i64) {
+    #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+    {
+        DM_DESC_CACHE.with(|c| c.get())
+    }
+    // SAFETY: single-threaded read (see the module note).
+    #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+    unsafe {
+        *single_thread::DM_DESC_CACHE.0.get()
+    }
+}
+
+/// Store the inline-domainMemory descriptor cache (see [`dm_cache_get`]).
+pub(crate) fn dm_cache_set(v: (u64, usize, i64)) {
+    #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+    {
+        DM_DESC_CACHE.with(|c| c.set(v));
+    }
+    // SAFETY: single-threaded write (see the module note).
+    #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+    unsafe {
+        *single_thread::DM_DESC_CACHE.0.get() = v;
+    }
 }
 
 /// Reifies a fresh callee-owned `Activation` from the installed [`RunCtx`].

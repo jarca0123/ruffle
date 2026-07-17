@@ -84,6 +84,31 @@ pub trait JitBackend {
         let _ = (method, argc);
         None
     }
+
+    /// Whether the compiled `method` reads its scope base (`getscopeobject`/`newfunction`) — so an
+    /// in-WASM caller's `jit_enter`/`jit_leave` must install the live scope base + truncate the
+    /// scope stack for it (the ~99% that don't skip that bracket). Default: `false`.
+    fn method_scope_base_used(&self, method: Method<'_>) -> bool {
+        let _ = method;
+        false
+    }
+
+    /// TEMPORARY (inlining census): is `method` safe to SPLICE into its caller? True only if it
+    /// cannot throw, makes no calls and does not read its scope base — see `CompiledMethod`. A
+    /// caller that inlines such a body needs no ctx install and no call-stack push, because
+    /// nothing inside can reify or capture a stack trace. Default: `false`.
+    fn method_inline_safe(&self, method: Method<'_>) -> bool {
+        let _ = method;
+        false
+    }
+
+    /// TEMPORARY (inlining census): the compiled `method`'s op count, or `0` if not compiled.
+    /// Cached per callee by the in-WASM dispatch env so the hot path can bucket calls by callee
+    /// size without a lookup. Default: `0`.
+    fn method_n_ops(&self, method: Method<'_>) -> u32 {
+        let _ = method;
+        0
+    }
 }
 
 /// The default backend: never compiles anything, so every method is interpreted.

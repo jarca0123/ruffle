@@ -45,6 +45,11 @@ pub fn log_decline(name: &str) {
     }
 }
 
+/// An always-on diagnostic line (the histogram gates itself via `HISTO_MIN_OPS`). Web: console.
+pub fn diag_log(s: &str) {
+    console_log(s);
+}
+
 /// Total frame arena, in bytes (matches the old shared-memory size: 4 MiB = many strides).
 const FRAME_BUF_BYTES: usize = (FRAME_PAGES as usize) * 65536;
 
@@ -387,6 +392,11 @@ fn instantiate(bytes: &[u8], memory: &WebAssembly::Memory) -> Option<js_sys::Fun
     bind_idx(&env, "callmethodic_i", helpers::call_method_ic as fn(i64, i64, i64, i64, i64) -> i64 as usize)?;
     bind_idx(&env, "jitenter_i", helpers::jit_enter as fn(i64, i64, i64, i64) -> i64 as usize)?;
     bind_idx(&env, "jitleave_i", helpers::jit_leave as fn() as usize)?;
+    bind_idx(
+        &env,
+        "jittailenter_i",
+        helpers::jit_tail_enter as fn(i64, i64, i64, i64) -> i64 as usize,
+    )?;
     Reflect::set(&env, &"memory".into(), memory).ok()?;
     let imports = Object::new();
     Reflect::set(&imports, &"env".into(), &env).ok()?;
